@@ -92,7 +92,7 @@ Do not `install` into the vendor scope unless governance explicitly allows it; u
 now-fluent export-xml --project ./work --build-local --zip
 ```
 
-Raw per-record `<record_update>` build artifacts plus a manifest. Not an update set on their own.
+Raw per-record `<record_update>` build artifacts plus a manifest. Not an update set on their own. Exports every built record by default; `--include`/`--exclude` (same repeatable, comma-separated, substring selection as `update-set-package`) export only selected records.
 
 ## Importable update set
 

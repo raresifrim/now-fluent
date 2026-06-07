@@ -111,6 +111,19 @@ now-fluent export-xml --project ./my-app --build-local --zip
 
 `--build-local` runs `now-sdk build` first. The export contains the raw per-record `<record_update>` build artifacts plus a `manifest.json`. These are build artifacts, not an update set — use `update-set-package` for that.
 
+By default **every built record is exported**. To export only some, use the same `--include`/`--exclude` selection as `update-set-package` (repeatable, comma-separated, substring match — a sys_id for one record, a table name for a type):
+
+```bash
+# only the script include(s)
+now-fluent export-xml --project ./my-app --build-local --include sys_script_include
+
+# everything except the SDK bookkeeping sys_module records
+now-fluent export-xml --project ./my-app --build-local --exclude sys_module
+
+# two specific records by sys_id
+now-fluent export-xml --project ./my-app --build-local --include id1,id2
+```
+
 ## update-set-package — build an importable update set
 
 Builds a **real, directly-importable ServiceNow update set XML** from the project's built record XML. Ideal for Global scope or ServiceNow-owned/vendor scopes (e.g. HAM) where an SDK install is not appropriate.
