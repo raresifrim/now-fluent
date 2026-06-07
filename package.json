@@ -1,0 +1,18 @@
+{
+  "name": "now-fluent",
+  "version": "1.0.0",
+  "description": "A thin wrapper around the ServiceNow SDK (now-sdk): forwards every now-sdk command verbatim and adds Fluent helpers (import, export-xml, and importable update-set generation).",
+  "type": "module",
+  "bin": {
+    "now-fluent": "./bin/now-fluent.mjs"
+  },
+  "scripts": {
+    "doctor": "node ./bin/now-fluent.mjs doctor",
+    "help": "node ./bin/now-fluent.mjs help"
+  },
+  "engines": {
+    "node": ">=20.18.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
