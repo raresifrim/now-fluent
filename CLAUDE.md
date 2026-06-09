@@ -83,9 +83,10 @@ When you already have an update set exported to XML (you publish/export it yours
 now-fluent import-update-set --from ./my-update-set.xml --project ./work
 ```
 
-- `now-sdk transform --from` cannot read an update set export directly: each record is HTML-escaped inside `<sys_update_xml><payload>`. This command unwraps every `<payload>` (one level of entity decoding) into individual `<record_update>` files, then runs `now-sdk transform --from <dir>` over them.
+- `now-sdk transform --from` cannot read an update set export directly: each record is wrapped inside `<sys_update_xml><payload>` (either HTML-escaped or in a CDATA section). This command unwraps every `<payload>` (handling both encodings) into individual `<record_update>` files, then runs `now-sdk transform --from <dir>` over them.
 - The path may be given via `--from` or positionally. `--project` maps to transform's `--directory` (defaults to the current project).
 - `--out <dir>` writes the extracted per-record XML to a chosen folder; `--keep` preserves the temp extraction; `--dry-run` prints the now-sdk command and leaves the extracted files for inspection.
+- `--include <token[,token...]>` / `--exclude <token[,token...]>` select which records to import — same substring semantics as `update-set-package` (a token is a substring of `<table>_<sysid>`; a table name selects a type, a sys_id selects one record; both repeatable and comma-separated). Filtering happens before writing, so excluded records are never transformed. Essential for large app exports (a published app can be ~30k records dominated by `sys_documentation`/`sys_translated`/`sys_ui_message`); e.g. `--exclude sys_documentation,sys_translated,sys_ui_message` or `--include sys_sg_,catalog,sys_script`.
 - This is a useful workaround for ServiceNow-owned scopes (e.g. `sn_hamp`): `download` is gated by the instance's company-key/maint check, but an update set export is not — export the records to an update set XML, then `import-update-set`. Getting OOB records into the update set is a manual step on your side.
 
 ## Scope-bound projects for vendor scopes (e.g. HAM / sn_hamp)

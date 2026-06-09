@@ -57,14 +57,21 @@ Enhanced commands (handled by now-fluent):
       or as positional arguments.
 
   import-update-set --from <path> [--project <path>] [--out <dir>] [--keep]
+                    [--include <substr>...] [--exclude <substr>...]
                     [--dry-run] [-- <extra now-sdk args>]
       Import a ServiceNow update set XML file (already exported/published
       manually) into a project as Fluent source. Unwraps each
-      <sys_update_xml><payload> record from the <unload> into an individual
-      <record_update> file, then runs "now-sdk transform --from" on them.
-      Local only; never contacts an instance. The update set path may be given
-      via --from or positionally. Extracted record XML goes to a temp folder
-      (or --out <dir>); --keep preserves it for inspection.
+      <sys_update_xml><payload> record from the <unload> (handles both
+      HTML-escaped and CDATA payloads) into an individual <record_update> file,
+      then runs "now-sdk transform --from" on them. Local only; never contacts
+      an instance. The update set path may be given via --from or positionally.
+      Extracted record XML goes to a temp folder (or --out <dir>); --keep
+      preserves it for inspection.
+      Selecting records (matched against <table>_<sysid>, same as
+      update-set-package): --include keeps only matching records, --exclude
+      drops matching ones. Both are repeatable AND accept comma-separated lists.
+      A table name selects a type, a sys_id selects one record. Useful for
+      large app exports, e.g. --exclude sys_documentation,sys_translated,sys_ui_message.
 
   export-xml --project <path> [--out <path>] [--build-local] [--zip]
              [--include <substr>...] [--exclude <substr>...]
@@ -306,16 +313,19 @@ function decodeXmlEntities(value) {
 
 function extractUpdateSetPayloads(xml) {
   // A ServiceNow update set export is an <unload> with one <sys_update_xml> per
-  // captured record; each holds the record as escaped XML inside <payload>.
+  // captured record; each holds the record inside <payload>. The payload comes
+  // in two encodings: HTML-escaped (&lt;record_update&gt;...) or wrapped in a
+  // single CDATA section (<![CDATA[<record_update>...]]>). Handle both.
   const payloads = []
   const re = /<payload>([\s\S]*?)<\/payload>/g
   let m
   while ((m = re.exec(xml)) !== null) {
     const raw = m[1].trim()
     if (!raw) continue
-    const decoded = decodeXmlEntities(raw).trim()
-    if (!decoded.includes('<record_update')) continue
-    payloads.push(decoded)
+    const cdata = raw.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/)
+    const recordXml = cdata ? cdata[1].trim() : decodeXmlEntities(raw).trim()
+    if (!recordXml.includes('<record_update')) continue
+    payloads.push(recordXml)
   }
   return payloads
 }
@@ -331,6 +341,8 @@ function commandImportUpdateSet(flags, config, positional) {
   const dryRun = Boolean(flags['dry-run'])
   const keep = Boolean(flags.keep)
   const extra = flags.__passthrough || []
+  const includes = toTokenList(flags.include ?? config.include)
+  const excludes = toTokenList(flags.exclude ?? config.exclude)
 
   const xml = readFileSync(from, 'utf8')
   const payloads = extractUpdateSetPayloads(xml)
@@ -346,16 +358,44 @@ function commandImportUpdateSet(flags, config, positional) {
   mkdirSync(workDir, { recursive: true })
 
   const records = []
+  let filtered = 0
+  let n = 0
   for (const payload of payloads) {
     const { table } = parseRecordUpdate(payload, from)
     const sysId = firstMatch(payload, /<sys_id>([0-9a-f]{32})<\/sys_id>/i)
-    const base = `${table || 'record'}_${sysId || String(records.length + 1)}`
-    writeFileSync(join(workDir, `${base}.xml`), `<?xml version="1.0" encoding="UTF-8"?>\n${payload}\n`)
+    const base = `${table || 'record'}_${sysId || String(++n)}`
+    // --include/--exclude match like update-set-package: a token is a substring of
+    // <table>_<sysid> (a table name selects a type, a sys_id selects one record).
+    if (includes.length && !includes.some((s) => base.includes(s))) { filtered++; continue }
+    if (excludes.length && excludes.some((s) => base.includes(s))) { filtered++; continue }
+    // The decoded payload often already carries its own <?xml?> prolog; strip any
+    // leading declaration so we emit exactly one (two is invalid XML).
+    const body = payload.replace(/^\s*<\?xml[^>]*\?>\s*/i, '')
+    writeFileSync(join(workDir, `${base}.xml`), `<?xml version="1.0" encoding="UTF-8"?>\n${body}\n`)
     records.push({ table, sysId })
   }
 
-  console.log(`Extracted ${records.length} record(s) from ${basename(from)}:`)
-  for (const r of records) console.log(`  - ${r.table || 'unknown'} ${r.sysId || ''}`.trimEnd())
+  if (records.length === 0) {
+    rmSync(workDir, { recursive: true, force: true })
+    fail(`No records matched after --include/--exclude filtering (${payloads.length} payload(s) in ${basename(from)}).`)
+  }
+
+  const filterNote = (includes.length || excludes.length) ? ` (filtered out ${filtered})` : ''
+  console.log(`Extracted ${records.length} record(s) from ${basename(from)}${filterNote}.`)
+  if (records.length <= 20) {
+    for (const r of records) console.log(`  - ${r.table || 'unknown'} ${r.sysId || ''}`.trimEnd())
+  } else {
+    // Too many to list individually — summarize by table, busiest first.
+    const byTable = {}
+    for (const r of records) {
+      const t = r.table || 'unknown'
+      byTable[t] = (byTable[t] || 0) + 1
+    }
+    const tables = Object.keys(byTable).sort((a, b) => byTable[b] - byTable[a])
+    console.log(`  ${tables.length} table(s):`)
+    for (const t of tables.slice(0, 30)) console.log(`  - ${t}: ${byTable[t]}`)
+    if (tables.length > 30) console.log(`  ... and ${tables.length - 30} more table(s)`)
+  }
   console.log(`Extracted record XML: ${workDir}`)
 
   runSdk(['transform', '--from', workDir, '--directory', project, ...extra], { cwd: project, dryRun })
