@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, write
 import { join, resolve, basename, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
 
 const VERSION = '1.0.0'
 
@@ -14,9 +15,9 @@ const SDK_BIN = process.env.NOW_FLUENT_SDK || 'now-sdk'
 // Commands handled by now-fluent itself. EVERY other command (and its exact
 // arguments) is forwarded verbatim to now-sdk, so any current or future now-sdk
 // command works unchanged.
-const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'export-xml', 'update-set-package'])
+const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package'])
 
-const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run'])
+const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep'])
 
 // ---------------------------------------------------------------------------
 // Help
@@ -54,6 +55,16 @@ Enhanced commands (handled by now-fluent):
       "now-sdk transform --table <table> --id <sysid>" for each id.
       sys_ids may be given via repeated --sys-id, --ids, comma-separated lists,
       or as positional arguments.
+
+  import-update-set --from <path> [--project <path>] [--out <dir>] [--keep]
+                    [--dry-run] [-- <extra now-sdk args>]
+      Import a ServiceNow update set XML file (already exported/published
+      manually) into a project as Fluent source. Unwraps each
+      <sys_update_xml><payload> record from the <unload> into an individual
+      <record_update> file, then runs "now-sdk transform --from" on them.
+      Local only; never contacts an instance. The update set path may be given
+      via --from or positionally. Extracted record XML goes to a temp folder
+      (or --out <dir>); --keep preserves it for inspection.
 
   export-xml --project <path> [--out <path>] [--build-local] [--zip]
              [--include <substr>...] [--exclude <substr>...]
@@ -273,6 +284,92 @@ function commandImport(flags, config, positional) {
   }
   if (failed.length) fail(`import failed for: ${failed.join(', ')}`)
   console.log(`\nimport (via transform fallback) succeeded for: ${sysIds.join(', ')}`)
+}
+
+// ---------------------------------------------------------------------------
+// import-update-set: explode a ServiceNow update set XML into individual record
+// files and transform them into Fluent source via `now-sdk transform --from`.
+// `now-sdk transform --from` cannot read an update set export directly because
+// each record is HTML-escaped inside <sys_update_xml><payload>; this unwraps
+// them into the <record_update> layout transform does understand. Local only.
+// ---------------------------------------------------------------------------
+function decodeXmlEntities(value) {
+  return String(value)
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&amp;/g, '&') // must be last so escaped entities are not double-decoded
+}
+
+function extractUpdateSetPayloads(xml) {
+  // A ServiceNow update set export is an <unload> with one <sys_update_xml> per
+  // captured record; each holds the record as escaped XML inside <payload>.
+  const payloads = []
+  const re = /<payload>([\s\S]*?)<\/payload>/g
+  let m
+  while ((m = re.exec(xml)) !== null) {
+    const raw = m[1].trim()
+    if (!raw) continue
+    const decoded = decodeXmlEntities(raw).trim()
+    if (!decoded.includes('<record_update')) continue
+    payloads.push(decoded)
+  }
+  return payloads
+}
+
+function commandImportUpdateSet(flags, config, positional) {
+  const fromRaw = flags.from || config.from || positional[0]
+  if (!fromRaw) fail('Missing required --from <path to update set XML> (or pass it positionally)')
+  const from = resolve(fromRaw)
+  if (!existsSync(from)) fail(`Update set XML not found: ${from}`)
+
+  const projectRaw = flags.project || config.project
+  const project = projectRaw ? resolve(projectRaw) : process.cwd()
+  const dryRun = Boolean(flags['dry-run'])
+  const keep = Boolean(flags.keep)
+  const extra = flags.__passthrough || []
+
+  const xml = readFileSync(from, 'utf8')
+  const payloads = extractUpdateSetPayloads(xml)
+  if (payloads.length === 0) {
+    fail(`No <sys_update_xml> payloads found in ${basename(from)}. `
+      + 'Expected a ServiceNow update set export (an <unload> containing '
+      + '<sys_update_xml><payload>...</payload></sys_update_xml> entries).')
+  }
+
+  // Write each record as its own <record_update> file. now-sdk's own transform
+  // pipeline uses exactly this <table>_<sysid>.xml layout and reads the folder.
+  const workDir = flags.out ? resolve(flags.out) : join(tmpdir(), `now-fluent-us-${randomUUID()}`)
+  mkdirSync(workDir, { recursive: true })
+
+  const records = []
+  for (const payload of payloads) {
+    const { table } = parseRecordUpdate(payload, from)
+    const sysId = firstMatch(payload, /<sys_id>([0-9a-f]{32})<\/sys_id>/i)
+    const base = `${table || 'record'}_${sysId || String(records.length + 1)}`
+    writeFileSync(join(workDir, `${base}.xml`), `<?xml version="1.0" encoding="UTF-8"?>\n${payload}\n`)
+    records.push({ table, sysId })
+  }
+
+  console.log(`Extracted ${records.length} record(s) from ${basename(from)}:`)
+  for (const r of records) console.log(`  - ${r.table || 'unknown'} ${r.sysId || ''}`.trimEnd())
+  console.log(`Extracted record XML: ${workDir}`)
+
+  runSdk(['transform', '--from', workDir, '--directory', project, ...extra], { cwd: project, dryRun })
+
+  if (dryRun) {
+    console.log(`[dry-run] left extracted record XML at ${workDir}`)
+    return
+  }
+  if (keep || flags.out) {
+    console.log(`\nKept extracted record XML at: ${workDir}`)
+  } else {
+    rmSync(workDir, { recursive: true, force: true })
+  }
+  console.log(`\nimport-update-set: transformed ${records.length} record(s) into ${project}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +821,9 @@ function main() {
       break
     case 'import':
       commandImport(flags, config, positional)
+      break
+    case 'import-update-set':
+      commandImportUpdateSet(flags, config, positional)
       break
     case 'export-xml':
       commandExportXml(flags, config)

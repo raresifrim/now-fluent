@@ -5,7 +5,7 @@ You are working in or near a ServiceNow SDK/Fluent project. Use the local `now-f
 `now-fluent` is a thin wrapper around `now-sdk`:
 
 - It **forwards every now-sdk command and its exact arguments verbatim**, so anything you'd run as `now-sdk <cmd> ...` you run as `now-fluent <cmd> ...` (current and future commands alike).
-- It **adds three enhanced commands**: `import`, `export-xml`, and `update-set-package`.
+- It **adds four enhanced commands**: `import`, `import-update-set`, `export-xml`, and `update-set-package`.
 
 The official ServiceNow SDK plugin/skills may also be installed. Use those for SDK knowledge, Fluent API guidance, and `now-sdk explain`-style lookups. Use `now-fluent` for local execution.
 
@@ -74,6 +74,19 @@ now-fluent import --project ./work --auth <alias> --sys-id <32hex>
 
 For a record whose table you already know, you can also just forward transform directly:
 `now-fluent transform --auth <alias> --table <table> --id <sysid>`.
+
+## Import a manually-exported update set XML (import-update-set)
+
+When you already have an update set exported to XML (you publish/export it yourself), convert all its records to Fluent source locally — no instance contact:
+
+```bash
+now-fluent import-update-set --from ./my-update-set.xml --project ./work
+```
+
+- `now-sdk transform --from` cannot read an update set export directly: each record is HTML-escaped inside `<sys_update_xml><payload>`. This command unwraps every `<payload>` (one level of entity decoding) into individual `<record_update>` files, then runs `now-sdk transform --from <dir>` over them.
+- The path may be given via `--from` or positionally. `--project` maps to transform's `--directory` (defaults to the current project).
+- `--out <dir>` writes the extracted per-record XML to a chosen folder; `--keep` preserves the temp extraction; `--dry-run` prints the now-sdk command and leaves the extracted files for inspection.
+- This is a useful workaround for ServiceNow-owned scopes (e.g. `sn_hamp`): `download` is gated by the instance's company-key/maint check, but an update set export is not — export the records to an update set XML, then `import-update-set`. Getting OOB records into the update set is a manual step on your side.
 
 ## Scope-bound projects for vendor scopes (e.g. HAM / sn_hamp)
 
