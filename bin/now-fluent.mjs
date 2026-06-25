@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join, resolve, basename, dirname } from 'node:path'
+import { join, resolve, basename, dirname, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -17,7 +17,7 @@ const SDK_BIN = process.env.NOW_FLUENT_SDK || 'now-sdk'
 // command works unchanged.
 const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package'])
 
-const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep'])
+const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force'])
 
 // ---------------------------------------------------------------------------
 // Help
@@ -56,22 +56,61 @@ Enhanced commands (handled by now-fluent):
       sys_ids may be given via repeated --sys-id, --ids, comma-separated lists,
       or as positional arguments.
 
-  import-update-set --from <path> [--project <path>] [--out <dir>] [--keep]
-                    [--include <substr>...] [--exclude <substr>...]
-                    [--dry-run] [-- <extra now-sdk args>]
+  import-update-set --from <path> [--project <path>] [--auth <alias>] [--out <dir>]
+                    [--keep] [--no-flows] [--bulk] [--keep-failed] [--force]
+                    [--include <substr>...] [--exclude <substr>...] [--dry-run]
+                    [-- <extra now-sdk args>]
       Import a ServiceNow update set XML file (already exported/published
       manually) into a project as Fluent source. Unwraps each
       <sys_update_xml><payload> record from the <unload> (handles both
-      HTML-escaped and CDATA payloads) into an individual <record_update> file,
-      then runs "now-sdk transform --from" on them. Local only; never contacts
-      an instance. The update set path may be given via --from or positionally.
-      Extracted record XML goes to a temp folder (or --out <dir>); --keep
-      preserves it for inspection.
+      HTML-escaped and CDATA payloads) into individual <record_update> files and
+      runs "now-sdk transform --from" on them.
+      Progress: by default each record is transformed individually so you see
+      "[i/N] importing <table> <sysid>" as it goes (a bad record is reported and
+      skipped, not fatal). --bulk runs one transform over the whole folder instead:
+      faster and atomic for huge sets, but silent for minutes with no progress.
+      Order: family group batches first, then flows (online), then the standalone
+      records — the heavy chunks run first so an interrupted run keeps the most
+      value and a resume has the least left to do.
+      Resume: standalone records whose sys_id is already registered in the
+      project's keys.ts are skipped, so re-running after an interruption only
+      imports what's missing; --force re-imports/overwrites everything. A family
+      group is skipped only when EVERY record its payloads define (all <sys_id>
+      tags, incl. children embedded in parent DSLs) is already registered —
+      otherwise the family imports in full. A flow is skipped only when its
+      sys_hub_flow id AND all update-set sys_hub_* records referencing it are
+      registered. --bulk always imports everything.
+      Self-healing: now-sdk builds the whole project after each record, and a record
+      can even "succeed" (exit 0) while writing a Fluent object that breaks every
+      later build. Per-record mode captures each transform's log; when a build ERROR
+      names a file, that file is removed and the record retried, and a final
+      verification build cleans up anything the last records left broken. Duplicate
+      definition conflicts ('Record ... is defined 2 times') are healed by removing
+      the standalone Record() file, keeping the parent that embeds it. Every removed
+      file is listed at the end so you can handle those records manually.
+      --keep-failed disables the removal and leaves offending files on disk.
+      Family grouping: parent/child tables that must be transformed together to avoid
+      duplicate definitions are collected into one batch and transformed in a single
+      --from call, so children embed into their parent's DSL. Current families:
+      sys_transform_map + sys_transform_entry + sys_transform_script (ImportSet),
+      sys_ui_list + sys_ui_list_element + sys_ui_list_control (List),
+      sys_security_acl + sys_security_acl_role (Acl roles),
+      sys_ui_policy + sys_ui_policy_action + sys_ui_policy_rl_action (UiPolicy),
+      catalog_ui_policy + catalog_ui_policy_action (CatalogUiPolicy), and
+      sys_ui_form(+_sections/_section) + sys_ui_section + sys_ui_element (Form).
+      Flows & actions: flow-graph records (sys_hub_*) cannot be transformed offline
+      (their action/trigger shapes aren't in the update set), so each custom action
+      definition (sys_hub_action_type_definition, imported first) and each flow
+      (sys_hub_flow) is routed to the ONLINE per-record transform instead — this
+      needs --auth <alias> and contacts the instance. Without --auth they are
+      skipped with a notice; --no-flows skips them silently. Everything else stays
+      fully local.
+      The update set path may be given via --from or positionally. Extracted
+      record XML goes to a temp folder (or --out <dir>); --keep preserves it.
       Selecting records (matched against <table>_<sysid>, same as
-      update-set-package): --include keeps only matching records, --exclude
-      drops matching ones. Both are repeatable AND accept comma-separated lists.
-      A table name selects a type, a sys_id selects one record. Useful for
-      large app exports, e.g. --exclude sys_documentation,sys_translated,sys_ui_message.
+      update-set-package): --include keeps only matching records, --exclude drops
+      matching ones (repeatable AND comma-separated). A good large-export filter:
+      --exclude sys_documentation,sys_translated,sys_ui_message,sys_atf_test,sys_atf_step
 
   export-xml --project <path> [--out <path>] [--build-local] [--zip]
              [--include <substr>...] [--exclude <substr>...]
@@ -297,8 +336,11 @@ function commandImport(flags, config, positional) {
 // import-update-set: explode a ServiceNow update set XML into individual record
 // files and transform them into Fluent source via `now-sdk transform --from`.
 // `now-sdk transform --from` cannot read an update set export directly because
-// each record is HTML-escaped inside <sys_update_xml><payload>; this unwraps
-// them into the <record_update> layout transform does understand. Local only.
+// each record is HTML-escaped (or CDATA-wrapped) inside <sys_update_xml><payload>;
+// this unwraps them into the <record_update> layout transform understands.
+// Flow records (sys_hub_*) can't be resolved offline (shapes/action defs missing),
+// so flows are routed to the online per-flow transform (`--table sys_hub_flow --id`,
+// needs --auth). Non-flow records stay fully local.
 // ---------------------------------------------------------------------------
 function decodeXmlEntities(value) {
   return String(value)
@@ -330,6 +372,119 @@ function extractUpdateSetPayloads(xml) {
   return payloads
 }
 
+// now-sdk transform builds the whole project after writing each record, and a record
+// can even exit 0 ("Transform completed successfully") while leaving a Fluent object
+// that breaks every LATER build (e.g. a sys_declarative_action_assignment missing
+// mandatory fields). The reliable signal is the build diagnostics in the output: a
+// failing build always prints "ERROR: <path>:<line>:<col> - error TS...". So capture
+// each transform's full log, extract the file paths named in ERROR lines, remove those
+// files and retry; everything removed is reported at the end for manual handling.
+function stripAnsi(value) {
+  return String(value).replace(/\x1b\[[0-9;]*m/g, '')
+}
+
+// Some record families must be transformed TOGETHER in one transform call: transformed
+// separately, now-sdk embeds the children inside the parent's DSL (e.g.
+// sys_transform_entry fields inside the sys_transform_map's ImportSet()) while a
+// standalone transform of a child also emits its own Record() file — so the project
+// defines the record twice ("Record ... is defined 2 times"). Batching the family into
+// a single --from call makes now-sdk emit only the parent with embedded children.
+const TRANSFORM_TOGETHER = [
+  { key: 'sys_transform', tables: ['sys_transform_map', 'sys_transform_entry', 'sys_transform_script'] },
+  // sys_ui_list payloads carry their sys_ui_list_element children inline; separate
+  // per-record transforms can claim the same element twice (List DSL vs standalone).
+  { key: 'sys_ui_list', tables: ['sys_ui_list', 'sys_ui_list_element', 'sys_ui_list_control'] },
+  // ACL role assignments embed into the ACL's DSL; standalone role transforms conflict.
+  { key: 'sys_security_acl', tables: ['sys_security_acl', 'sys_security_acl_role'] },
+  // UI policy actions embed into the policy's DSL (same for the catalog variant).
+  { key: 'sys_ui_policy', tables: ['sys_ui_policy', 'sys_ui_policy_action', 'sys_ui_policy_rl_action'] },
+  { key: 'catalog_ui_policy', tables: ['catalog_ui_policy', 'catalog_ui_policy_action'] },
+  // Form payloads: a Form() DSL claims its sys_ui_section records IMPLICITLY (derived
+  // from table+view, not listed by sys_id), while sys_ui_section payloads also produce
+  // standalone Record() files for the same sections. (sys_ui_formatter is NOT family.)
+  { key: 'sys_ui_form', tables: ['sys_ui_form', 'sys_ui_form_sections', 'sys_ui_form_section', 'sys_ui_section', 'sys_ui_element'] },
+]
+function transformGroupFor(table) {
+  return TRANSFORM_TOGETHER.find((g) => g.tables.includes(table))
+}
+
+// Resume support: src/fluent/generated/keys.ts registers every record the project
+// already claims (explicit entries keyed by sys_id, including children embedded in a
+// parent DSL). Records whose sys_id is already registered are skipped unless --force,
+// so an interrupted import can be re-run without re-transforming the finished half.
+function loadProjectRecordIds(project) {
+  const keysFile = join(project, 'src', 'fluent', 'generated', 'keys.ts')
+  const ids = new Set()
+  if (!existsSync(keysFile)) return ids
+  const src = readFileSync(keysFile, 'utf8')
+  // Two shapes register a record as present:
+  //   1. the entry KEY is the sys_id:           '<sysid>': { table: ... id: ... }
+  //   2. a DIRECT id property of an entry:      { table: 'x' id: '<sysid>' }
+  // An `id:` nested inside a composite `key: { ... }` block is a key COMPONENT that
+  // references ANOTHER record (e.g. a child keyed by its parent's id) — counting those
+  // as present caused records to be skipped that were never actually imported.
+  let depth = 0
+  let keyBlockDepth = -1 // brace depth at which a nested `key: {` block started
+  for (const line of src.split('\n')) {
+    const t = line.trim()
+    const km = t.match(/^'([0-9a-f]{32})': \{/)
+    if (km) ids.add(km[1])
+    if (keyBlockDepth < 0 && /^key: \{/.test(t)) keyBlockDepth = depth
+    if (keyBlockDepth < 0) {
+      const im = t.match(/^id: '([0-9a-f]{32})',?$/)
+      if (im) ids.add(im[1])
+    }
+    for (const ch of t) {
+      if (ch === '{') depth++
+      else if (ch === '}') { depth--; if (keyBlockDepth >= 0 && depth <= keyBlockDepth) keyBlockDepth = -1 }
+    }
+  }
+  return ids
+}
+
+function extractErrorFilePaths(output, project) {
+  const clean = stripAnsi(output)
+  const paths = new Set()
+  // e.g. "[now-sdk] ERROR: src/fluent/generated/.../file.now.ts:6:5 - error TS2739: ..."
+  const re = /ERROR:\s*(\S+?):\d+:\d+\s*-\s*error/g
+  let m
+  while ((m = re.exec(clean)) !== null) {
+    const p = resolve(project, m[1])
+    if (existsSync(p)) paths.add(p)
+  }
+  // Duplicate-definition conflicts: 'Record "table.sysid" is defined 2 times in the
+  // project:' followed by a numbered file list. Remove only the STANDALONE Record()
+  // file, keeping the parent DSL that embeds the record. Rules, strongest first:
+  //  1. content — the standalone is a generic `Record(` with `Now.ID['<sysid>']`, while
+  //     a parent DSL may not mention the sys_id at all (e.g. Form() claims its
+  //     sys_ui_section records implicitly via table+view). File NAMES can lie: the
+  //     standalone is sometimes named after another record in the same payload.
+  //  2. directory — the generic fallback usually lands under other/<table-with-dashes>/.
+  //  3. basename — a file named exactly <table>_<sysid>.
+  const dupRe = /Record "(\w+)\.([0-9a-f]{32})" is defined \d+ times/g
+  while ((m = dupRe.exec(clean)) !== null) {
+    const [, table, sysId] = m
+    const listed = []
+    const listRe = /^\s*\d+\.\s+(\S+?):\d+\s*$/gm
+    let f
+    while ((f = listRe.exec(clean)) !== null) {
+      const p = resolve(project, f[1])
+      if (existsSync(p)) listed.push(p)
+    }
+    const byContent = listed.filter((p) => {
+      try {
+        const src = readFileSync(p, 'utf8')
+        return /\bRecord\(/.test(src) && src.includes(`'${sysId}'`)
+      } catch { return false }
+    })
+    const tableDir = `/other/${table.replace(/_/g, '-')}/`
+    const byDir = listed.filter((p) => `/${p.replace(/\\/g, '/')}/`.includes(tableDir))
+    const byBase = listed.filter((p) => basename(p).startsWith(`${table}_${sysId}`))
+    for (const p of (byContent.length ? byContent : byDir.length ? byDir : byBase)) paths.add(p)
+  }
+  return [...paths]
+}
+
 function commandImportUpdateSet(flags, config, positional) {
   const fromRaw = flags.from || config.from || positional[0]
   if (!fromRaw) fail('Missing required --from <path to update set XML> (or pass it positionally)')
@@ -340,6 +495,20 @@ function commandImportUpdateSet(flags, config, positional) {
   const project = projectRaw ? resolve(projectRaw) : process.cwd()
   const dryRun = Boolean(flags['dry-run'])
   const keep = Boolean(flags.keep)
+  const noFlows = Boolean(flags['no-flows'])
+  // By default, transform records one-by-one (transform --from <file>) so progress is
+  // visible — you see which record is importing right now. --bulk uses a single
+  // `transform --from <dir>` over the whole folder: faster and atomic for huge sets,
+  // but silent for minutes with no indication of progress.
+  const bulk = Boolean(flags.bulk)
+  // When a build fails during/after a per-record transform, its diagnostics name the
+  // file(s) breaking the project; those are removed (and reported at the end) so they
+  // can't fail every following record. --keep-failed leaves them on disk for inspection.
+  const keepFailed = Boolean(flags['keep-failed'])
+  // Records already registered in the project's keys.ts are skipped (resume support);
+  // --force re-imports them. Family groups and --bulk always import everything.
+  const force = Boolean(flags.force)
+  const auth = flags.auth || config.auth
   const extra = flags.__passthrough || []
   const includes = toTokenList(flags.include ?? config.include)
   const excludes = toTokenList(flags.exclude ?? config.exclude)
@@ -357,7 +526,11 @@ function commandImportUpdateSet(flags, config, positional) {
   const workDir = flags.out ? resolve(flags.out) : join(tmpdir(), `now-fluent-us-${randomUUID()}`)
   mkdirSync(workDir, { recursive: true })
 
-  const records = []
+  const records = []         // non-flow records → offline `transform --from`
+  const flowSeedSet = new Set()   // sys_hub_flow sys_ids → online per-flow transform
+  const actionSeedSet = new Set() // sys_hub_action_type_definition sys_ids → online per-action transform
+  const flowGraphPayloads = [] // skipped sys_hub_* records, kept for completeness checks
+  let flowRelated = 0        // sys_hub_* records skipped from --from (handled online)
   let filtered = 0
   let n = 0
   for (const payload of payloads) {
@@ -368,23 +541,44 @@ function commandImportUpdateSet(flags, config, positional) {
     // <table>_<sysid> (a table name selects a type, a sys_id selects one record).
     if (includes.length && !includes.some((s) => base.includes(s))) { filtered++; continue }
     if (excludes.length && excludes.some((s) => base.includes(s))) { filtered++; continue }
+    // Flow graph records (sys_hub_*) can't be transformed offline from update-set XML:
+    // the action/trigger "shapes" (type definitions) aren't in the set, so the offline
+    // transform fails to resolve flow instances. Route the flow seeds (sys_hub_flow) to
+    // the online per-flow transform, and skip the rest of the graph from --from.
+    if (!noFlows && table && table.startsWith('sys_hub_')) {
+      flowRelated++
+      if (table === 'sys_hub_flow' && sysId) flowSeedSet.add(sysId)
+      else if (table === 'sys_hub_action_type_definition' && sysId) actionSeedSet.add(sysId)
+      else if (sysId) flowGraphPayloads.push({ sysId, text: payload })
+      continue
+    }
     // The decoded payload often already carries its own <?xml?> prolog; strip any
     // leading declaration so we emit exactly one (two is invalid XML).
     const body = payload.replace(/^\s*<\?xml[^>]*\?>\s*/i, '')
-    writeFileSync(join(workDir, `${base}.xml`), `<?xml version="1.0" encoding="UTF-8"?>\n${body}\n`)
-    records.push({ table, sysId })
+    // Family tables (TRANSFORM_TOGETHER) go into a per-group subfolder so the whole
+    // family is transformed in ONE --from call (separate transforms would define the
+    // children twice — embedded in the parent AND as standalone Record() files).
+    // In --bulk mode everything is one call anyway, so no grouping is needed.
+    const grp = !bulk && table ? transformGroupFor(table) : null
+    const dir = grp ? join(workDir, grp.key) : workDir
+    if (grp) mkdirSync(dir, { recursive: true })
+    const file = join(dir, `${base}.xml`)
+    writeFileSync(file, `<?xml version="1.0" encoding="UTF-8"?>\n${body}\n`)
+    records.push({ table, sysId, file, group: grp ? grp.key : null })
   }
+  const flows = [...flowSeedSet]
+  const actions = [...actionSeedSet]
 
-  if (records.length === 0) {
+  if (records.length === 0 && flows.length === 0 && actions.length === 0) {
     rmSync(workDir, { recursive: true, force: true })
-    fail(`No records matched after --include/--exclude filtering (${payloads.length} payload(s) in ${basename(from)}).`)
+    fail(`No records matched after filtering (${payloads.length} payload(s) in ${basename(from)}).`)
   }
 
   const filterNote = (includes.length || excludes.length) ? ` (filtered out ${filtered})` : ''
-  console.log(`Extracted ${records.length} record(s) from ${basename(from)}${filterNote}.`)
-  if (records.length <= 20) {
+  console.log(`Extracted ${records.length} non-flow record(s) from ${basename(from)}${filterNote}.`)
+  if (records.length && records.length <= 20) {
     for (const r of records) console.log(`  - ${r.table || 'unknown'} ${r.sysId || ''}`.trimEnd())
-  } else {
+  } else if (records.length) {
     // Too many to list individually — summarize by table, busiest first.
     const byTable = {}
     for (const r of records) {
@@ -396,9 +590,302 @@ function commandImportUpdateSet(flags, config, positional) {
     for (const t of tables.slice(0, 30)) console.log(`  - ${t}: ${byTable[t]}`)
     if (tables.length > 30) console.log(`  ... and ${tables.length - 30} more table(s)`)
   }
+  if (flowRelated) {
+    console.log(`Detected ${flows.length} flow(s) and ${actions.length} action definition(s) across `
+      + `${flowRelated} sys_hub_* record(s) — routed to the online per-record transform `
+      + `(offline --from can't resolve flow/action shapes).`)
+  }
   console.log(`Extracted record XML: ${workDir}`)
 
-  runSdk(['transform', '--from', workDir, '--directory', project, ...extra], { cwd: project, dryRun })
+  // Phase 1: offline transform of the non-flow records.
+  let importedRecords = 0
+  let skippedRecords = 0
+  let skippedFlows = 0
+  let importedFlows = 0
+  const failedRecords = []
+  // Resume support: skip standalone records (and flows) already registered in the
+  // project's keys.ts. Family groups and --bulk always import everything — their
+  // records can be claimed implicitly by a parent, so presence can't be judged per id.
+  const existingIds = (!force && !bulk) ? loadProjectRecordIds(project) : new Set()
+
+  // Self-healing, shared by the offline unit transforms AND the online flow/action
+  // transforms (both can write files that fail the project build). On failure, the
+  // build diagnostics name the file(s) breaking the project; remove them (reported at
+  // the end) so they can't fail everything that follows.
+  const removedForErrors = []
+  // Note on keys.ts: a transform that exits 0 registers its ids there, but the
+  // verification build after a removal prunes entries whose source file is gone, so
+  // no manual scrubbing is needed — the presence check just has to read only REAL
+  // registrations (see loadProjectRecordIds).
+  // Known now-sdk codegen bug: generated Action() files copy EMPTY instance fields as
+  // `prop: ''`, but some props are typed as enums (e.g. mid_selection_type:
+  // 'use_connection_alias' | 'define_connection_inline' | 'any'), failing the build
+  // with TS2769. Empty means "unset" on the record, so dropping the property is
+  // faithful — try that once before giving up and removing the file.
+  const autofixTried = new Set()
+  const tryAutofix = (p) => {
+    if (!basename(p).startsWith('sys_hub_action_type_definition_')) return false
+    if (autofixTried.has(p)) return false
+    autofixTried.add(p)
+    try {
+      const src = readFileSync(p, 'utf8')
+      const next = src.replace(/^[ \t]*\w+: '',?\n/gm, '')
+      if (next !== src) { writeFileSync(p, next); return true }
+    } catch { /* fall through to removal */ }
+    return false
+  }
+  const removeNamed = (out, indent) => {
+    const bad = keepFailed ? [] : extractErrorFilePaths(out, project)
+    let handled = 0
+    for (const p of bad) {
+      const rel = relative(project, p)
+      if (tryAutofix(p)) {
+        handled++
+        console.warn(`${indent}auto-fixed ${rel} (dropped empty-string properties the DSL types reject)`)
+        continue
+      }
+      const scripts = []
+      try {
+        const src = readFileSync(p, 'utf8')
+        // Now.include('./scripts/x.js') companions would be orphaned — remove them too.
+        for (const s of src.matchAll(/Now\.include\('([^']+)'\)/g)) scripts.push(resolve(dirname(p), s[1]))
+      } catch { /* already gone */ }
+      rmSync(p, { force: true })
+      for (const s of scripts) rmSync(s, { force: true })
+      removedForErrors.push(rel)
+      handled++
+      console.warn(`${indent}removed ${rel} (named in a build ERROR)`)
+    }
+    return handled
+  }
+  // A broken file can be left by a transform that exited 0 (the damage only surfaces
+  // on the next build), so verify with a real build and clean up anything it names.
+  const verifyProjectBuild = () => {
+    console.log('\nVerifying the project still builds...')
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
+      if (b.status === 0) { console.log('  build OK'); return }
+      const out = `${b.stdout || ''}${b.stderr || ''}`
+      if (!removeNamed(out, '  ')) {
+        process.stdout.write(out)
+        console.error('  ! the build is failing but no file path could be extracted from its errors — fix manually')
+        return
+      }
+    }
+  }
+
+  // Online per-flow transform (each flow + its full graph + shapes from the instance).
+  // A function because per-record mode runs it BETWEEN the family groups and the
+  // standalone records: families + flows are the big/slow chunks, so they go first —
+  // an interrupted run then keeps the most value, and the cheap standalones follow.
+  let flowPhaseDone = false
+  const runFlowPhase = () => {
+    if (flowPhaseDone) return
+    flowPhaseDone = true
+    // Two kinds of online seeds: custom action definitions first (flows may use them),
+    // then flows. Resume support: each online transform is slow, so skip seeds already
+    // FULLY imported (unless --force). The seed id alone isn't proof — an interrupted
+    // transform can leave a partial graph — so a seed is skipped only when its own id
+    // AND every sys_hub_* record in the update set that references it (its graph
+    // snapshot) are registered in keys.ts. Note the online transform imports the LIVE
+    // graph; if the instance changed since the export, the snapshot ids may not all
+    // match and the seed re-imports (harmless).
+    const fullyImported = (seedId) => {
+      if (!existingIds.has(seedId)) return false
+      for (const p of flowGraphPayloads) {
+        if (p.text.includes(seedId) && !existingIds.has(p.sysId)) return false
+      }
+      return true
+    }
+    const seeds = [
+      ...actions.map((id) => ({ kind: 'action', table: 'sys_hub_action_type_definition', id })),
+      ...flows.map((id) => ({ kind: 'flow', table: 'sys_hub_flow', id })),
+    ]
+    const pending = seeds.filter((s) => !fullyImported(s.id))
+    skippedFlows = seeds.length - pending.length
+    if (skippedFlows) {
+      console.log(`\nSkipping ${skippedFlows} flow(s)/action(s) already fully imported (seed + its graph `
+        + `records registered in keys.ts) — pass --force to re-import.`)
+    }
+    if (!pending.length) return
+    if (!auth) {
+      console.warn(`\n! ${pending.length} flow(s)/action(s) detected but no --auth provided. They need the `
+        + `online transform (offline --from cannot resolve flow/action shapes). Re-run with --auth <alias> `
+        + `to import them, or pass --no-flows to skip them entirely.`)
+      return
+    }
+    console.log(`\nTransforming ${pending.length} flow(s)/action(s) online via "now-sdk transform --table <table> --id <id> --auth ${auth}"...`)
+    const failedSeeds = []
+    for (const s of pending) {
+      const r = runSdk(['transform', '--auth', auth, '--table', s.table, '--id', s.id, '--directory', project, ...extra],
+        { cwd: project, dryRun, allowFailure: true, capture: !dryRun })
+      if (dryRun) continue
+      const out = `${r.stdout || ''}${r.stderr || ''}`
+      process.stdout.write(out)
+      if (r.status === 0) { importedFlows++; console.log(`  ${s.kind} ${s.id} ok`) }
+      else {
+        console.error(`  ${s.kind} ${s.id} FAILED (exit ${r.status})`)
+        // now-sdk can generate a flow/action file that itself fails to compile
+        // (e.g. an Action() with a bad wfa.actionStep call) — auto-fix or remove
+        // what the diagnostics name so it can't break everything that follows.
+        const handled = removeNamed(out, '    ')
+        // If the seed's own file survived (auto-fixed in place), check whether the
+        // project now builds — if so the seed actually landed.
+        const seedFile = join(project, 'src', 'fluent', 'generated', 'automation', 'flow', `${s.table}_${s.id}.now.ts`)
+        if (handled && existsSync(seedFile)
+          && runSdk(['build'], { cwd: project, allowFailure: true, capture: true }).status === 0) {
+          importedFlows++
+          console.log(`  ${s.kind} ${s.id} ok (auto-fixed)`)
+        } else {
+          failedSeeds.push(`${s.kind} ${s.id}`)
+        }
+      }
+    }
+    // A seed transform can exit 0 yet write a file that fails the build (e.g. an
+    // Action() with an invalid wfa.actionStep call), so always verify with a build.
+    // If verification removes a pending seed's own file, that seed is NOT imported.
+    if (!dryRun && !keepFailed) {
+      const before = removedForErrors.length
+      verifyProjectBuild()
+      const removedNow = removedForErrors.slice(before)
+      for (const s of pending) {
+        if (removedNow.some((f) => f.includes(s.id))) {
+          importedFlows = Math.max(0, importedFlows - 1)
+          failedSeeds.push(`${s.kind} ${s.id} (its generated file failed the build and was removed)`)
+        }
+      }
+    }
+    if (failedSeeds.length) console.warn(`  ${failedSeeds.length} flow(s)/action(s) failed: ${[...new Set(failedSeeds)].join(', ')}`)
+  }
+
+  if (records.length) {
+    if (bulk) {
+      // One bulk transform over the whole folder: fast and atomic, but silent for
+      // minutes (no per-record progress) and one fatal record rolls back everything.
+      if (!dryRun) {
+        console.log(`Transforming ${records.length} non-flow record(s) via a single now-sdk transform --from (bulk)...`)
+        console.log('  Note: bulk mode prints nothing during the commit phase and writes files only at '
+          + 'the end — a silent period of several minutes is normal, not a hang. Drop --bulk to see '
+          + 'per-record progress.')
+      }
+      runSdk(['transform', '--from', workDir, '--directory', project, ...extra], { cwd: project, dryRun })
+      importedRecords = records.length
+    } else {
+      // One unit per standalone record, plus one unit per family group (its subfolder
+      // is transformed in a single --from call so children embed into their parent).
+      // Resume support: standalone records already registered in keys.ts are skipped.
+      // A family group is skipped only when EVERY record its payloads define is already
+      // registered — keys.ts also registers children claimed implicitly by a parent
+      // DSL, and a single family payload can define several records (each with its own
+      // <sys_id> tag, e.g. a sys_ui_list plus its elements), so all of them must match.
+      const recordUnits = []
+      const groupUnits = []
+      const groupMembers = new Map()
+      let skippedStandalone = 0
+      for (const r of records) {
+        if (!r.group) {
+          if (r.sysId && existingIds.has(r.sysId)) { skippedStandalone++; skippedRecords++; continue }
+          recordUnits.push({ label: `${r.table || 'record'} ${r.sysId || ''}`.trim(), file: r.file, count: 1 })
+        } else {
+          if (!groupMembers.has(r.group)) groupMembers.set(r.group, [])
+          groupMembers.get(r.group).push(r)
+        }
+      }
+      const groupFullyPresent = (members) => {
+        if (!existingIds.size) return false
+        let found = false
+        for (const r of members) {
+          const src = readFileSync(r.file, 'utf8')
+          const re = /<sys_id>([0-9a-f]{32})<\/sys_id>/g
+          let m
+          while ((m = re.exec(src)) !== null) {
+            found = true
+            if (!existingIds.has(m[1])) return false
+          }
+        }
+        return found // a group with no readable sys_ids can't be verified — import it
+      }
+      for (const [key, members] of groupMembers) {
+        if (groupFullyPresent(members)) {
+          skippedRecords += members.length
+          console.log(`Skipping ${key}* family (${members.length} record(s)) — every record it defines `
+            + `is already present in the project.`)
+          continue
+        }
+        groupUnits.push({ label: `${key}* family (${members.length} records, transformed together)`, file: join(workDir, key), count: members.length })
+      }
+      const totalUnits = groupUnits.length + recordUnits.length
+      const toTransform = groupUnits.concat(recordUnits).reduce((n, u) => n + u.count, 0)
+      if (skippedStandalone) {
+        console.log(`Skipping ${skippedStandalone} standalone record(s) already present in the project `
+          + `(registered in keys.ts) — pass --force to re-import/overwrite them.`)
+      }
+      if (!dryRun && totalUnits) {
+        console.log(`Transforming ${toTransform} non-flow record(s) in ${totalUnits} step(s) via now-sdk transform --from...`)
+        console.log('  Order: family groups first, then flows (online), then standalone records — '
+          + 'the heavy chunks go first so an interrupted run keeps the most value.')
+        console.log('  (per-record progress shown below; pass --bulk for a single faster atomic transform instead)')
+        if (!keepFailed) {
+          console.log('  If a transform or the final verification build fails, the file(s) named in its '
+            + 'build ERRORs are removed and retried, so one broken object cannot fail all later records; '
+            + 'removed files are listed at the end (--keep-failed leaves them on disk instead).')
+        }
+      }
+      let i = 0
+      const transformUnit = (u) => {
+        i++
+        console.log(`\n[${i}/${totalUnits}] importing ${u.label}`)
+        let res
+        let attempts = 0
+        while (true) {
+          res = runSdk(['transform', '--from', u.file, '--directory', project, ...extra],
+            { cwd: project, dryRun, allowFailure: true, capture: !dryRun })
+          if (dryRun) break
+          const out = `${res.stdout || ''}${res.stderr || ''}`
+          process.stdout.write(out)
+          if (res.status === 0) break
+          const removed = removeNamed(out, '    ')
+          // Duplicate-definition-only failures: the transform already wrote ALL its
+          // output (the build runs after the writes), so removing the standalone
+          // Record() resolves the conflict — re-running the transform would only
+          // recreate it (some batches emit the standalone even when the family is
+          // transformed together). Verify with a build and treat green as success:
+          // the record stays embedded in its parent DSL, nothing is lost.
+          const clean = stripAnsi(out)
+          if (removed && /is defined \d+ times/.test(clean) && !/:\d+:\d+\s*-\s*error/.test(clean)) {
+            const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
+            if (b.status === 0) {
+              console.log('    duplicate(s) resolved by removal — build OK')
+              res = { status: 0 }
+              break
+            }
+            removeNamed(`${b.stdout || ''}${b.stderr || ''}`, '    ')
+          }
+          if (!removed || attempts >= 2) break
+          attempts++
+          console.warn(`    retrying ${u.label}...`)
+        }
+        if (dryRun) return
+        if (res.status === 0) { importedRecords += u.count }
+        else { failedRecords.push(u.label); console.error(`  ✗ ${u.label} FAILED (exit ${res.status})`) }
+      }
+      // Heavy chunks first: family group batches, then the online flows, then the
+      // cheap standalone records.
+      for (const u of groupUnits) transformUnit(u)
+      runFlowPhase()
+      for (const u of recordUnits) transformUnit(u)
+      // A broken file written by the LAST record(s) only surfaces on the next build
+      // (transform can exit 0 yet leave the project unbuildable).
+      if (!dryRun && !keepFailed && totalUnits) verifyProjectBuild()
+      if (failedRecords.length) {
+        console.warn(`\n! ${failedRecords.length} record(s) failed to transform: ${failedRecords.join(', ')}`)
+      }
+    }
+  }
+
+  // In per-record mode the flow phase already ran between families and standalones;
+  // this covers --bulk and the no-records case.
+  runFlowPhase()
 
   if (dryRun) {
     console.log(`[dry-run] left extracted record XML at ${workDir}`)
@@ -409,7 +896,16 @@ function commandImportUpdateSet(flags, config, positional) {
   } else {
     rmSync(workDir, { recursive: true, force: true })
   }
-  console.log(`\nimport-update-set: transformed ${records.length} record(s) into ${project}`)
+  if (removedForErrors.length) {
+    const unique = [...new Set(removedForErrors)]
+    console.warn(`\n! ${unique.length} file(s) were removed because they broke the project build — `
+      + 'handle these records manually:')
+    for (const f of unique) console.warn(`  - ${f}`)
+  }
+  const failNote = failedRecords.length ? ` (${failedRecords.length} record(s) failed)` : ''
+  const skipNote = (skippedRecords || skippedFlows)
+    ? ` (skipped as already present: ${skippedRecords} record(s), ${skippedFlows} flow(s)/action(s) — --force to re-import)` : ''
+  console.log(`\nimport-update-set: ${importedRecords}/${records.length} record(s) + ${importedFlows} flow(s)/action(s) into ${project}${failNote}${skipNote}`)
 }
 
 // ---------------------------------------------------------------------------
