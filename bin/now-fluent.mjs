@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 
-const VERSION = '1.0.0'
+const VERSION = '1.1.0'
 
 // The ServiceNow SDK executable. Override with NOW_FLUENT_SDK, e.g.
 //   NOW_FLUENT_SDK="npx @servicenow/sdk"
@@ -17,7 +17,7 @@ const SDK_BIN = process.env.NOW_FLUENT_SDK || 'now-sdk'
 // command works unchanged.
 const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package'])
 
-const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force'])
+const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force', 'no-related'])
 
 // ---------------------------------------------------------------------------
 // Help
@@ -48,23 +48,58 @@ Enhanced commands (handled by now-fluent):
   doctor
       Report now-fluent, Node, and now-sdk versions.
 
-  import --project <path> --auth <alias> --sys-id <32hex>[,<32hex>...] [--table <table>]
+  import [--project <path>] --auth <alias>
+         [--sys-id <32hex>[,<32hex>...] | --query <encoded query> --table <table>]
+         [--table <table>] [--via auto|move|transform|query] [--limit <n>]
+         [--no-related] [--out <dir>] [--keep] [--keep-failed] [--force]
          [--dry-run] [-- <extra now-sdk args>]
-      Import one or more records into a local project by sys_id. Tries
-      "now-sdk move" first; if that fails and --table is given, falls back to
-      "now-sdk transform --table <table> --id <sysid>" for each id.
-      sys_ids may be given via repeated --sys-id, --ids, comma-separated lists,
-      or as positional arguments.
+      Import records into a local project. Three strategies, tried in this order
+      unless --via names one:
+        move       one call, but needs the target app to exist on the instance
+        transform  online per record ("transform --table <t> --id <id>"); resolves
+                   relationships itself, but the SDK's scope checks refuse records
+                   outside the project's app
+        query      read the row with "now-sdk query" (plain Table REST API),
+                   rebuild its <record_update> XML locally and transform that
+                   OFFLINE — no scope-gated endpoint in the path, so it still
+                   works when move and transform are refused
+      --table is now optional: the table of any sys_id is resolved from
+      sys_metadata.sys_class_name with one query, so the old "cannot fall back to
+      transform without a table" dead end is gone. Pass --table anyway for records
+      that do not extend sys_metadata (plain data tables).
+      --query <encoded query> imports every record matching a query instead of a
+      sys_id list (needs --table), e.g.
+        --table sys_script_include --query "sys_scope.scope=x_my_app^active=true"
+      It defaults to --via query and skips records already registered in the
+      project's keys.ts, so an interrupted bulk import can just be re-run (--force
+      re-imports everything). --limit <n> caps how many records it takes.
+      The query path fetches each record's family children (a UI policy's actions,
+      an ACL's roles, an import map's entries — the TRANSFORM_TOGETHER families)
+      and transforms them in the SAME call, so now-sdk cannot define a child twice;
+      --no-related imports the record alone. Its child columns are discovered from
+      sys_dictionary, not hard-coded.
+      Failures heal like import-update-set: files named in a build ERROR are removed
+      (or auto-fixed) and the unit retried, with a verification build at the end;
+      --keep-failed leaves them on disk. --out <dir>/--keep preserve the rebuilt XML.
+      sys_ids may be given via repeated --sys-id, --ids, comma-separated lists, or
+      as positional arguments.
 
-  import-update-set --from <path> [--project <path>] [--auth <alias>] [--out <dir>]
+  import-update-set (--from <path> | --sys-id <32hex> | --name "<name>")
+                    [--project <path>] [--auth <alias>] [--out <dir>]
                     [--keep] [--no-flows] [--bulk] [--keep-failed] [--force]
                     [--include <substr>...] [--exclude <substr>...] [--dry-run]
                     [-- <extra now-sdk args>]
-      Import a ServiceNow update set XML file (already exported/published
-      manually) into a project as Fluent source. Unwraps each
-      <sys_update_xml><payload> record from the <unload> (handles both
-      HTML-escaped and CDATA payloads) into individual <record_update> files and
-      runs "now-sdk transform --from" on them.
+      Import a ServiceNow update set into a project as Fluent source, from either:
+        --from <path>   an update set XML you exported/published manually
+        --sys-id <id>   the update set ON THE INSTANCE (needs --auth): its
+        --name "<n>"    sys_update_xml rows are read with "now-sdk query", which
+                        returns the very same <payload> blobs the export wraps
+      Reading it from the instance needs no export step at all, works on an update
+      set that is still IN PROGRESS, and is a plain Table API read — so it also
+      works where the SDK's own gated update-set download is refused. Both
+      sys_update_set (local) and sys_remote_update_set (retrieved) are searched.
+      Everything after the source is identical for both: each <payload> is unwrapped
+      into an individual <record_update> file and fed to "now-sdk transform --from".
       Progress: by default each record is transformed individually so you see
       "[i/N] importing <table> <sysid>" as it goes (a bad record is reported and
       skipped, not fatal). --bulk runs one transform over the whole folder instead:
@@ -105,7 +140,8 @@ Enhanced commands (handled by now-fluent):
       needs --auth <alias> and contacts the instance. Without --auth they are
       skipped with a notice; --no-flows skips them silently. Everything else stays
       fully local.
-      The update set path may be given via --from or positionally. Extracted
+      The update set may be given via --from/--sys-id/--name or positionally (a
+      32-hex positional is read as a sys_id, anything else as a path). Extracted
       record XML goes to a temp folder (or --out <dir>); --keep preserves it.
       Selecting records (matched against <table>_<sysid>, same as
       update-set-package): --include keeps only matching records, --exclude drops
@@ -249,7 +285,7 @@ function sysIdsFrom(flags, config, positional = []) {
 // ---------------------------------------------------------------------------
 // now-sdk invocation
 // ---------------------------------------------------------------------------
-function runSdk(args, { cwd, dryRun, capture, allowFailure } = {}) {
+function runSdk(args, { cwd, dryRun, capture, allowFailure, quiet } = {}) {
   const [cmd, ...base] = splitShellLike(SDK_BIN)
   const fullArgs = [...base, ...args]
   const printable = [cmd, ...fullArgs].map(shellQuote).join(' ')
@@ -259,18 +295,34 @@ function runSdk(args, { cwd, dryRun, capture, allowFailure } = {}) {
     return { status: 0, stdout: '', stderr: '' }
   }
 
-  console.log(`> ${printable}`)
+  if (!quiet) console.log(`> ${printable}`)
   const result = spawnSync(cmd, fullArgs, {
     cwd: cwd || process.cwd(),
     stdio: capture ? 'pipe' : 'inherit',
     encoding: 'utf8',
-    env: process.env
+    env: process.env,
+    // spawnSync buffers captured output in memory and defaults to 1MB, which one page
+    // of sys_update_xml payloads (whole records, scripts included) blows through with
+    // ENOBUFS. Give captured output room.
+    maxBuffer: 512 * 1024 * 1024
   })
-  if (result.error) fail(`Failed to run ${cmd}: ${result.error.message}`)
+  if (result.error) {
+    if (result.error.code === 'ENOBUFS') {
+      fail(`Output of "${printable}" exceeded the capture buffer. Re-run with a smaller `
+        + '--limit, or narrow the query with --include/--exclude.')
+    }
+    fail(`Failed to run ${cmd}: ${result.error.message}`)
+  }
   if (result.status !== 0 && !allowFailure) {
     fail(`Command failed with exit code ${result.status}: ${printable}`, result.status || 1)
   }
   return result
+}
+
+// The exact command line runSdk would run, for dry-run plans.
+function sdkPrintable(args) {
+  const [cmd, ...base] = splitShellLike(SDK_BIN)
+  return [cmd, ...base, ...args].map(shellQuote).join(' ')
 }
 
 // Forward an arbitrary now-sdk command (and its exact args) verbatim.
@@ -285,51 +337,732 @@ function passthrough(argv) {
 }
 
 // ---------------------------------------------------------------------------
-// import: move, falling back to transform
+// Instance queries (now-sdk query)
 // ---------------------------------------------------------------------------
+// `now-sdk query <table> -q <encoded query> --output json` silences its logger and
+// prints exactly ONE line:
+//   {"ok":true,"hasMore":<bool>,"nextOffset":<number|null>,"records":[...]}
+//   {"ok":false,"error":{"message":"...","status":<http>,"table":"..."}}
+// It is a plain Table REST API read, so it succeeds where the SDK's scope-gated
+// paths are refused (download's company-key/maint check, move's "app must exist on
+// the instance", fluent_update_set_export.do's sysparm_ck + app scope) — which is
+// exactly the failure mode that blocks import/transform in ServiceNow-owned scopes.
+// One invocation returns one page; hasMore/nextOffset drive the paging loop.
+
+let queryCommandSupported = null
+function sdkSupportsQuery() {
+  if (queryCommandSupported === null) {
+    const r = runSdk(['query', '--help'], { capture: true, allowFailure: true, quiet: true })
+    queryCommandSupported = r.status === 0 && /sysparm_query/.test(`${r.stdout || ''}${r.stderr || ''}`)
+  }
+  return queryCommandSupported
+}
+
+function parseQueryEnvelope(output) {
+  const line = String(output).split('\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop()
+  if (!line) return null
+  try { return JSON.parse(line) } catch { return null }
+}
+
+// The Table API returns a field either as a plain string (--display-value false) or
+// as { value, display_value } (--display-value all). Normalize both.
+function fieldParts(raw) {
+  if (raw && typeof raw === 'object') {
+    const value = raw.value ?? raw.display_value ?? ''
+    return { value: value == null ? '' : String(value), display: raw.display_value == null ? '' : String(raw.display_value) }
+  }
+  return { value: raw == null ? '' : String(raw), display: '' }
+}
+
+function fieldValue(raw) {
+  return fieldParts(raw).value
+}
+
+// Fetch EVERY record matching an encoded query, following the SDK's paging.
+function queryRecords({ table, query, fields, auth, displayValue, pageSize = 100, timeout, max = Infinity, label, quiet = true }) {
+  if (!auth) fail(`Missing --auth <alias>: reading ${table} from the instance needs credentials.`)
+  if (!sdkSupportsQuery()) {
+    fail('This now-sdk build has no "query" command (added in SDK 4.10). Upgrade the SDK '
+      + '(npm i -g @servicenow/sdk) or use the offline paths (--from <xml>, --table/--id).')
+  }
+  // Offset paging is only stable when the sort is TOTAL. ServiceNow leaves the order
+  // of rows tied on the sort column undefined, and ties are the norm — an update set's
+  // sys_update_xml rows can share one sys_created_on by the dozen — so paging without a
+  // unique tiebreaker silently skips a row on one page and repeats another on the next.
+  // sys_id is unique on every table, so it makes each page deterministic.
+  const pagedQuery = /ORDERBY(DESC)?sys_id\b/.test(query) ? query : `${query}^ORDERBYsys_id`
+
+  const rows = []
+  let offset = 0
+  let pages = 0
+  while (rows.length < max) {
+    const args = ['query', table, '--query', pagedQuery, '--output', 'json', '--auth', auth,
+      '--limit', String(Math.min(pageSize, max - rows.length)), '--offset', String(offset)]
+    if (fields) args.push('--fields', fields)
+    if (displayValue) args.push('--display-value', displayValue)
+    if (timeout) args.push('--timeout', String(timeout))
+    const r = runSdk(args, { capture: true, allowFailure: true, quiet })
+    const output = `${r.stdout || ''}${r.stderr || ''}`
+    const envelope = parseQueryEnvelope(output)
+    if (!envelope) {
+      fail(`Could not read the response of "now-sdk query ${table}" (exit ${r.status}):\n`
+        + stripAnsi(output).trim().slice(0, 800))
+    }
+    if (envelope.ok === false) {
+      const err = envelope.error || {}
+      fail(`query ${table} failed: ${err.message || 'unknown error'}${err.status ? ` (HTTP ${err.status})` : ''}`)
+    }
+    const batch = Array.isArray(envelope.records) ? envelope.records : []
+    rows.push(...batch)
+    pages++
+    if (label && pages > 1) console.log(`  ${label}: ${rows.length} record(s) fetched...`)
+    if (!envelope.hasMore || envelope.nextOffset == null || batch.length === 0) break
+    offset = envelope.nextOffset
+  }
+  return rows
+}
+
+// ---------------------------------------------------------------------------
+// Table API JSON -> <record_update> XML
+// ---------------------------------------------------------------------------
+// Rebuild the XML that `now-sdk transform --from` reads from a queried JSON row,
+// mirroring the shape ServiceNow itself writes into an update set payload:
+//   <record_update table="T"><T action="INSERT_OR_UPDATE"><field>v</field>...</T></record_update>
+// The SDK's parser drops empty elements and the sys_package/sys_mod_count/
+// sys_class_name/sys_update_name bookkeeping fields, and falls back to the raw
+// sys_id whenever a reference carries no usable attribute — so a row fetched with
+// --display-value all reproduces an export faithfully enough to transform.
+const SYS_ID_RE = /^[0-9a-f]{32}$/i
+
+function looksLikeReference(value) {
+  // Plain sys_id, a variable pointer (IO:<sysid>), or a glide_list of sys_ids.
+  return SYS_ID_RE.test(value) || /^IO:[0-9a-f]{32}$/i.test(value)
+    || /^[0-9a-f]{32}(,[0-9a-f]{32})+$/i.test(value)
+}
+
+function xmlElement(name, value, attrs = '') {
+  if (value === '' || value == null) return `<${name}${attrs}/>`
+  const text = String(value)
+  if (/[<>&]/.test(text) || text.includes('\n')) {
+    // Script/HTML fields go in CDATA, as the platform does. CDATA cannot contain
+    // "]]>", so split it across two sections.
+    return `<${name}${attrs}><![CDATA[${text.split(']]>').join(']]]]><![CDATA[>')}]]></${name}>`
+  }
+  return `<${name}${attrs}>${xmlEscape(text)}</${name}>`
+}
+
+function recordJsonToXml(table, row) {
+  const sysId = fieldValue(row.sys_id)
+  const fields = []
+  for (const name of Object.keys(row).sort()) {
+    if (name.startsWith('@')) continue
+    const { value, display } = fieldParts(row[name])
+    // display_value only where the platform puts it: on references, so the SDK's
+    // coalesce lookups have something to match (it falls back to the sys_id if not).
+    const attrs = display && display !== value && looksLikeReference(value)
+      ? ` display_value="${xmlEscape(display)}"` : ''
+    fields.push(xmlElement(name, value, attrs))
+  }
+  // Not a real column — the platform's exporter adds it, and now-fluent's own
+  // parseRecordUpdate reads it; the SDK parser ignores it.
+  if (!('sys_update_name' in row) && sysId) fields.push(`<sys_update_name>${table}_${sysId}</sys_update_name>`)
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<record_update table="${xmlEscape(table)}">\n`
+    + `  <${table} action="INSERT_OR_UPDATE">\n    ${fields.join('\n    ')}\n  </${table}>\n</record_update>\n`
+}
+
+// ---------------------------------------------------------------------------
+// Record discovery via query
+// ---------------------------------------------------------------------------
+// Every Fluent-transformable record is a sys_metadata descendant, and
+// sys_metadata.sys_class_name names the concrete table — so ONE query resolves
+// --table for any number of sys_ids. That removes import's old dead end
+// ("cannot fall back to transform without a table").
+function discoverTables(sysIds, auth) {
+  const found = new Map()
+  // sys_idIN<list> in one shot, chunked so the encoded query stays a sane length.
+  for (let i = 0; i < sysIds.length; i += 50) {
+    const chunk = sysIds.slice(i, i + 50)
+    const rows = queryRecords({
+      table: 'sys_metadata',
+      query: `sys_idIN${chunk.join(',')}`,
+      fields: 'sys_id,sys_class_name,sys_name,sys_scope',
+      displayValue: 'all',
+      auth
+    })
+    for (const row of rows) {
+      const id = fieldValue(row.sys_id)
+      const table = fieldValue(row.sys_class_name)
+      if (id && table) {
+        found.set(id, { table, name: fieldValue(row.sys_name), scope: fieldParts(row.sys_scope).display || fieldValue(row.sys_scope) })
+      }
+    }
+  }
+  return found
+}
+
+// A record's children (a UI policy's actions, an ACL's roles, an import map's entries)
+// must be transformed in the SAME call as their parent or now-sdk defines them twice —
+// the very families import-update-set batches together. The online
+// `transform --table --id` pulls them itself; the query path has to fetch them.
+//
+// Finding the column that links child to parent is not as simple as asking the
+// dictionary for `reference=<parent>^name=<child>`: table inheritance breaks that on
+// both sides. catalog_ui_policy_action INHERITS its `ui_policy` column from
+// sys_ui_policy_action, and that column references sys_ui_policy — not
+// catalog_ui_policy. Matching only the concrete tables finds nothing and the children
+// are silently dropped, leaving a policy with no actions. So resolve both tables'
+// ancestries and match a column defined ANYWHERE in the child's chain that points at
+// ANYTHING in the parent's chain.
+
+// Ancestry stops here: every metadata table extends sys_metadata, so including it
+// would make any column referencing sys_metadata look like a link to the parent.
+const GENERIC_BASE_TABLES = new Set(['sys_metadata', 'sys_metadata_delete'])
+
+const ancestryCache = new Map()
+function tableAncestries(tables, auth) {
+  const missing = tables.filter((t) => !ancestryCache.has(t))
+  if (missing.length) {
+    const superOf = new Map() // table name -> super_class sys_id
+    const nameOf = new Map()  // sys_db_object sys_id -> table name
+    const absorb = (rows) => {
+      const unresolved = []
+      for (const row of rows) {
+        const name = fieldValue(row.name)
+        if (!name) continue
+        const superId = fieldValue(row.super_class)
+        nameOf.set(fieldValue(row.sys_id), name)
+        superOf.set(name, superId || null)
+        if (superId && !nameOf.has(superId)) unresolved.push(superId)
+      }
+      return unresolved
+    }
+    let pending = absorb(queryRecords({
+      table: 'sys_db_object', query: `nameIN${missing.join(',')}`, fields: 'sys_id,name,super_class', auth
+    }))
+    // Each round climbs one level of the hierarchy; the guard just bounds a cycle.
+    for (let level = 0; pending.length && level < 12; level++) {
+      pending = absorb(queryRecords({
+        table: 'sys_db_object', query: `sys_idIN${pending.join(',')}`, fields: 'sys_id,name,super_class', auth
+      }))
+    }
+    for (const table of missing) {
+      const chain = []
+      const seen = new Set()
+      let current = table
+      while (current && !seen.has(current) && !GENERIC_BASE_TABLES.has(current)) {
+        seen.add(current)
+        chain.push(current)
+        const superId = superOf.get(current)
+        current = superId ? nameOf.get(superId) : null
+      }
+      ancestryCache.set(table, chain.length ? chain : [table])
+    }
+  }
+  return new Map(tables.map((t) => [t, ancestryCache.get(t) ?? [t]]))
+}
+
+// Every reference column defined anywhere in a family's table chains, fetched in one
+// dictionary query and cached per family.
+const familyColumnsCache = new Map()
+function familyReferenceColumns(groupKey, chains, auth) {
+  if (!familyColumnsCache.has(groupKey)) {
+    const tables = new Set()
+    for (const chain of chains.values()) for (const t of chain) tables.add(t)
+    const rows = queryRecords({
+      table: 'sys_dictionary',
+      query: `nameIN${[...tables].join(',')}^reference!=NULL`,
+      fields: 'name,element,reference',
+      auth
+    })
+    familyColumnsCache.set(groupKey, rows
+      .map((r) => ({ defining: fieldValue(r.name), column: fieldValue(r.element), target: fieldValue(r.reference) }))
+      .filter((c) => c.defining && c.column && c.target))
+  }
+  return familyColumnsCache.get(groupKey)
+}
+
+// Collect the family members of one parent record, walking the family's reference
+// graph outward from the parent. Not every member points AT the parent: a Form's
+// sections hang off the sys_ui_form_section m2m and its elements off those sections,
+// so the walk follows references in BOTH directions and repeats until nothing new
+// turns up (form -> form_section -> section -> element).
+function relatedChildRows(table, sysId, auth, parentRow) {
+  const group = fetchFamilyFor(table)
+  if (!group) return []
+  const children = group.tables.filter((t) => t !== table)
+  const chains = tableAncestries(group.tables, auth)
+  const columns = familyReferenceColumns(group.key, chains, auth)
+  const inChain = (t, target) => (chains.get(t) ?? [t]).includes(target)
+  const idsIn = (value) => String(value ?? '').split(',').map((s) => s.trim()).filter((s) => /^[0-9a-f]{32}$/i.test(s))
+
+  const fetched = new Map([[table, new Map([[sysId, parentRow ?? null]])]])
+  const pending = new Set(children)
+  const out = []
+
+  // Explicit joins first, for members matched against a field VALUE of the parent
+  // instead of a sys_id reference. A table declared here is removed from the walk
+  // whether or not it returned rows — the walk's view of it would be wrong.
+  for (const link of group.links ?? []) {
+    pending.delete(link.table)
+    const value = parentRow ? fieldValue(parentRow[link.parentField]) : ''
+    if (!value) continue
+    const found = new Map()
+    for (const row of queryRecords({
+      table: link.table,
+      query: `${link.column}=${value}${link.filter ? `^${link.filter(auth)}` : ''}`,
+      displayValue: 'all', auth, pageSize: 200
+    })) {
+      const id = fieldValue(row.sys_id)
+      if (id) found.set(id, row)
+    }
+    if (!found.size) continue
+    fetched.set(link.table, found)
+    for (const row of found.values()) out.push({ table: link.table, row })
+  }
+
+  for (let round = 0; pending.size && round <= group.tables.length; round++) {
+    let progressed = false
+    for (const child of [...pending]) {
+      const found = new Map()
+
+      // Backward: a column on the child (or a table it extends) pointing at something
+      // we already hold — the common parent/child shape.
+      for (const col of columns) {
+        if (!inChain(child, col.defining)) continue
+        for (const [holder, rows] of fetched) {
+          if (!rows.size || holder === child || !inChain(holder, col.target)) continue
+          for (const row of queryRecords({
+            table: child, query: `${col.column}IN${[...rows.keys()].join(',')}`,
+            displayValue: 'all', auth, pageSize: 100
+          })) {
+            const id = fieldValue(row.sys_id)
+            if (id) found.set(id, row)
+          }
+        }
+      }
+
+      // Forward: a column on something we hold pointing AT the child — how an m2m row
+      // reaches the record it links to.
+      const targets = new Set()
+      for (const [holder, rows] of fetched) {
+        if (holder === child) continue
+        for (const col of columns) {
+          if (!inChain(holder, col.defining) || !inChain(child, col.target)) continue
+          for (const row of rows.values()) {
+            if (row) for (const id of idsIn(fieldValue(row[col.column]))) targets.add(id)
+          }
+        }
+      }
+      if (targets.size) {
+        for (const row of queryRecords({
+          table: child, query: `sys_idIN${[...targets].join(',')}`,
+          displayValue: 'all', auth, pageSize: 100
+        })) {
+          const id = fieldValue(row.sys_id)
+          if (id) found.set(id, row)
+        }
+      }
+
+      if (found.size) {
+        fetched.set(child, found)
+        pending.delete(child)
+        progressed = true
+        for (const row of found.values()) out.push({ table: child, row })
+      }
+    }
+    if (!progressed) break
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Self-healing transform runner (shared by import-update-set and import --via query)
+// ---------------------------------------------------------------------------
+// now-sdk builds the whole project after writing each record, and a record can even
+// exit 0 ("Transform completed successfully") while leaving a Fluent object that
+// breaks every LATER build. The reliable signal is the build diagnostics, so capture
+// each transform's log, remove (or auto-fix) whatever its ERROR lines name, and
+// report every removal at the end for manual handling.
+function createHealer({ project, keepFailed }) {
+  const removedForErrors = []
+  // Known now-sdk codegen bug: generated Action() files copy EMPTY instance fields as
+  // `prop: ''`, but some props are typed as enums (e.g. mid_selection_type:
+  // 'use_connection_alias' | 'define_connection_inline' | 'any'), failing the build
+  // with TS2769. Empty means "unset" on the record, so dropping the property is
+  // faithful — try that once before giving up and removing the file.
+  const autofixTried = new Set()
+  const tryAutofix = (p) => {
+    if (!basename(p).startsWith('sys_hub_action_type_definition_')) return false
+    if (autofixTried.has(p)) return false
+    autofixTried.add(p)
+    try {
+      const src = readFileSync(p, 'utf8')
+      const next = src.replace(/^[ \t]*\w+: '',?\n/gm, '')
+      if (next !== src) { writeFileSync(p, next); return true }
+    } catch { /* fall through to removal */ }
+    return false
+  }
+  const removeNamed = (out, indent = '    ') => {
+    const bad = keepFailed ? [] : extractErrorFilePaths(out, project)
+    let handled = 0
+    for (const p of bad) {
+      const rel = relative(project, p)
+      if (tryAutofix(p)) {
+        handled++
+        console.warn(`${indent}auto-fixed ${rel} (dropped empty-string properties the DSL types reject)`)
+        continue
+      }
+      const scripts = []
+      try {
+        const src = readFileSync(p, 'utf8')
+        // Now.include('./scripts/x.js') companions would be orphaned — remove them too.
+        for (const s of src.matchAll(/Now\.include\('([^']+)'\)/g)) scripts.push(resolve(dirname(p), s[1]))
+      } catch { /* already gone */ }
+      rmSync(p, { force: true })
+      for (const s of scripts) rmSync(s, { force: true })
+      removedForErrors.push(rel)
+      handled++
+      console.warn(`${indent}removed ${rel} (named in a build ERROR)`)
+    }
+    return handled
+  }
+  // A broken file can be left by a transform that exited 0 (the damage only surfaces
+  // on the next build), so verify with a real build and clean up anything it names.
+  const verifyProjectBuild = () => {
+    console.log('\nVerifying the project still builds...')
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
+      if (b.status === 0) { console.log('  build OK'); return }
+      const out = `${b.stdout || ''}${b.stderr || ''}`
+      if (!removeNamed(out, '  ')) {
+        process.stdout.write(out)
+        console.error('  ! the build is failing but no file path could be extracted from its errors — fix manually')
+        return
+      }
+    }
+  }
+  const report = () => {
+    if (!removedForErrors.length) return
+    const unique = [...new Set(removedForErrors)]
+    console.warn(`\n! ${unique.length} file(s) were removed because they broke the project build — `
+      + 'handle these records manually:')
+    for (const f of unique) console.warn(`  - ${f}`)
+  }
+  return { removedForErrors, removeNamed, verifyProjectBuild, report }
+}
+
+// Run ONE `transform --from <path>` unit: a single record file, or a folder that must
+// be transformed as one batch (a parent + the children that embed into its DSL).
+function transformFromUnit({ path, label, project, extra = [], dryRun, healer, indent = '    ' }) {
+  let res
+  let attempts = 0
+  while (true) {
+    res = runSdk(['transform', '--from', path, '--directory', project, ...extra],
+      { cwd: project, dryRun, allowFailure: true, capture: !dryRun })
+    if (dryRun) return { ok: true, status: 0 }
+    const out = `${res.stdout || ''}${res.stderr || ''}`
+    process.stdout.write(out)
+    if (res.status === 0) break
+    const removed = healer.removeNamed(out, indent)
+    // Duplicate-definition-only failures: the transform already wrote ALL its output
+    // (the build runs after the writes), so removing the standalone Record() resolves
+    // the conflict — re-running would only recreate it (some batches emit the
+    // standalone even when the family is transformed together). Verify with a build
+    // and treat green as success: the record stays embedded in its parent DSL.
+    const clean = stripAnsi(out)
+    if (removed && /is defined \d+ times/.test(clean) && !/:\d+:\d+\s*-\s*error/.test(clean)) {
+      const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
+      if (b.status === 0) {
+        console.log(`${indent}duplicate(s) resolved by removal — build OK`)
+        return { ok: true, status: 0 }
+      }
+      healer.removeNamed(`${b.stdout || ''}${b.stderr || ''}`, indent)
+    }
+    if (!removed || attempts >= 2) break
+    attempts++
+    console.warn(`${indent}retrying ${label}...`)
+  }
+  return { ok: res.status === 0, status: res.status }
+}
+
+// ---------------------------------------------------------------------------
+// import: move -> online transform -> offline transform of queried JSON
+// ---------------------------------------------------------------------------
+// Three ways into a project, tried in that order (--via picks one explicitly):
+//   move       one call, but needs the target app to already exist on the instance
+//   transform  online per record; resolves relationships itself, but the SDK's
+//              scope checks refuse it for records outside the project's app
+//   query      read the row through the Table REST API, rebuild its <record_update>
+//              XML locally and transform that offline — no scope-gated endpoint in
+//              the path, so it works where the other two are refused
+const IMPORT_STRATEGIES = ['auto', 'move', 'transform', 'query']
+
 function commandImport(flags, config, positional) {
   const project = projectPath(flags, config)
   const auth = flags.auth || config.auth
   if (!auth) fail('Missing required --auth for import')
-  const sysIds = sysIdsFrom(flags, config, positional)
   const table = flags.table || config.table
+  const encodedQuery = flags.query || config.query
   const dryRun = Boolean(flags['dry-run'])
   const extra = flags.__passthrough || []
+  const keepFailed = Boolean(flags['keep-failed'])
+  const related = !flags['no-related']
+  const force = Boolean(flags.force)
+  const max = flags.limit ? Number(flags.limit) : Infinity
+  // An encoded query is a bulk selection, so it defaults to the query strategy —
+  // that is the one that already has every row in hand after a single call.
+  const via = String(flags.via || config.via || (encodedQuery ? 'query' : 'auto')).toLowerCase()
+  if (!IMPORT_STRATEGIES.includes(via)) fail(`Unknown --via ${via} (expected: ${IMPORT_STRATEGIES.join(', ')})`)
 
   if (!existsSync(project)) {
     console.warn(`Project directory does not exist yet: ${project}`)
     console.warn('Initialize it first with: now-fluent init ... (or now-sdk init ...)')
   }
 
-  console.log(`Importing ${sysIds.length} record(s) into ${project} via now-sdk move...`)
-  const moveArgs = ['move', '--ids', ...sysIds, '--auth', auth, '--source', project, ...extra]
-  const moveResult = runSdk(moveArgs, { cwd: project, dryRun, allowFailure: true })
+  // ---- 1. Decide WHICH records to import -----------------------------------
+  let sysIds
+  const prefetched = new Map() // table -> already-fetched full rows (from --query)
+  if (encodedQuery) {
+    if (!table) fail('--query needs --table <table> (the table to run the encoded query against).')
+    if (dryRun) {
+      console.log(`[dry-run] would select records with: now-sdk query ${table} --query ${shellQuote(encodedQuery)} --auth ${auth}`)
+      return
+    }
+    console.log(`Selecting records: ${table} where ${encodedQuery}`)
+    const rows = queryRecords({ table, query: encodedQuery, auth, displayValue: 'all', pageSize: 50, timeout: 120000, max, label: table })
+    if (!rows.length) fail(`No ${table} records matched: ${encodedQuery}`)
+    prefetched.set(table, rows)
+    sysIds = rows.map((r) => fieldValue(r.sys_id)).filter(Boolean)
+    console.log(`  ${sysIds.length} record(s) matched.`)
+  } else {
+    sysIds = sysIdsFrom(flags, config, positional)
+  }
 
-  if (moveResult.status === 0) {
-    console.log(`\nmove succeeded for: ${sysIds.join(', ')}`)
+  // A dry run cannot exercise the ladder (nothing actually fails), so print the plan
+  // for whichever strategies --via selects instead of pretending the first one landed.
+  if (dryRun) {
+    const t = table || '<table resolved from sys_metadata>'
+    const wants = (s) => via === 'auto' || via === s
+    console.log(via === 'auto'
+      ? '\n[dry-run] import tries these in order, stopping at the first that lands:'
+      : `\n[dry-run] import --via ${via} would run:`)
+    if (wants('move')) {
+      console.log(`  move       ${sdkPrintable(['move', '--ids', ...sysIds, '--auth', auth, '--source', project, ...extra])}`)
+    }
+    if (!table && (wants('transform') || wants('query'))) {
+      console.log(`  resolve    ${sdkPrintable(['query', 'sys_metadata', '--query', `sys_idIN${sysIds.join(',')}`, '--fields', 'sys_id,sys_class_name,sys_name,sys_scope', '--display-value', 'all', '--output', 'json', '--auth', auth])}`)
+    }
+    if (wants('transform')) {
+      for (const id of sysIds) {
+        console.log(`  transform  ${sdkPrintable(['transform', '--auth', auth, '--table', t, '--id', id, '--directory', project, ...extra])}`)
+      }
+    }
+    if (wants('query')) {
+      for (const id of sysIds) {
+        console.log(`  query      ${sdkPrintable(['query', t, '--query', `sys_id=${id}`, '--display-value', 'all', '--output', 'json', '--auth', auth])}`)
+      }
+      console.log(`             then ${sdkPrintable(['transform', '--from', '<rebuilt record XML>', '--directory', project, ...extra])}`)
+    }
+    if (via === 'auto') console.log('  (--via move|transform|query pins one strategy instead)')
     return
   }
 
-  console.warn(`\nmove failed (exit code ${moveResult.status}).`)
-  if (!table) {
-    fail('Cannot fall back to transform without a table. Re-run with --table <table> '
-      + '(the table that the sys_id(s) belong to) to enable the transform fallback.')
+  // Resume support for bulk selections: an explicit sys_id list is always imported
+  // (you asked for those records by name), but a --query re-run skips what is
+  // already registered in the project's keys.ts unless --force.
+  if (encodedQuery && !force) {
+    const present = loadProjectRecordIds(project)
+    const remaining = sysIds.filter((id) => !present.has(id))
+    if (remaining.length !== sysIds.length) {
+      console.log(`Skipping ${sysIds.length - remaining.length} record(s) already present in the project `
+        + '(registered in keys.ts) — pass --force to re-import them.')
+    }
+    if (!remaining.length) { console.log('Nothing left to import.'); return }
+    sysIds = remaining
   }
 
-  console.log(`Falling back to: now-sdk transform --table ${table} --id <sysid> (per record)...`)
-  const failed = []
-  for (const id of sysIds) {
-    const transformArgs = ['transform', '--auth', auth, '--table', table, '--id', id, '--directory', project, ...extra]
-    const result = runSdk(transformArgs, { cwd: project, dryRun, allowFailure: true })
-    if (result.status === 0) {
-      console.log(`  transformed ${id}`)
+  let pending = [...sysIds]
+  const importedBy = { move: [], transform: [], query: [] }
+
+  // ---- 2. move -------------------------------------------------------------
+  if (via === 'auto' || via === 'move') {
+    console.log(`\nImporting ${pending.length} record(s) into ${project} via now-sdk move...`)
+    const moveResult = runSdk(['move', '--ids', ...pending, '--auth', auth, '--source', project, ...extra],
+      { cwd: project, allowFailure: true })
+    if (moveResult.status === 0) {
+      importedBy.move = pending
+      pending = []
     } else {
-      console.error(`  transform failed for ${id} (exit code ${result.status})`)
-      failed.push(id)
+      console.warn(`\nmove failed (exit code ${moveResult.status}).`)
+      if (via === 'move') fail(`import --via move failed for: ${pending.join(', ')}`)
     }
   }
-  if (failed.length) fail(`import failed for: ${failed.join(', ')}`)
-  console.log(`\nimport (via transform fallback) succeeded for: ${sysIds.join(', ')}`)
+
+  // ---- 3. resolve each record's table (query makes --table optional) -------
+  const tableFor = new Map()
+  if (pending.length && via !== 'move') {
+    for (const id of pending) if (table) tableFor.set(id, table)
+    const unknown = pending.filter((id) => !tableFor.has(id))
+    if (unknown.length) {
+      console.log(`\nResolving the table of ${unknown.length} record(s) from sys_metadata.sys_class_name...`)
+      const found = discoverTables(unknown, auth)
+      for (const [id, info] of found) {
+        tableFor.set(id, info.table)
+        console.log(`  ${id} -> ${info.table}${info.name ? ` (${info.name}${info.scope ? `, ${info.scope}` : ''})` : ''}`)
+      }
+      const unresolved = unknown.filter((id) => !tableFor.has(id))
+      if (unresolved.length) {
+        console.warn(`  ! could not resolve ${unresolved.length} sys_id(s) from sys_metadata: ${unresolved.join(', ')}`)
+        console.warn('    They may live in a non-metadata (data) table, or be invisible to this account. '
+          + 'Pass --table <table> to import them anyway.')
+      }
+    }
+  }
+
+  // ---- 4. online transform -------------------------------------------------
+  if (pending.length && (via === 'auto' || via === 'transform')) {
+    const doable = pending.filter((id) => tableFor.has(id))
+    if (doable.length) {
+      console.log(`\nTransforming ${doable.length} record(s) online via "now-sdk transform --table <table> --id <id>"...`)
+      const attempting = new Set(doable)
+      const stillPending = pending.filter((id) => !attempting.has(id))
+      for (const id of doable) {
+        const t = tableFor.get(id)
+        const result = runSdk(['transform', '--auth', auth, '--table', t, '--id', id, '--directory', project, ...extra],
+          { cwd: project, allowFailure: true })
+        if (result.status === 0) {
+          console.log(`  ${t} ${id} ok`)
+          importedBy.transform.push(id)
+        } else {
+          console.error(`  ${t} ${id} FAILED (exit ${result.status})`)
+          stillPending.push(id)
+        }
+      }
+      pending = stillPending
+    }
+    if (via === 'transform') {
+      if (pending.length) fail(`import --via transform failed for: ${pending.join(', ')}`)
+      console.log(`\nimport: ${importedBy.transform.length} record(s) into ${project}`)
+      return
+    }
+    if (pending.length) {
+      console.log(`\n${pending.length} record(s) left — falling back to the query path `
+        + '(Table API read + offline transform, which no scope check gates).')
+    }
+  }
+
+  // ---- 5. query -> XML -> offline transform --------------------------------
+  if (pending.length) {
+    const targets = []
+    const noTable = []
+    for (const id of pending) {
+      const t = tableFor.get(id)
+      if (!t) {
+        console.error(`  ! skipping ${id}: no table known (pass --table <table>)`)
+        noTable.push(id)
+        continue
+      }
+      targets.push({ sysId: id, table: t })
+    }
+    if (targets.length) {
+      const result = importViaQuery({
+        targets, auth, project, extra, related, keepFailed, prefetched,
+        outDir: flags.out, keep: Boolean(flags.keep)
+      })
+      importedBy.query = result.imported
+      // Records with no resolvable table never reached the query path — they are
+      // still failures and must not vanish from the summary.
+      pending = [...result.failed, ...noTable]
+    }
+  }
+
+  const total = importedBy.move.length + importedBy.transform.length + importedBy.query.length
+  const by = Object.entries(importedBy).filter(([, v]) => v.length).map(([k, v]) => `${v.length} via ${k}`).join(', ')
+  console.log(`\nimport: ${total} record(s) into ${project}${by ? ` (${by})` : ''}`)
+  if (pending.length) fail(`import failed for: ${pending.join(', ')}`)
+}
+
+// Pull records off the instance as JSON, rebuild their <record_update> XML locally
+// and transform that offline. Each record gets its OWN folder holding the record plus
+// the children that embed into its Fluent DSL, and the folder is transformed in a
+// single `transform --from` call — the same family batching import-update-set does,
+// so now-sdk cannot define a child twice.
+function importViaQuery({ targets, auth, project, extra, related, keepFailed, prefetched, outDir, keep }) {
+  const workDir = outDir ? resolve(outDir) : join(tmpdir(), `now-fluent-query-${randomUUID()}`)
+  mkdirSync(workDir, { recursive: true })
+
+  // One query per table (sys_idIN<list>) rather than one per record.
+  const rowFor = new Map()
+  const byTable = new Map()
+  for (const t of targets) {
+    if (!byTable.has(t.table)) byTable.set(t.table, [])
+    byTable.get(t.table).push(t.sysId)
+  }
+  for (const [tbl, ids] of byTable) {
+    const cached = prefetched?.get(tbl)
+    const rows = cached || queryRecords({
+      table: tbl, query: `sys_idIN${ids.join(',')}`, auth,
+      displayValue: 'all', pageSize: 50, timeout: 120000, label: tbl
+    })
+    for (const row of rows) {
+      const id = fieldValue(row.sys_id)
+      if (id) rowFor.set(id, row)
+    }
+  }
+
+  const units = []
+  const failed = []
+  for (const t of targets) {
+    const row = rowFor.get(t.sysId)
+    if (!row) {
+      console.error(`  ! ${t.table} ${t.sysId}: not returned by the query (wrong table, or no read access)`)
+      failed.push(t.sysId)
+      continue
+    }
+    const dir = join(workDir, `${t.table}_${t.sysId}`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${t.table}_${t.sysId}.xml`), recordJsonToXml(t.table, row))
+    let children = 0
+    if (related) {
+      for (const child of relatedChildRows(t.table, t.sysId, auth, row)) {
+        writeFileSync(join(dir, `${child.table}_${fieldValue(child.row.sys_id)}.xml`), recordJsonToXml(child.table, child.row))
+        children++
+      }
+    }
+    units.push({ sysId: t.sysId, dir, label: `${t.table} ${t.sysId}${children ? ` (+${children} child record(s))` : ''}` })
+  }
+
+  console.log(`\nTransforming ${units.length} rebuilt record(s) offline via now-sdk transform --from...`)
+  const healer = createHealer({ project, keepFailed })
+  const imported = []
+  let i = 0
+  for (const unit of units) {
+    i++
+    console.log(`\n[${i}/${units.length}] importing ${unit.label}`)
+    const { ok, status } = transformFromUnit({ path: unit.dir, label: unit.label, project, extra, healer })
+    if (ok) imported.push(unit.sysId)
+    else { failed.push(unit.sysId); console.error(`  x ${unit.label} FAILED (exit ${status})`) }
+  }
+  // A transform can exit 0 and still leave the project unbuildable; the damage only
+  // shows on the next build. If verification had to remove a record's own file, that
+  // record did NOT land, however green its transform looked.
+  if (units.length && !keepFailed) {
+    const before = healer.removedForErrors.length
+    healer.verifyProjectBuild()
+    for (const removed of healer.removedForErrors.slice(before)) {
+      const at = imported.findIndex((id) => removed.includes(id))
+      if (at >= 0) {
+        console.error(`  x ${imported[at]}: its generated file failed the build and was removed`)
+        failed.push(imported[at])
+        imported.splice(at, 1)
+      }
+    }
+  }
+
+  if (keep || outDir) console.log(`\nKept rebuilt record XML at: ${workDir}`)
+  else rmSync(workDir, { recursive: true, force: true })
+  healer.report()
+  return { imported, failed }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,21 +1086,27 @@ function decodeXmlEntities(value) {
     .replace(/&amp;/g, '&') // must be last so escaped entities are not double-decoded
 }
 
+// A <payload> comes in three encodings depending on where it was read from:
+// HTML-escaped (&lt;record_update&gt;...) or CDATA-wrapped in an XML export, and
+// as the plain record XML when read as JSON off the Table API. Handle all three.
+function normalizeUpdatePayload(raw) {
+  let text = String(raw ?? '').trim()
+  if (!text) return null
+  const cdata = text.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/)
+  if (cdata) text = cdata[1].trim()
+  if (!text.includes('<record_update')) text = decodeXmlEntities(text).trim()
+  return text.includes('<record_update') ? text : null
+}
+
 function extractUpdateSetPayloads(xml) {
   // A ServiceNow update set export is an <unload> with one <sys_update_xml> per
-  // captured record; each holds the record inside <payload>. The payload comes
-  // in two encodings: HTML-escaped (&lt;record_update&gt;...) or wrapped in a
-  // single CDATA section (<![CDATA[<record_update>...]]>). Handle both.
+  // captured record; each holds the record inside <payload>.
   const payloads = []
   const re = /<payload>([\s\S]*?)<\/payload>/g
   let m
   while ((m = re.exec(xml)) !== null) {
-    const raw = m[1].trim()
-    if (!raw) continue
-    const cdata = raw.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/)
-    const recordXml = cdata ? cdata[1].trim() : decodeXmlEntities(raw).trim()
-    if (!recordXml.includes('<record_update')) continue
-    payloads.push(recordXml)
+    const recordXml = normalizeUpdatePayload(m[1])
+    if (recordXml) payloads.push(recordXml)
   }
   return payloads
 }
@@ -407,6 +1146,63 @@ const TRANSFORM_TOGETHER = [
 function transformGroupFor(table) {
   return TRANSFORM_TOGETHER.find((g) => g.tables.includes(table))
 }
+
+// The instance's base language, for family members that exist once per language.
+let baseLanguageValue = null
+function baseLanguage(auth) {
+  if (baseLanguageValue === null) {
+    const [row] = queryRecords({ table: 'sys_properties', query: 'name=glide.sys.language', fields: 'value', auth })
+    baseLanguageValue = (row && fieldValue(row.value)) || 'en'
+  }
+  return baseLanguageValue
+}
+
+// Families that `import --via query` FETCHES together for one record, but that must NOT
+// be batched into a single transform call by import-update-set. The distinction matters:
+// TRANSFORM_TOGETHER also drives how a whole update set is chunked, so putting every
+// catalog table in one group there would collapse a large export into one huge,
+// slow, all-or-nothing step. Fetching is per record, so it has no such cost.
+//
+// `tables` are walked through the reference graph. `links` declare joins the reference
+// walk cannot make — a child matched against a FIELD VALUE of the parent rather than by
+// a sys_id reference — and a table named in `links` is deliberately kept out of the
+// reference walk entirely.
+const FETCH_TOGETHER = [
+  // A catalog item is nearly useless on its own: its variables, UI policies (and their
+  // actions) and client scripts are all separate records referencing it, and they all
+  // hang directly off sc_cat_item, so the ordinary walk finds them.
+  {
+    key: 'sc_cat_item',
+    tables: ['sc_cat_item', 'item_option_new', 'catalog_ui_policy', 'catalog_ui_policy_action', 'catalog_script_client']
+  },
+  // A table and all its fields. Both joins MUST be explicit: sys_dictionary and
+  // sys_choice identify their table by NAME, not by a sys_id reference. Worse, letting
+  // the reference walk near sys_dictionary would be actively wrong —
+  // sys_dictionary.reference DOES point at sys_db_object, but it means "this field
+  // points TO that table", so the walk would drag in every field on the instance that
+  // references it.
+  {
+    key: 'sys_db_object',
+    tables: ['sys_db_object', 'sys_dictionary', 'sys_choice'],
+    links: [
+      { table: 'sys_dictionary', column: 'name', parentField: 'name' },
+      // Choices exist once per language. Only the base language embeds into the Table
+      // schema; the translations cannot, and would land as dozens of standalone
+      // Record() files (36 of them for a 16-choice table on a 12-language instance).
+      { table: 'sys_choice', column: 'name', parentField: 'name', filter: (auth) => `language=${baseLanguage(auth)}` },
+    ],
+  },
+]
+
+// The family to pull in for a record being imported on its own. Only a group's FIRST
+// table is a parent — importing a catalog_ui_policy must fetch its own actions (the
+// catalog_ui_policy family), not climb back up to the catalog item that owns it.
+function fetchFamilyFor(table) {
+  return FETCH_TOGETHER.find((g) => g.tables[0] === table)
+    || TRANSFORM_TOGETHER.find((g) => g.tables[0] === table)
+    || null
+}
+
 
 // Resume support: src/fluent/generated/keys.ts registers every record the project
 // already claims (explicit entries keyed by sys_id, including children embedded in a
@@ -485,11 +1281,114 @@ function extractErrorFilePaths(output, project) {
   return [...paths]
 }
 
+// Read the update set straight off the instance instead of from an exported file.
+// sys_update_xml.payload holds exactly the same <record_update> blob the XML export
+// wraps, so both sources feed the identical pipeline — and because this is a plain
+// Table API read it also works for an update set that is still IN PROGRESS (nothing
+// has to be marked complete and exported first), and for scopes where the SDK's own
+// gated update-set download (fluent_update_set_export.do) is refused.
+function fetchUpdateSetPayloads(ref, auth) {
+  const isSysId = /^[0-9a-f]{32}$/i.test(ref)
+  // Update sets live in two tables: sys_update_set (built on this instance) and
+  // sys_remote_update_set (retrieved from elsewhere). Their sys_update_xml rows point
+  // back through update_set / remote_update_set respectively — look in both so any
+  // update set sys_id can simply be pasted in.
+  const candidates = []
+  for (const table of ['sys_update_set', 'sys_remote_update_set']) {
+    const rows = queryRecords({
+      table,
+      query: isSysId ? `sys_id=${ref}` : `name=${ref}`,
+      fields: 'sys_id,name,state,application,sys_updated_on',
+      displayValue: 'all',
+      auth
+    })
+    for (const row of rows) {
+      candidates.push({
+        table,
+        sysId: fieldValue(row.sys_id),
+        name: fieldValue(row.name),
+        state: fieldValue(row.state),
+        scope: fieldParts(row.application).display || fieldValue(row.application),
+        updated: fieldValue(row.sys_updated_on)
+      })
+    }
+  }
+  if (!candidates.length) {
+    fail(`No update set found for ${isSysId ? `sys_id ${ref}` : `name "${ref}"`} in sys_update_set or sys_remote_update_set.`)
+  }
+  if (candidates.length > 1) {
+    console.error(`Ambiguous update set "${ref}" — ${candidates.length} matches:`)
+    for (const c of candidates) console.error(`  ${c.sysId}  ${c.table}  ${c.name} (${c.state}, updated ${c.updated})`)
+    fail('Re-run with the exact --sys-id of the one you want.')
+  }
+  const set = candidates[0]
+  console.log(`Update set: ${set.name}`)
+  console.log(`  ${set.table} ${set.sysId} — state ${set.state}${set.scope ? `, ${set.scope}` : ''}`)
+
+  // Batched update sets: a "batch parent" captures NOTHING itself — its records live
+  // in the child sets that point at it through `parent`, and batches can nest. The
+  // platform's own export of a parent contains the whole batch, so collect the tree.
+  const setIds = [set.sysId]
+  let frontier = [set.sysId]
+  while (frontier.length) {
+    const kids = queryRecords({
+      table: set.table,
+      query: `parentIN${frontier.join(',')}`,
+      fields: 'sys_id,name,state',
+      auth
+    })
+    frontier = []
+    for (const kid of kids) {
+      const id = fieldValue(kid.sys_id)
+      if (!id || setIds.includes(id)) continue
+      setIds.push(id)
+      frontier.push(id)
+      console.log(`  + batch child: ${fieldValue(kid.name)} (${id})`)
+    }
+  }
+
+  const rows = queryRecords({
+    table: 'sys_update_xml',
+    // Cover both link fields and the whole batch in one query; ordered so the set
+    // imports the way it was recorded.
+    query: `update_setIN${setIds.join(',')}^ORremote_update_setIN${setIds.join(',')}^ORDERBYsys_created_on`,
+    fields: 'sys_id,name,type,target_name,action,payload,sys_created_on',
+    auth,
+    // payloads are whole records (scripts included), so keep pages small and allow
+    // more than the SDK's 30s default per page.
+    pageSize: 50,
+    timeout: 120000,
+    label: 'sys_update_xml'
+  })
+  if (!rows.length) {
+    fail(`Update set ${set.sysId} has no sys_update_xml records`
+      + (setIds.length > 1 ? ` (nor do its ${setIds.length - 1} batch child set(s)).` : ' (nothing was captured in it).'))
+  }
+  const payloads = []
+  let unreadable = 0
+  for (const row of rows) {
+    const payload = normalizeUpdatePayload(fieldValue(row.payload))
+    if (payload) payloads.push(payload)
+    else unreadable++
+  }
+  if (unreadable) console.warn(`  ! ${unreadable} sys_update_xml row(s) had no readable <record_update> payload and were skipped.`)
+  return { payloads, sourceName: `${set.name} (${set.sysId})` }
+}
+
 function commandImportUpdateSet(flags, config, positional) {
-  const fromRaw = flags.from || config.from || positional[0]
-  if (!fromRaw) fail('Missing required --from <path to update set XML> (or pass it positionally)')
-  const from = resolve(fromRaw)
-  if (!existsSync(from)) fail(`Update set XML not found: ${from}`)
+  // The update set can come from a local XML export (--from <path>) or straight off
+  // the instance (--sys-id <32hex> / --name "<name>"), which needs --auth. A 32-hex
+  // positional is read as a sys_id, anything else as a path.
+  const positionalIds = positional.filter((p) => /^[0-9a-f]{32}$/i.test(p))
+  const positionalPath = positional.find((p) => !/^[0-9a-f]{32}$/i.test(p))
+  const fromRaw = flags.from || config.from || positionalPath
+  const setRef = flags['sys-id'] ?? flags.sysId ?? flags.name ?? config.updateSet ?? positionalIds[0]
+  if (Array.isArray(setRef)) fail('--sys-id/--name takes ONE update set (repeat the command for others).')
+  if (fromRaw && setRef) fail('Pass either --from <xml file> or --sys-id/--name (the update set on the instance), not both.')
+  if (!fromRaw && !setRef) {
+    fail('Missing an update set: pass --from <path to update set XML>, or --sys-id <update set sys_id> '
+      + '(or --name "<update set name>") with --auth <alias> to read it from the instance.')
+  }
 
   const projectRaw = flags.project || config.project
   const project = projectRaw ? resolve(projectRaw) : process.cwd()
@@ -513,12 +1412,27 @@ function commandImportUpdateSet(flags, config, positional) {
   const includes = toTokenList(flags.include ?? config.include)
   const excludes = toTokenList(flags.exclude ?? config.exclude)
 
-  const xml = readFileSync(from, 'utf8')
-  const payloads = extractUpdateSetPayloads(xml)
-  if (payloads.length === 0) {
-    fail(`No <sys_update_xml> payloads found in ${basename(from)}. `
-      + 'Expected a ServiceNow update set export (an <unload> containing '
-      + '<sys_update_xml><payload>...</payload></sys_update_xml> entries).')
+  // Both sources produce the same thing: a list of <record_update> payload strings.
+  let payloads
+  let sourceName
+  if (setRef) {
+    if (dryRun) {
+      console.log(`[dry-run] would read the update set from the instance: `
+        + `now-sdk query sys_update_xml --query update_set=${setRef} --auth ${auth || '<alias>'}`)
+      return
+    }
+    ;({ payloads, sourceName } = fetchUpdateSetPayloads(String(setRef), auth))
+    console.log(`Fetched ${payloads.length} record payload(s) from the instance.`)
+  } else {
+    const from = resolve(fromRaw)
+    if (!existsSync(from)) fail(`Update set XML not found: ${from}`)
+    sourceName = basename(from)
+    payloads = extractUpdateSetPayloads(readFileSync(from, 'utf8'))
+    if (payloads.length === 0) {
+      fail(`No <sys_update_xml> payloads found in ${sourceName}. `
+        + 'Expected a ServiceNow update set export (an <unload> containing '
+        + '<sys_update_xml><payload>...</payload></sys_update_xml> entries).')
+    }
   }
 
   // Write each record as its own <record_update> file. now-sdk's own transform
@@ -534,7 +1448,7 @@ function commandImportUpdateSet(flags, config, positional) {
   let filtered = 0
   let n = 0
   for (const payload of payloads) {
-    const { table } = parseRecordUpdate(payload, from)
+    const { table } = parseRecordUpdate(payload, sourceName)
     const sysId = firstMatch(payload, /<sys_id>([0-9a-f]{32})<\/sys_id>/i)
     const base = `${table || 'record'}_${sysId || String(++n)}`
     // --include/--exclude match like update-set-package: a token is a substring of
@@ -571,11 +1485,11 @@ function commandImportUpdateSet(flags, config, positional) {
 
   if (records.length === 0 && flows.length === 0 && actions.length === 0) {
     rmSync(workDir, { recursive: true, force: true })
-    fail(`No records matched after filtering (${payloads.length} payload(s) in ${basename(from)}).`)
+    fail(`No records matched after filtering (${payloads.length} payload(s) in ${sourceName}).`)
   }
 
   const filterNote = (includes.length || excludes.length) ? ` (filtered out ${filtered})` : ''
-  console.log(`Extracted ${records.length} non-flow record(s) from ${basename(from)}${filterNote}.`)
+  console.log(`Extracted ${records.length} non-flow record(s) from ${sourceName}${filterNote}.`)
   if (records.length && records.length <= 20) {
     for (const r of records) console.log(`  - ${r.table || 'unknown'} ${r.sysId || ''}`.trimEnd())
   } else if (records.length) {
@@ -612,67 +1526,12 @@ function commandImportUpdateSet(flags, config, positional) {
   // transforms (both can write files that fail the project build). On failure, the
   // build diagnostics name the file(s) breaking the project; remove them (reported at
   // the end) so they can't fail everything that follows.
-  const removedForErrors = []
   // Note on keys.ts: a transform that exits 0 registers its ids there, but the
   // verification build after a removal prunes entries whose source file is gone, so
   // no manual scrubbing is needed — the presence check just has to read only REAL
   // registrations (see loadProjectRecordIds).
-  // Known now-sdk codegen bug: generated Action() files copy EMPTY instance fields as
-  // `prop: ''`, but some props are typed as enums (e.g. mid_selection_type:
-  // 'use_connection_alias' | 'define_connection_inline' | 'any'), failing the build
-  // with TS2769. Empty means "unset" on the record, so dropping the property is
-  // faithful — try that once before giving up and removing the file.
-  const autofixTried = new Set()
-  const tryAutofix = (p) => {
-    if (!basename(p).startsWith('sys_hub_action_type_definition_')) return false
-    if (autofixTried.has(p)) return false
-    autofixTried.add(p)
-    try {
-      const src = readFileSync(p, 'utf8')
-      const next = src.replace(/^[ \t]*\w+: '',?\n/gm, '')
-      if (next !== src) { writeFileSync(p, next); return true }
-    } catch { /* fall through to removal */ }
-    return false
-  }
-  const removeNamed = (out, indent) => {
-    const bad = keepFailed ? [] : extractErrorFilePaths(out, project)
-    let handled = 0
-    for (const p of bad) {
-      const rel = relative(project, p)
-      if (tryAutofix(p)) {
-        handled++
-        console.warn(`${indent}auto-fixed ${rel} (dropped empty-string properties the DSL types reject)`)
-        continue
-      }
-      const scripts = []
-      try {
-        const src = readFileSync(p, 'utf8')
-        // Now.include('./scripts/x.js') companions would be orphaned — remove them too.
-        for (const s of src.matchAll(/Now\.include\('([^']+)'\)/g)) scripts.push(resolve(dirname(p), s[1]))
-      } catch { /* already gone */ }
-      rmSync(p, { force: true })
-      for (const s of scripts) rmSync(s, { force: true })
-      removedForErrors.push(rel)
-      handled++
-      console.warn(`${indent}removed ${rel} (named in a build ERROR)`)
-    }
-    return handled
-  }
-  // A broken file can be left by a transform that exited 0 (the damage only surfaces
-  // on the next build), so verify with a real build and clean up anything it names.
-  const verifyProjectBuild = () => {
-    console.log('\nVerifying the project still builds...')
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
-      if (b.status === 0) { console.log('  build OK'); return }
-      const out = `${b.stdout || ''}${b.stderr || ''}`
-      if (!removeNamed(out, '  ')) {
-        process.stdout.write(out)
-        console.error('  ! the build is failing but no file path could be extracted from its errors — fix manually')
-        return
-      }
-    }
-  }
+  const healer = createHealer({ project, keepFailed })
+  const { removedForErrors, removeNamed, verifyProjectBuild } = healer
 
   // Online per-flow transform (each flow + its full graph + shapes from the instance).
   // A function because per-record mode runs it BETWEEN the family groups and the
@@ -835,39 +1694,10 @@ function commandImportUpdateSet(flags, config, positional) {
       const transformUnit = (u) => {
         i++
         console.log(`\n[${i}/${totalUnits}] importing ${u.label}`)
-        let res
-        let attempts = 0
-        while (true) {
-          res = runSdk(['transform', '--from', u.file, '--directory', project, ...extra],
-            { cwd: project, dryRun, allowFailure: true, capture: !dryRun })
-          if (dryRun) break
-          const out = `${res.stdout || ''}${res.stderr || ''}`
-          process.stdout.write(out)
-          if (res.status === 0) break
-          const removed = removeNamed(out, '    ')
-          // Duplicate-definition-only failures: the transform already wrote ALL its
-          // output (the build runs after the writes), so removing the standalone
-          // Record() resolves the conflict — re-running the transform would only
-          // recreate it (some batches emit the standalone even when the family is
-          // transformed together). Verify with a build and treat green as success:
-          // the record stays embedded in its parent DSL, nothing is lost.
-          const clean = stripAnsi(out)
-          if (removed && /is defined \d+ times/.test(clean) && !/:\d+:\d+\s*-\s*error/.test(clean)) {
-            const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
-            if (b.status === 0) {
-              console.log('    duplicate(s) resolved by removal — build OK')
-              res = { status: 0 }
-              break
-            }
-            removeNamed(`${b.stdout || ''}${b.stderr || ''}`, '    ')
-          }
-          if (!removed || attempts >= 2) break
-          attempts++
-          console.warn(`    retrying ${u.label}...`)
-        }
+        const { ok, status } = transformFromUnit({ path: u.file, label: u.label, project, extra, dryRun, healer })
         if (dryRun) return
-        if (res.status === 0) { importedRecords += u.count }
-        else { failedRecords.push(u.label); console.error(`  ✗ ${u.label} FAILED (exit ${res.status})`) }
+        if (ok) { importedRecords += u.count }
+        else { failedRecords.push(u.label); console.error(`  x ${u.label} FAILED (exit ${status})`) }
       }
       // Heavy chunks first: family group batches, then the online flows, then the
       // cheap standalone records.
@@ -1319,6 +2149,13 @@ function commandDoctor(flags) {
   } else {
     console.log(`ServiceNow SDK: not available via "${SDK_BIN}"`)
     console.log('Install it (npm i -g @servicenow/sdk) or set NOW_FLUENT_SDK.')
+  }
+
+  // The instance-reading paths (import --via query, import-update-set --sys-id)
+  // need the SDK's `query` command, added in 4.10.
+  if (sdkVersion.status === 0) {
+    console.log(`now-sdk query: ${sdkSupportsQuery() ? 'available' : 'NOT available (needs SDK 4.10+) '
+      + '— import --via query and import-update-set --sys-id will not work'}`)
   }
 
   const cfg = resolve('.now-fluent.json')

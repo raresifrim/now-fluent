@@ -3,11 +3,12 @@
 `now-fluent` is a thin wrapper around the ServiceNow SDK (`now-sdk`). It does two things:
 
 1. **Forwards every now-sdk command verbatim** — use `now-fluent` exactly like `now-sdk`, with the same commands and arguments (including any future now-sdk commands).
-2. **Adds a few Fluent-focused helpers** on top: `import` (move with a transform fallback), `export-xml`, and `update-set-package` (build a real, importable ServiceNow update set).
+2. **Adds four Fluent-focused helpers** on top: `import` (move → online transform → Table-API query, whichever lands), `import-update-set` (a whole update set, from a file or straight off the instance), `export-xml`, and `update-set-package` (build a real, importable ServiceNow update set).
 
 ```text
 now-fluent <now-sdk-command> [...exact now-sdk args]   # forwarded to now-sdk
-now-fluent import | export-xml | update-set-package    # handled by now-fluent
+now-fluent import | import-update-set                  # handled by now-fluent
+now-fluent export-xml | update-set-package             # handled by now-fluent
 ```
 
 ## Safety model
@@ -70,9 +71,17 @@ now-fluent transform --help
 
 `now-fluent help` shows now-fluent's help; `now-fluent doctor` reports the now-fluent, Node, and now-sdk versions.
 
-## import — bring records into a project by sys_id
+## import — bring records into a project
 
-`import` tries `now-sdk move` first and, if that fails, falls back to `now-sdk transform` for each record. (`move` claims records into the app but needs the app present on the instance; `transform --table --id` downloads and converts without that requirement, but needs the record's table.)
+`import` has three ways to get a record into a project and tries them in order until one lands:
+
+| strategy | what it runs | needs |
+| --- | --- | --- |
+| `move` | `now-sdk move --ids ...` | the target app to already exist on the instance |
+| `transform` | `now-sdk transform --table <t> --id <id>` | the SDK's scope checks to allow the record |
+| `query` | `now-sdk query` → rebuilt `<record_update>` XML → `now-sdk transform --from` | nothing beyond read access |
+
+The `query` strategy is the one that always works: it reads the record through the plain Table REST API and rebuilds its update-set-style XML locally, so no scope-gated SDK endpoint is in the path. That is what makes records in ServiceNow-owned scopes importable when `move` and the online `transform` are refused.
 
 ```bash
 now-fluent import \
@@ -84,24 +93,81 @@ now-fluent import \
 Multiple records — repeated flags, comma-separated lists, or positional ids all work:
 
 ```bash
-now-fluent import --project ./my-app --auth dev \
-  --sys-id id1 --sys-id id2
-
-now-fluent import --project ./my-app --auth dev \
-  --sys-id id1,id2,id3
-
+now-fluent import --project ./my-app --auth dev --sys-id id1 --sys-id id2
+now-fluent import --project ./my-app --auth dev --sys-id id1,id2,id3
 now-fluent import --project ./my-app --auth dev id1 id2 id3
 ```
 
-Enable the transform fallback by giving the table the record(s) belong to:
+### `--table` is now optional
+
+The table of any sys_id is resolved with one query against `sys_metadata.sys_class_name`, so the old "cannot fall back to transform without a table" dead end is gone. Pass `--table` only for records that do not extend `sys_metadata` (plain data tables), or to skip the lookup.
+
+### Importing by query
+
+`--query <encoded query>` (with `--table`) imports everything a query matches instead of a sys_id list:
 
 ```bash
 now-fluent import --project ./my-app --auth dev \
   --table sys_script_include \
-  --sys-id 0123456789abcdef0123456789abcdef
+  --query "sys_scope.scope=sn_hamp^active=true"
 ```
 
-If `move` fails and no `--table` is provided, `import` stops and tells you to re-run with `--table` (transform needs a table). Use `--dry-run` to print the now-sdk commands without running them, and `-- <args>` to pass extra flags through to the underlying move/transform (e.g. `-- -d`).
+It defaults to `--via query`, and skips records already registered in the project's `keys.ts` — so an interrupted bulk import can simply be re-run. `--force` re-imports everything; `--limit <n>` caps how many records it takes.
+
+### Composite records
+
+The query path also fetches each record's family — a UI policy's actions, an ACL's roles, a form's sections and elements — and transforms them **in the same call**, so now-sdk embeds them in the parent's DSL instead of defining them twice. `--no-related` imports the record alone.
+
+Covered families:
+
+| parent | fetched with it |
+| --- | --- |
+| `sc_cat_item` | variables, UI policies, policy actions, catalog client scripts |
+| `sys_db_object` | every field (`sys_dictionary`) and its choice lists |
+| `sys_ui_form` | form sections, sections, elements |
+| `sys_ui_policy` / `catalog_ui_policy` | their actions |
+| `sys_security_acl` | its roles |
+| `sys_transform_map` | its entries and scripts |
+| `sys_ui_list` | its elements |
+
+Anything else imports as a single record. That is usually fine, because `--via auto` tries the online `transform --table --id` first and the SDK resolves relationships there itself — the family list only matters when the online transform is refused. Adding a family is one line in the source; the link columns are discovered automatically.
+
+The family is discovered from `sys_dictionary` rather than hard-coded, and the walk follows references outward in both directions until nothing new turns up, so a form reaches its elements through the section m2m (`sys_ui_form` → `sys_ui_form_section` → `sys_ui_section` → `sys_ui_element`). It also resolves table inheritance on both sides: `catalog_ui_policy_action` inherits its `ui_policy` column from `sys_ui_policy_action`, and that column references `sys_ui_policy` — matching only the concrete tables would silently produce a policy with no actions.
+
+Some members are joined by a field value rather than a sys_id reference — a table's fields and choices are matched by table *name* — so those joins are declared explicitly and kept out of the reference walk. Choices are limited to the instance's base language, since only that language embeds into the schema and the translations would otherwise arrive as dozens of loose records.
+
+Verified against a live instance: a catalog item imports as a `CatalogItem()` with all 13 of its variables embedded, 11 UI policies carrying their 17 actions, and 3 client scripts that reference the item's exported symbol; a table imports as a `Table()` with a 25-column typed schema and its choice lists; importing a catalog UI policy by sys_id produces byte-identical output to importing the update set that contains it; and a form imports with all its sections, layout and 18 fields.
+
+`sys_ui_list_control` is the one family member with no reference column back to its parent (it is matched by name/view), so import it through the update set instead.
+
+### Other flags
+
+`--via auto|move|transform|query` pins one strategy. `--dry-run` prints the plan for whichever strategies apply. `--out <dir>`/`--keep` preserve the rebuilt XML for inspection. Failures self-heal the same way `import-update-set` does: files named in a build ERROR are removed (or auto-fixed) and the unit retried, with a verification build at the end (`--keep-failed` leaves them on disk). `-- <args>` passes extra flags to the underlying now-sdk calls (e.g. `-- -d`).
+
+## import-update-set — import a whole update set as Fluent source
+
+Converts every record captured in an update set into Fluent source. The update set can come from a local XML export **or straight off the instance**:
+
+```bash
+# from an XML file you exported/published manually — no instance contact at all
+now-fluent import-update-set --from ./my-update-set.xml --project ./my-app
+
+# from the instance, by sys_id (or by name)
+now-fluent import-update-set --sys-id <update set sys_id> --auth dev --project ./my-app
+now-fluent import-update-set --name "My update set" --auth dev --project ./my-app
+```
+
+Reading it from the instance queries the set's `sys_update_xml` rows, whose `payload` field holds exactly the same `<record_update>` blob the XML export wraps — so both sources feed one identical pipeline. Compared with exporting first, it:
+
+- needs no export step, and no `--from` file to keep track of;
+- works on an update set that is still **in progress** (nothing has to be marked complete and exported);
+- is a plain Table API read, so it also works where the SDK's own gated update-set download is refused;
+- searches both `sys_update_set` (built locally) and `sys_remote_update_set` (retrieved), so any update set sys_id can just be pasted in;
+- handles **batched** update sets: a batch parent captures nothing itself, so the whole child tree is walked and imported, matching what the platform's own export of a parent contains.
+
+Validated against a live instance: for every update set exported locally from that instance, the payloads fetched by `--sys-id` are byte-identical to the exported XML (4, 19, 36, 65, 320 and 631-record sets). Where a record was captured in several sets of one batch, the instance route resolves to the **newest** capture — confirmed to match the record's live state, while the exported file can hand you a stale earlier one.
+
+Everything downstream is the same for both sources: per-record progress, resume via `keys.ts`, family batching, self-healing, and online routing for flows and action definitions. See `now-fluent help` for the full flag list (`--include`/`--exclude`, `--bulk`, `--force`, `--keep-failed`, `--no-flows`, `--out`, `--keep`).
 
 ## export-xml — export the built record XML
 
@@ -208,7 +274,7 @@ Create `.now-fluent.json` in your working directory to set defaults for the enha
 
 ServiceNow-owned scopes (e.g. HAM, `sn_hamp`) should be treated differently from custom scoped apps you own:
 
-- Use `now-fluent import` / `now-fluent transform` to bring records into a local project for analysis and Fluent authoring.
+- Use `now-fluent import` to bring records into a local project for analysis and Fluent authoring. Its `query` strategy reads records through the plain Table API, so it works in vendor scopes where `move` and the online `transform` are refused — as does `import-update-set --sys-id`, which needs no export step.
 - Bind the project to the scope (its `now.config.json` `scope`/`scopeId`) so builds keep the correct `apiName`.
 - Prefer **`update-set-package`** to land customer changes through ServiceNow's import/preview/commit flow, rather than installing an SDK package into a vendor scope.
 - Do not `install` into a ServiceNow-owned scope unless your organization explicitly owns and governs that application/version.
