@@ -225,12 +225,13 @@ Import it in ServiceNow via **System Update Sets → Retrieved Update Sets → I
 | `--out` | Explicit output folder (not auto-overwritten) | `exports/<name>/` |
 | `--no-bundle` | Write only the update set XML (no manifest/checklist/copies) | off |
 | `--zip` | Also produce a `.zip` | off |
+| `--keep-payload-scope` | Keep each payload's `sys_scope` as built. By default every payload `sys_scope` is rewritten to `--scope`/`--scope-id`, so e.g. a Global (`--scope global --scope-id global`) or other-scope update set built from an `sn_*` project lands in the right application | off |
 
 Run from a project that has `now.config.json` (any `init`-created project) and scope/scope-id/app-name are filled in automatically — you usually only pass `--update-set-name` and your selection.
 
 ### Selecting which records to include
 
-Records are gathered from `dist/app/update`, `metadata/update`, and `dist/update` (filenames look like `<table>_<sysid>.xml`), then filtered:
+Records are gathered from `dist/app/update`, `dist/app/author_elective_update` (record deletions tracked in `keys.ts`, emitted with `action="DELETE"` and packaged as `sys_update_xml` action `DELETE`), `metadata/update`, and `dist/update` (filenames look like `<table>_<sysid>.xml`), then filtered:
 
 - `--include <token[,token...]>` — keep only files matching a token.
 - `--exclude <token[,token...]>` — drop files matching a token.

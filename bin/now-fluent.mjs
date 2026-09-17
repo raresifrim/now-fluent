@@ -1764,7 +1764,7 @@ function exportXmlArtifacts(flags, config, outOverride) {
   if (files.length === 0) {
     const filtered = includes.length || excludes.length
     fail(`No XML artifacts found${filtered ? ' matching your --include/--exclude filters' : ''}. `
-      + 'Try --build-local, or check dist/app/update and metadata/update.')
+      + 'Try --build-local, or check dist/app/update, dist/app/author_elective_update and metadata/update.')
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -1798,6 +1798,7 @@ function exportXmlArtifacts(flags, config, outOverride) {
 
 function sourceLabel(source) {
   if (source.includes('/dist/app/update')) return 'dist-app-update'
+  if (source.includes('/dist/app/author_elective_update')) return 'dist-app-author-elective-update'
   if (source.includes('/metadata/update')) return 'metadata-update'
   if (source.includes('/dist/update')) return 'dist-update'
   return basename(source)
@@ -1864,16 +1865,21 @@ function commandUpdateSetPackage(flags, config) {
       const rawXml = readFileSync(file, 'utf8')
       return { ...parseRecordUpdate(rawXml, file), rawXml, file }
     })
+    const keepPayloadScope = Boolean(flags['keep-payload-scope'])
     const xml = buildUpdateSetXml({
       name, description, scope, scopeId, appName,
-      owner: flags.owner || config.owner, records
+      owner: flags.owner || config.owner, records,
+      rewritePayloadScope: !keepPayloadScope
     })
     updateSetFile = join(out, `update-set-${slugify(name)}.xml`)
     writeFileSync(updateSetFile, xml)
     console.log(`Created importable update set XML: ${updateSetFile}`)
-    console.log(`  name="${name}"  scope=${scope}  records=${records.length}`)
+    const deletes = records.filter((r) => isDeletePayload(r.rawXml)).length
+    console.log(`  name="${name}"  scope=${scope}  records=${records.length}  deletes=${deletes}`
+      + `  payload sys_scope=${keepPayloadScope ? 'kept as built' : `${scope} (${scopeId})`}`)
     for (const r of records) {
-      console.log(`   - ${typeLabelForTable(r.table)}: ${r.targetName}  [${r.table}]`)
+      const action = isDeletePayload(r.rawXml) ? ' DELETE' : ''
+      console.log(`   - ${typeLabelForTable(r.table)}: ${r.targetName}  [${r.table}]${action}`)
     }
   }
 
@@ -1977,6 +1983,8 @@ function typeLabelForTable(table) {
 function collectArtifactFiles(project, { includes = [], excludes = [] } = {}) {
   const dirs = [
     join(project, 'dist', 'app', 'update'),
+    // record deletions tracked in keys.ts (removed Fluent code) are emitted here as action="DELETE"
+    join(project, 'dist', 'app', 'author_elective_update'),
     join(project, 'metadata', 'update'),
     join(project, 'dist', 'update')
   ].filter(existsSync)
@@ -2015,7 +2023,22 @@ function parseRecordUpdate(xml, file) {
   return { table, updateName, targetName }
 }
 
-function buildUpdateSetXml({ name, description, scope, scopeId, appName, owner, records }) {
+// A build artifact whose record element carries action="DELETE" (dist/app/author_elective_update).
+function isDeletePayload(xml) {
+  return /<record_update[^>]*>\s*<[A-Za-z0-9_]+[^>]*\baction="DELETE"/.test(String(xml))
+}
+
+// Point every sys_scope of a payload at the update set's application, so records land in the
+// scope the update set is built for (e.g. a Global or other-scope update set from an sn_* project).
+function rewriteSysScope(payload, scope, scopeId) {
+  const display = xmlEscape(scope)
+  const id = xmlEscape(scopeId)
+  return payload
+    .replace(/<sys_scope\b[^>]*\/>/g, `<sys_scope display_value="${display}">${id}</sys_scope>`)
+    .replace(/<sys_scope\b[^>]*>[^<]*<\/sys_scope>/g, `<sys_scope display_value="${display}">${id}</sys_scope>`)
+}
+
+function buildUpdateSetXml({ name, description, scope, scopeId, appName, owner, records, rewritePayloadScope = true }) {
   const now = snDateTime()
   const user = owner || 'admin'
   const remoteSysId = guid()
@@ -2053,10 +2076,11 @@ function buildUpdateSetXml({ name, description, scope, scopeId, appName, owner, 
 
   let recordedAt = Date.now()
   const updates = records.map((r) => {
-    const payload = stripXmlDeclaration(r.rawXml)
+    const stripped = stripXmlDeclaration(r.rawXml)
+    const payload = rewritePayloadScope ? rewriteSysScope(stripped, scope, scopeId) : stripped
     return [
       '<sys_update_xml action="INSERT_OR_UPDATE">',
-      '<action>INSERT_OR_UPDATE</action>',
+      `<action>${isDeletePayload(stripped) ? 'DELETE' : 'INSERT_OR_UPDATE'}</action>`,
       `<application display_value="${xmlEscape(appDisplay)}">${xmlEscape(scopeId)}</application>`,
       '<category>customer</category>',
       '<comments/>',
