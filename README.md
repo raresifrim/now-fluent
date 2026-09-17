@@ -227,7 +227,7 @@ Import it in ServiceNow via **System Update Sets → Retrieved Update Sets → I
 | `--zip` | Also produce a `.zip` | off |
 | `--keep-payload-scope` | Keep each payload's `sys_scope` as built. By default every payload `sys_scope` is rewritten to `--scope`/`--scope-id`, so e.g. a Global (`--scope global --scope-id global`) or other-scope update set built from an `sn_*` project lands in the right application | off |
 
-Known now-sdk build defects are fixed in the payloads before packaging: `sys_hub_flow_snapshot.outputs` serialized as `[object Object]` (subflows with a `masterSnapshot`) is written empty, as on the instance. Any other `[object Object]` in a payload is reported as a warning.
+Known now-sdk build defects are fixed in the payloads before packaging: `sys_hub_flow_snapshot.outputs` serialized as `[object Object]` (subflows with a `masterSnapshot`) is written empty, as on the instance. Top-level flow steps (`sys_hub_action_instance_v2`, `sys_hub_flow_logic_instance_v2`, `sys_hub_sub_flow_instance_v2`) are emitted without `parent_ui_id`; an explicit empty `<parent_ui_id/>` is added so a step moved out of a removed If/loop is re-parented on commit. Any other `[object Object]` in a payload is reported as a warning.
 
 Run from a project that has `now.config.json` (any `init`-created project) and scope/scope-id/app-name are filled in automatically — you usually only pass `--update-set-name` and your selection.
 

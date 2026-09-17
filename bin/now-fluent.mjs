@@ -1869,7 +1869,7 @@ function commandUpdateSetPackage(flags, config) {
       const rawXml = sanitized.xml
       return { ...parseRecordUpdate(rawXml, file), rawXml, file }
     })
-    if (sdkFixes) console.log(`Fixed ${sdkFixes} known now-sdk serialization defect(s) (sys_hub_flow_snapshot.outputs "[object Object]")`)
+    if (sdkFixes) console.log(`Fixed ${sdkFixes} known now-sdk serialization defect(s) (sys_hub_flow_snapshot.outputs "[object Object]", missing parent_ui_id on top-level flow steps)`)
     const keepPayloadScope = Boolean(flags['keep-payload-scope'])
     const xml = buildUpdateSetXml({
       name, description, scope, scopeId, appName,
@@ -2038,7 +2038,17 @@ function sanitizeSdkPayload(xml) {
     fixes++
     return `${before}<outputs/>`
   })
-  return { xml: fixed, fixes, leftovers: (fixed.match(/\[object Object\]/g) || []).length }
+  // - flow components at the top level of a flow are emitted without <parent_ui_id>; on commit the old value is kept,
+  //   so a step moved out of a removed If/loop stays attached to the deleted parent ("Action(s) not found").
+  //   Write an explicit empty <parent_ui_id/> so the instance value is cleared.
+  const withParents = fixed.replace(
+    /(<(sys_hub_action_instance_v2|sys_hub_flow_logic_instance_v2|sys_hub_sub_flow_instance_v2) action="INSERT_OR_UPDATE"[^>]*>)([\s\S]*?)(<\/\2>)/g,
+    (match, open, table, body, close) => {
+      if (/<parent_ui_id\b/.test(body)) return match
+      fixes++
+      return `${open}${body.replace(/\s*$/, '')}\n    <parent_ui_id/>\n  ${close}`
+    })
+  return { xml: withParents, fixes, leftovers: (withParents.match(/\[object Object\]/g) || []).length }
 }
 
 // A build artifact whose record element carries action="DELETE" (dist/app/author_elective_update).
