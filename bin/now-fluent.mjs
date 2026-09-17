@@ -1861,10 +1861,15 @@ function commandUpdateSetPackage(flags, config) {
     console.warn('Skipping importable update set XML: no matching record XML found.')
     console.warn('  Run with --build-local, and check your --include/--exclude filters.')
   } else {
+    let sdkFixes = 0
     const records = files.map((file) => {
-      const rawXml = readFileSync(file, 'utf8')
+      const sanitized = sanitizeSdkPayload(readFileSync(file, 'utf8'))
+      sdkFixes += sanitized.fixes
+      if (sanitized.leftovers) console.warn(`! ${basename(file)}: contains "[object Object]" ${sanitized.leftovers} time(s) - check the payload before importing`)
+      const rawXml = sanitized.xml
       return { ...parseRecordUpdate(rawXml, file), rawXml, file }
     })
+    if (sdkFixes) console.log(`Fixed ${sdkFixes} known now-sdk serialization defect(s) (sys_hub_flow_snapshot.outputs "[object Object]")`)
     const keepPayloadScope = Boolean(flags['keep-payload-scope'])
     const xml = buildUpdateSetXml({
       name, description, scope, scopeId, appName,
@@ -2021,6 +2026,19 @@ function parseRecordUpdate(xml, file) {
     || basename(file).replace(/\.xml$/i, '')
   const targetName = firstMatch(xml, /<name>([^<]*)<\/name>/) || updateName
   return { table, updateName, targetName }
+}
+
+// Known now-sdk serialization defects in build artifacts, fixed before packaging.
+// - sys_hub_flow_snapshot.outputs is written as "[object Object]" for subflows with a masterSnapshot
+//   (update set preview: "Could not find a record in sys_hub_flow_output for column outputs").
+//   On the instance this column is empty; the outputs are sys_hub_flow_output records with model = snapshot.
+function sanitizeSdkPayload(xml) {
+  let fixes = 0
+  const fixed = String(xml).replace(/(<sys_hub_flow_snapshot\b[\s\S]*?)<outputs>\[object Object\]<\/outputs>/g, (match, before) => {
+    fixes++
+    return `${before}<outputs/>`
+  })
+  return { xml: fixed, fixes, leftovers: (fixed.match(/\[object Object\]/g) || []).length }
 }
 
 // A build artifact whose record element carries action="DELETE" (dist/app/author_elective_update).
