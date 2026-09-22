@@ -3,10 +3,11 @@
 `now-fluent` is a thin wrapper around the ServiceNow SDK (`now-sdk`). It does two things:
 
 1. **Forwards every now-sdk command verbatim** — use `now-fluent` exactly like `now-sdk`, with the same commands and arguments (including any future now-sdk commands).
-2. **Adds four Fluent-focused helpers** on top: `import` (move → online transform → Table-API query, whichever lands), `import-update-set` (a whole update set, from a file or straight off the instance), `export-xml`, and `update-set-package` (build a real, importable ServiceNow update set).
+2. **Adds six Fluent-focused helpers** on top: `pull`/`push` (the tight edit loop against one live record), `import` (move → online transform → Table-API query, whichever lands), `import-update-set` (a whole update set, from a file or straight off the instance), `export-xml`, and `update-set-package` (build a real, importable ServiceNow update set).
 
 ```text
 now-fluent <now-sdk-command> [...exact now-sdk args]   # forwarded to now-sdk
+now-fluent pull | push                                 # handled by now-fluent
 now-fluent import | import-update-set                  # handled by now-fluent
 now-fluent export-xml | update-set-package             # handled by now-fluent
 ```
@@ -16,6 +17,7 @@ now-fluent export-xml | update-set-package             # handled by now-fluent
 - It does not commit to Git.
 - It does not deploy anything to an instance unless you run an SDK command that does (`now-fluent install`, etc.) — those are just forwarded to now-sdk.
 - `update-set-package` can build a real, importable update set XML, but it only writes the file locally — **importing, previewing, and committing stay manual steps you perform in ServiceNow.**
+- `push` is the one command that **writes to an instance directly.** It only ever touches the records you name (or `--all` selects), it refuses a record that changed on the instance since you pulled it, and `--dry-run` shows you every request before you send one. Everything else in now-fluent is read-only or local.
 
 ## Requirements
 
@@ -70,6 +72,78 @@ now-fluent transform --help
 ```
 
 `now-fluent help` shows now-fluent's help; `now-fluent doctor` reports the now-fluent, Node, and now-sdk versions.
+
+## pull / push — the tight edit loop against a live record
+
+`update-set-package` is the *governed* path: build an update set, import it, preview it, commit it. That is right for promoting a change you do not own, and heavy for fixing a typo in a script include.
+
+`pull`/`push` is the inner loop. Both ends are the plain Table REST API — the same ungated path `import --via query` uses — so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's own update-set export.
+
+```bash
+# read the record into the project AND snapshot what the instance holds right now
+now-fluent pull --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
+
+# ...edit the Fluent source...
+
+# build, diff against the snapshot, and write only what changed back to the record
+now-fluent push --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
+```
+
+### How push decides what to do
+
+| situation | what push does |
+| --- | --- |
+| record does not exist on the instance | `POST` carrying the `sys_id`, so it keeps the identity `Now.ID` gave it |
+| record exists, fields changed locally | `PUT` with **only** the changed fields |
+| record exists, nothing changed locally | nothing — reported as `unchanged` |
+| record changed on the instance since you pulled | **refused** (`--force` overrides) |
+| record exists but was never pulled | **refused** — there is no baseline to tell your edits from someone else's |
+| artifact is a `DELETE` (you removed the Fluent code) | skipped unless `--allow-delete` — and then still subject to every guard above |
+
+The snapshot lives in `<project>/.now-fluent/state/<table>_<sysid>.json`. It is what makes the diff and the drift check possible; add it to `.gitignore` if you do not want it committed. A snapshot taken against one instance is never used as the diff reference for another — push notices and refuses.
+
+### Two limitations worth knowing
+
+**push cannot clear a field by deleting it from the Fluent source.** A Table API write merges, and the built artifact only contains the fields your Fluent code models — so "absent from the artifact" means "not modelled", not "delete this value". Removing a property leaves the old value on the record. Set it to an explicit empty value instead.
+
+**pull replaces local source.** It takes the instance version of the records you name, so uncommitted Fluent edits to those records are lost. It warns when a record already exists locally; commit or stash first.
+
+### Credentials
+
+`push`/`pull` use **the credential you already gave the SDK** — no second profile, no keychain, no extra tool. `now-sdk auth --print <alias>` exists to hand out a live credential for manual API calls, and that is exactly what now-fluent asks it for. `now-fluent doctor` reports whether that works.
+
+### What push is NOT
+
+A push is a **record write**, so it runs business rules exactly as editing the form would. Committing an update set does not. For a script include that difference is nil; for dictionary and table records it is not. `push` also produces no update set of its own unless you point the session at one with `--update-set <sys_id|name>` (experimental — see below).
+
+Use `update-set-package` to promote anything you do not own.
+
+### Before trusting it: run the spike
+
+Two platform behaviours `push` depends on — that a Table API `PUT` **merges** rather than replaces, and that an insert honours a supplied `sys_id` — plus whether your instance lets you write into a given application scope at all, are instance- and version-dependent. Prove them on a dev instance first:
+
+```bash
+npm run verify-push -- --auth dev                 # Global only
+npm run verify-push -- --auth dev --scope sn_hamp # ...and inside an application scope
+```
+
+It creates throwaway `sys_script_include` records, checks each assumption, deletes them again, and exits non-zero if any assumption fails. `--keep` leaves the records behind for inspection.
+
+### Useful flags
+
+| flag | effect |
+| --- | --- |
+| `--dry-run` | print the method, URL and body for each record; send nothing |
+| `--all` | push every built record (`--include`/`--exclude` select, same tokens as `update-set-package`) |
+| `--full` | send every modelled field, not just the changed ones |
+| `--force` | push anyway when the record drifted |
+| `--no-drift-check` | skip the drift comparison entirely |
+| `--no-build` | push whatever is already in the build output |
+| `--no-scope` | omit `sys_scope` from the write |
+| `--allow-delete` | apply `DELETE` artifacts instead of skipping them |
+| `--update-set <id\|name>` | point your session at an in-progress update set first (experimental) |
+
+`--table` is optional for both commands: `push` reads it from the built artifact (and validates a `--table` you do pass against it), and `pull` resolves it from `sys_metadata.sys_class_name`.
 
 ## import — bring records into a project
 
@@ -265,6 +339,7 @@ Create `.now-fluent.json` in your working directory to set defaults for the enha
   "project": "./my-app",
   "auth": "dev",
   "table": "sys_script_include",
+  "via": "query",
   "updateSetName": "My customizations",
   "scope": "sn_hamp",
   "scopeId": "6cd246601b9e0010cf95dd33dd4bcb8a",
@@ -281,7 +356,17 @@ ServiceNow-owned scopes (e.g. HAM, `sn_hamp`) should be treated differently from
 - Bind the project to the scope (its `now.config.json` `scope`/`scopeId`) so builds keep the correct `apiName`.
 - Prefer **`update-set-package`** to land customer changes through ServiceNow's import/preview/commit flow, rather than installing an SDK package into a vendor scope.
 - Do not `install` into a ServiceNow-owned scope unless your organization explicitly owns and governs that application/version.
+- `push` is *technically* not scope-gated (it is the plain Table API), but "the API allows it" is not "your governance allows it". Verify with `npm run verify-push -- --auth dev --scope <scope>` on a dev instance, and keep vendor-scope changes on the update-set path unless your process says otherwise.
 
 ## Working with the official ServiceNow SDK plugin/skills
 
-Use the official ServiceNow SDK plugin/skills for knowledge and code authoring (how to model a Business Rule, ACL, Table, Scripted REST API, Flow, etc., and `now-sdk explain`). Use `now-fluent` for execution: it is now-sdk plus `import`, `export-xml`, and `update-set-package`.
+Use the official ServiceNow SDK plugin/skills for knowledge and code authoring (how to model a Business Rule, ACL, Table, Scripted REST API, Flow, etc., and `now-sdk explain`). Use `now-fluent` for execution: it is now-sdk plus `pull`/`push`, `import`, `import-update-set`, `export-xml`, and `update-set-package`.
+
+## Tests
+
+```bash
+npm test                              # parser unit tests + push/pull end-to-end tests
+npm run verify-push -- --auth dev     # the live spike against a real instance
+```
+
+`npm test` needs no instance and no SDK: a fake `now-sdk` and an in-process mock Table API stand in for both. The mock encodes the two platform behaviours `push` relies on (PUT merges, POST honours a supplied `sys_id`), so the tests prove the *client* is correct **given** those semantics — `verify-push` is what proves the platform provides them.

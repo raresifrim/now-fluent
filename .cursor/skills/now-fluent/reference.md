@@ -4,13 +4,55 @@
 
 | Command | Purpose |
 |---------|---------|
-| `doctor` | Report now-fluent, Node, now-sdk versions |
+| `doctor` | Report now-fluent, Node, now-sdk versions + push/pull credential readiness |
+| `pull` | Import a record AND snapshot its live state as a push baseline |
+| `push` | Write the built record back to the instance through the Table API |
 | `import` | Bring records into a project by sys_id (move → transform fallback) |
 | `import-update-set` | Unwrap update set XML payloads → transform to Fluent source |
 | `export-xml` | Export built `<record_update>` artifacts + manifest |
 | `update-set-package` | Build real importable update set XML from built records |
 
 All other commands forward to now-sdk unchanged.
+
+## pull / push — key behaviors
+
+The inner edit loop. Both ends are the plain Table REST API, so neither is gated by the
+scope checks that refuse `move` / online `transform` / `download`.
+
+**Credentials.** Taken from the SDK's own store: `now-sdk auth --list` gives the host,
+`now-sdk auth --print <alias> --format headers` gives live auth headers (that flag
+exists for exactly this — "for use in manual API calls"). No second profile, no
+keychain, no ServiceNow CLI (`snc`) dependency.
+
+**`pull`** = `import --via query --force`, plus a baseline at
+`<project>/.now-fluent/state/<table>_<sysid>.json` holding the record's full field
+values and its `sys_updated_on` / `sys_mod_count`. `--no-state` skips the baseline.
+
+**`push`** builds, reads the compiled `<record_update>` artifact, and writes it back:
+
+| situation | action |
+|---|---|
+| record absent on instance | `POST` carrying the `sys_id` (keeps `Now.ID` identity) |
+| record present, fields edited | `PUT` with only the changed fields |
+| record present, nothing edited | no request — `unchanged` |
+| drifted since pull | REFUSED (`--force` overrides) |
+| present but never pulled | REFUSED (no baseline to diff against) |
+| `action="DELETE"` artifact | skipped unless `--allow-delete` |
+
+Never written: `sys_created_*`, `sys_updated_*`, `sys_mod_count`, `sys_update_name`,
+`sys_package`, `sys_policy`, `sys_class_name`. **Is** written: `sys_scope` (that is what
+puts the record in the right scope) — `--no-scope` omits it.
+
+Flags: `--dry-run` (print requests, send nothing), `--all` + `--include`/`--exclude`,
+`--full`, `--no-build`, `--no-drift-check`, `--update-set <id|name>` (experimental).
+One refused record does not abandon the rest of the run.
+
+**Not an update set commit.** A push runs business rules like a form edit; a commit does
+not. Use `update-set-package` to promote anything you do not own.
+
+**Verify first:** `npm run verify-push -- --auth <alias> [--scope <scope>]` proves, on a
+real instance, that a Table API `PUT` merges rather than replaces, that an insert honours
+a supplied `sys_id`, and whether writes into the target scope are permitted at all.
 
 ## import-update-set — key behaviors
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync } from 'node:fs'
 import { join, resolve, basename, dirname, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
-const VERSION = '1.1.0'
+const VERSION = '1.2.0'
 
 // The ServiceNow SDK executable. Override with NOW_FLUENT_SDK, e.g.
 //   NOW_FLUENT_SDK="npx @servicenow/sdk"
@@ -15,9 +16,11 @@ const SDK_BIN = process.env.NOW_FLUENT_SDK || 'now-sdk'
 // Commands handled by now-fluent itself. EVERY other command (and its exact
 // arguments) is forwarded verbatim to now-sdk, so any current or future now-sdk
 // command works unchanged.
-const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package'])
+const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package', 'pull', 'push'])
 
-const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force', 'no-related'])
+const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force', 'no-related',
+  // push/pull
+  'no-build', 'full', 'allow-delete', 'no-drift-check', 'no-scope', 'all', 'no-state'])
 
 // ---------------------------------------------------------------------------
 // Help
@@ -147,6 +150,44 @@ Enhanced commands (handled by now-fluent):
       update-set-package): --include keeps only matching records, --exclude drops
       matching ones (repeatable AND comma-separated). A good large-export filter:
       --exclude sys_documentation,sys_translated,sys_ui_message,sys_atf_test,sys_atf_step
+
+  pull --project <path> --auth <alias> --sys-id <32hex>[,<32hex>...]
+       [--table <table>] [--via query|transform|move|auto] [--no-state] [--dry-run]
+      Import records into the project AND record a baseline snapshot of each one as
+      the instance holds it right now (.now-fluent/state/<table>_<sysid>.json).
+      The import itself is exactly "import --via query --force", so pull works in
+      ServiceNow-owned scopes for the same reason import does: the Table REST API is
+      not gated by the scope checks that refuse move/transform/download.
+      The baseline is what makes push safe — it is how push knows which fields you
+      actually edited, and whether somebody else changed the record meanwhile.
+      --table is optional (resolved from sys_metadata.sys_class_name); --no-state
+      imports without recording a baseline (push then has no drift detection).
+
+  push --project <path> --auth <alias>
+       (--sys-id <32hex>[,<32hex>...] | --all [--include <substr>...] [--exclude <substr>...])
+       [--table <table>] [--no-build] [--full] [--force] [--no-drift-check]
+       [--no-scope] [--allow-delete] [--update-set <sys_id|name>] [--dry-run]
+      Build the project, take the compiled <record_update> artifact for each selected
+      record, and write it straight back to the instance through the Table REST API
+      (PUT for a record that exists, POST carrying the sys_id for one that does not,
+      so the record keeps the identity the SDK's Now.ID gave it).
+      This is the INNER LOOP for iterating on a record you already own or have pulled.
+      It is NOT a replacement for update-set-package: a push is a record write, so it
+      runs business rules exactly as editing the form would, and it produces no
+      update set unless --update-set points the session at one.
+      By default only fields that differ from the pull baseline are sent (--full
+      sends every modelled field), and a record that changed on the instance since
+      you pulled it is REFUSED rather than clobbered (--force overrides, and
+      --no-drift-check disables the check).
+      --table is optional: the table comes from the built artifact, and a --table you
+      do pass is validated against it. --all pushes every built record, selected with
+      the same --include/--exclude substring tokens as update-set-package.
+      --no-scope omits sys_scope from the write; --allow-delete applies DELETE
+      artifacts (removed Fluent code) instead of skipping them.
+      --update-set <sys_id|name> points your account's session at an in-progress
+      update set first, so the writes are captured for promotion (EXPERIMENTAL —
+      verify it on your instance with scripts/verify-push.mjs).
+      --dry-run prints the method, URL and body for each record and sends nothing.
 
   export-xml --project <path> [--out <path>] [--build-local] [--zip]
              [--include <substr>...] [--exclude <substr>...]
@@ -423,6 +464,141 @@ function queryRecords({ table, query, fields, auth, displayValue, pageSize = 100
 }
 
 // ---------------------------------------------------------------------------
+// Instance WRITES (plain Table REST API)
+// ---------------------------------------------------------------------------
+// now-sdk has no write command — `query` is read-only and `install` deploys a whole
+// package. But `now-sdk auth --print <alias>` exists precisely to hand out a LIVE
+// credential "for use in manual API calls":
+//   --format headers  ->  "Authorization: ..." lines (works for basic AND oauth)
+//   --format env      ->  SN_SDK_INSTANCE_URL + session token/cookie
+//   auth --list       ->  "host = https://<instance>" per alias
+// So push/pull reuse the SAME credential store the rest of now-fluent (and the SDK)
+// already uses — no second profile, no keychain, no extra install — and talk to
+// /api/now/table directly. That is the same ungated path `import --via query` relies
+// on to work in ServiceNow-owned scopes, just with POST/PUT/DELETE instead of GET.
+
+const instanceCache = new Map()
+
+// "*[alias]" / "[alias]" followed by "      host = <url>" (see the SDK's
+// prettyPrintCredentials). Colours are stripped before parsing.
+function parseAuthHosts(output) {
+  const hosts = new Map()
+  let current = null
+  for (const raw of output.split('\n')) {
+    const line = raw.trim()
+    const alias = line.match(/^\*?\[(.+)\]$/)
+    if (alias) { current = alias[1]; continue }
+    const host = line.match(/^host\s*=\s*(\S+)/)
+    if (host && current) hosts.set(current, host[1])
+  }
+  return hosts
+}
+
+// `auth --print --format headers` routes ALL logging to stderr and prints only
+// "Name: value" header lines to stdout, so stdout parses cleanly even when the SDK
+// is chattering about telemetry.
+function parseHeaderLines(stdout) {
+  const headers = {}
+  for (const raw of String(stdout).split('\n')) {
+    const line = raw.trim()
+    const idx = line.indexOf(':')
+    if (idx <= 0) continue
+    const name = line.slice(0, idx).trim()
+    if (!/^[A-Za-z0-9-]+$/.test(name)) continue
+    headers[name] = line.slice(idx + 1).trim()
+  }
+  return headers
+}
+
+// The SDK sends a bearer/basic Authorization header, or a session token pair.
+function hasAuthHeader(headers) {
+  return Object.keys(headers).some((name) => /^(authorization|x-sn-session|x-usertoken|cookie)$/i.test(name))
+}
+
+function resolveInstance(auth) {
+  if (!auth) fail('Missing --auth <alias>: reading from and writing to the instance needs credentials.')
+  if (instanceCache.has(auth)) return instanceCache.get(auth)
+
+  const listed = runSdk(['auth', '--list'], { capture: true, allowFailure: true, quiet: true })
+  const hosts = parseAuthHosts(stripAnsi(`${listed.stdout || ''}\n${listed.stderr || ''}`))
+  const host = hosts.get(auth)
+  if (!host) {
+    const known = [...hosts.keys()]
+    fail(`No stored credential with alias "${auth}".${known.length ? ` Known aliases: ${known.join(', ')}.` : ''}`
+      + ' Add one with: now-fluent auth --add https://<instance>.service-now.com')
+  }
+
+  const printed = runSdk(['auth', '--print', auth, '--format', 'headers'], { capture: true, allowFailure: true, quiet: true })
+  const headers = printed.status === 0 ? parseHeaderLines(stripAnsi(printed.stdout || '')) : {}
+  // A non-zero exit, or output with no authenticating header, is a failure however
+  // many "Name: value"-shaped lines it printed — otherwise every write 401s later.
+  if (!hasAuthHeader(headers)) {
+    fail(`Could not obtain auth headers for "${auth}" (now-sdk auth --print exited ${printed.status}).\n`
+      + stripAnsi(`${printed.stderr || ''}`).trim().slice(0, 500))
+  }
+
+  let origin
+  try { origin = new URL(host).origin } catch { fail(`Stored host for "${auth}" is not a URL: ${host}`) }
+  const instance = { alias: auth, origin, headers }
+  instanceCache.set(auth, instance)
+  return instance
+}
+
+// One Table API call. Returns the `result` payload, or null for an allowed 404.
+// An HTTP failure normally ends the run (`fail`); pass throwOnError to get an Error
+// instead, so a caller can keep going — push does that per record, and the Phase 0
+// spike needs it to reach its cleanup step.
+async function snRequest(instance, method, path, { body, params, allow404, throwOnError } = {}) {
+  const abort = (message) => {
+    if (throwOnError) throw new Error(message)
+    fail(message)
+  }
+  const url = new URL(path, instance.origin)
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value != null && value !== '') url.searchParams.set(key, String(value))
+  }
+  const init = { method, headers: { Accept: 'application/json', ...instance.headers } }
+  if (body !== undefined) {
+    init.headers['Content-Type'] = 'application/json'
+    init.body = JSON.stringify(body)
+  }
+
+  let response
+  try {
+    response = await fetch(url, init)
+  } catch (error) {
+    abort(`${method} ${url.pathname} failed: ${error.message}`)
+  }
+  if (response.status === 404 && allow404) return null
+
+  const text = await response.text()
+  let parsed = null
+  try { parsed = text ? JSON.parse(text) : null } catch { /* an HTML error page, not JSON */ }
+
+  if (!response.ok) {
+    const error = parsed && parsed.error ? parsed.error : {}
+    const detail = error.message || error.detail || stripAnsi(text).replace(/\s+/g, ' ').trim().slice(0, 400)
+    let hint = ''
+    if (response.status === 401) hint = '\n  The stored credential was rejected — re-run: now-fluent auth --add <instance>'
+    if (response.status === 403) {
+      hint = '\n  Forbidden: the account lacks write access to this table, or the record belongs to a '
+        + 'protected application (sys_scope.protection_policy). Use update-set-package for that record instead.'
+    }
+    abort(`${method} ${url.pathname} -> HTTP ${response.status}: ${detail || response.statusText}${hint}`)
+  }
+  return parsed && 'result' in parsed ? parsed.result : parsed
+}
+
+// Raw column values (never display values): a push writes sys_ids, not labels.
+const RAW_READ_PARAMS = { sysparm_display_value: 'false', sysparm_exclude_reference_link: 'true' }
+
+async function snGetRecord(instance, table, sysId, fields, { throwOnError } = {}) {
+  const row = await snRequest(instance, 'GET', `/api/now/table/${encodeURIComponent(table)}/${encodeURIComponent(sysId)}`,
+    { params: { ...RAW_READ_PARAMS, sysparm_fields: fields }, allow404: true, throwOnError })
+  return row && Object.keys(row).length ? row : null
+}
+
+// ---------------------------------------------------------------------------
 // Table API JSON -> <record_update> XML
 // ---------------------------------------------------------------------------
 // Rebuild the XML that `now-sdk transform --from` reads from a queried JSON row,
@@ -468,6 +644,91 @@ function recordJsonToXml(table, row) {
   if (!('sys_update_name' in row) && sysId) fields.push(`<sys_update_name>${table}_${sysId}</sys_update_name>`)
   return `<?xml version="1.0" encoding="UTF-8"?>\n<record_update table="${xmlEscape(table)}">\n`
     + `  <${table} action="INSERT_OR_UPDATE">\n    ${fields.join('\n    ')}\n  </${table}>\n</record_update>\n`
+}
+
+// ---------------------------------------------------------------------------
+// <record_update> XML -> Table API JSON  (the inverse of recordJsonToXml)
+// ---------------------------------------------------------------------------
+// `now-sdk build` compiles Fluent into exactly the <record_update> payloads the
+// platform itself writes into an update set, so a built artifact is already a
+// faithful field map — it just has to be read back out to be PUT at the record.
+
+// Structural parsing must not look inside CDATA: a script field can legally contain
+// "</sys_script_include>" or "<field>". Mask every CDATA section first, parse the
+// skeleton, then restore the literal text.
+function maskCdata(xml) {
+  const sections = []
+  const masked = String(xml).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (match, inner) => {
+    sections.push(inner)
+    return `\u0000CDATA${sections.length - 1}\u0000`
+  })
+  return { masked, sections }
+}
+
+function unmaskCdata(value, sections) {
+  return String(value).replace(/\u0000CDATA(\d+)\u0000/g, (match, index) => sections[Number(index)] ?? '')
+}
+
+// An element's attribute run, matched by QUOTED VALUE rather than "anything up to the
+// next >". An attribute value may legally contain an unescaped ">" — a display_value
+// of "Task > Incident" does — and a [^>]* run would cut the tag in the wrong place and
+// silently corrupt the field that push then writes to the live record.
+const XML_ATTRS = '(?:\\s+[A-Za-z_:][-A-Za-z0-9_:.]*\\s*=\\s*(?:"[^"]*"|\'[^\']*\'))*'
+
+// The flat <field>value</field> / <field/> children of one record element.
+function parseFieldElements(inner, sections) {
+  const fields = {}
+  const re = new RegExp(`<([A-Za-z0-9_]+)${XML_ATTRS}\\s*(?:/>|>([\\s\\S]*?)</\\1>)`, 'g')
+  let match
+  while ((match = re.exec(inner)) !== null) {
+    const [, name, raw] = match
+    // Decode entities BEFORE unmasking: CDATA content is literal and must not be
+    // entity-decoded, and a placeholder contains no entities, so this order is safe.
+    fields[name] = raw === undefined ? '' : unmaskCdata(decodeXmlEntities(raw), sections)
+  }
+  return fields
+}
+
+// A <record_update> can carry SEVERAL sibling record elements (a sys_ui_list payload
+// embeds its elements, a Form its sections). Return them all; the caller picks.
+function parseRecordUpdateRecords(xml) {
+  const { masked, sections } = maskCdata(xml)
+  const body = firstMatch(masked, /<record_update\b[^>]*>([\s\S]*)<\/record_update>/) ?? masked
+  const records = []
+  // A record element is the one carrying action=; it need not be the first attribute.
+  const re = new RegExp(`<([A-Za-z0-9_]+)(${XML_ATTRS})\\s*>([\\s\\S]*?)</\\1>`, 'g')
+  let match
+  while ((match = re.exec(body)) !== null) {
+    const [, table, attrs, inner] = match
+    const action = (attrs.match(/\baction\s*=\s*["']([A-Za-z_]+)["']/) || [])[1]
+    if (!action) continue // a stray field element, not a record
+    const fields = parseFieldElements(inner, sections)
+    records.push({ table, action, fields, sysId: fields.sys_id || '' })
+  }
+  return records
+}
+
+// Bookkeeping the instance owns. Writing these is at best ignored and at worst
+// corrupting: sys_mod_count drives optimistic locking, sys_updated_* is the audit
+// trail, sys_update_name is the exporter's synthetic key (recordJsonToXml even adds
+// it itself), and the URL already fixes the class, so sys_class_name is redundant.
+const PUSH_READONLY_FIELDS = new Set([
+  'sys_created_by', 'sys_created_on', 'sys_updated_by', 'sys_updated_on',
+  'sys_mod_count', 'sys_update_name', 'sys_package', 'sys_policy', 'sys_class_name'
+])
+
+// Turn one parsed record element into the body of a Table API write.
+// sys_id is dropped here: PUT carries it in the URL, and the insert path re-adds it
+// explicitly so the record keeps the sys_id the SDK's Now.ID generated for it.
+function recordFieldsToPayload(fields, { keepScope = true } = {}) {
+  const payload = {}
+  for (const name of Object.keys(fields).sort()) {
+    if (name === 'sys_id') continue
+    if (PUSH_READONLY_FIELDS.has(name)) continue
+    if (!keepScope && (name === 'sys_scope' || name === 'sys_scope_delete')) continue
+    payload[name] = fields[name]
+  }
+  return payload
 }
 
 // ---------------------------------------------------------------------------
@@ -2187,6 +2448,488 @@ The \`update-set-*.xml\` is a real, importable update set and is the recommended
 }
 
 // ---------------------------------------------------------------------------
+// pull / push: the tight edit loop against a live record
+// ---------------------------------------------------------------------------
+// update-set-package stays the GOVERNED path for promoting a change you do not own.
+// pull/push is the inner loop: read a record into Fluent, edit it, write it straight
+// back. Both ends are the plain Table REST API, the same ungated path import --via
+// query already uses, so neither is blocked by the scope checks that refuse move,
+// the online transform, download and the SDK's update-set export.
+//
+// IMPORTANT SEMANTIC DIFFERENCE: a push is a record write, so it runs business rules
+// exactly as a user editing the form would. Committing an update set does not. For a
+// script include that difference is nil; for dictionary/table records it is not.
+
+// A pull records what the instance held at that moment. push diffs the built artifact
+// against it (so only genuinely edited fields are written) and compares the live
+// sys_updated_on/sys_mod_count against it (so a record someone else changed since the
+// pull is not silently clobbered).
+function statePath(project, table, sysId) {
+  return join(project, '.now-fluent', 'state', `${table}_${sysId}.json`)
+}
+
+// Baselines are keyed <table>_<sysid>; when the table is not known, find by sys_id.
+function findBaselineFor(project, sysId) {
+  const dir = join(project, '.now-fluent', 'state')
+  if (!existsSync(dir)) return null
+  const name = readdirSync(dir).find((file) => file.endsWith(`_${sysId}.json`))
+  return name ? join(dir, name) : null
+}
+
+function readBaseline(project, table, sysId) {
+  const file = statePath(project, table, sysId)
+  if (!existsSync(file)) return null
+  try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return null }
+}
+
+function writeBaseline(project, table, sysId, instance, row) {
+  const file = statePath(project, table, sysId)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, `${JSON.stringify({
+    table,
+    sysId,
+    alias: instance.alias,
+    instance: instance.origin,
+    pulledAt: new Date().toISOString(),
+    sys_updated_on: row.sys_updated_on || '',
+    sys_mod_count: row.sys_mod_count || '',
+    fields: row
+  }, null, 2)}\n`)
+  return file
+}
+
+// ---------------------------------------------------------------------------
+// pull
+// ---------------------------------------------------------------------------
+async function commandPull(flags, config, positional) {
+  const project = projectPath(flags, config)
+  const auth = flags.auth || config.auth
+  if (!auth) fail('Missing required --auth for pull')
+  const dryRun = Boolean(flags['dry-run'])
+  const sysIds = sysIdsFrom(flags, config, positional)
+
+  // pull takes the INSTANCE version, so it replaces the local Fluent source for these
+  // records. That is the contract, but it is silent data loss if the developer had
+  // uncommitted edits — so say which records are about to be overwritten.
+  const alreadyLocal = loadProjectRecordIds(project)
+  const replacing = sysIds.filter((id) => alreadyLocal.has(id))
+  if (replacing.length) {
+    console.warn(`Warning: ${replacing.length} of these record(s) already exist as Fluent source in this `
+      + 'project. pull takes the INSTANCE version, so any local edits to them will be replaced:')
+    for (const id of replacing) console.warn(`  ${id}`)
+    console.warn('  Commit or stash your work first if you need it back.\n')
+  }
+
+  // pull defaults to the query strategy: it is the one that survives ServiceNow-owned
+  // scopes. --via transform|move|auto still works for a project that can use them.
+  const importFlags = { ...flags, via: flags.via || config.via || 'query', force: true }
+  commandImport(importFlags, config, positional)
+  if (dryRun) return
+
+  if (flags['no-state']) {
+    // Be precise: this skips WRITING a baseline. Any baseline an earlier pull left on
+    // disk is still there, and push will still use it for the drift check and the diff
+    // — which, against a record just re-pulled, will look like drift.
+    const stale = sysIds.filter((id) => existsSync(statePath(project, flags.table || config.table || '', id))
+      || findBaselineFor(project, id))
+    console.log('\n--no-state: not recording a baseline for these records.')
+    if (stale.length) {
+      console.warn(`  Warning: ${stale.length} of them still have a baseline from an earlier pull. push will `
+        + 'keep using it, so a record you just re-pulled may be refused as drifted. Delete '
+        + `${join(project, '.now-fluent', 'state')} to start clean.`)
+    }
+    return
+  }
+
+  // The import also brings in family children (a UI policy's actions, an ACL's roles).
+  // Those are real records somebody may push, so they need baselines too — otherwise
+  // pushing one is refused for "no usable pull baseline". Anything newly registered in
+  // keys.ts by this import counts.
+  const nowLocal = loadProjectRecordIds(project)
+  const imported = [...new Set([...sysIds, ...[...nowLocal].filter((id) => !alreadyLocal.has(id))])]
+
+  // The baseline needs each record's table. --table covers the ids the user named;
+  // resolve the rest the same way import does.
+  const tableFor = new Map()
+  const table = flags.table || config.table
+  if (table) for (const id of sysIds) tableFor.set(id, table)
+  const unknown = imported.filter((id) => !tableFor.has(id))
+  if (unknown.length) for (const [id, info] of discoverTables(unknown, auth)) tableFor.set(id, info.table)
+
+  const instance = resolveInstance(auth)
+  console.log('\nRecording pull baselines...')
+  let written = 0
+  const skipped = []
+  for (const sysId of imported) {
+    const recordTable = tableFor.get(sysId)
+    if (!recordTable) {
+      console.warn(`  ! ${sysId}: table unknown, no baseline recorded (pass --table <table>)`)
+      skipped.push(sysId)
+      continue
+    }
+    // One unreadable record must not cost every later record its baseline.
+    try {
+      const row = await snGetRecord(instance, recordTable, sysId, undefined, { throwOnError: true })
+      if (!row) {
+        console.warn(`  ! ${recordTable} ${sysId}: not readable on the instance, no baseline recorded`)
+        skipped.push(sysId)
+        continue
+      }
+      writeBaseline(project, recordTable, sysId, instance, row)
+      console.log(`  ${recordTable} ${sysId} baseline recorded (${Object.keys(row).length} fields)`)
+      written++
+    } catch (error) {
+      console.warn(`  ! ${recordTable} ${sysId}: ${error && error.message ? error.message : error}`)
+      skipped.push(sysId)
+    }
+  }
+  console.log(`\npull: ${written} baseline(s) in ${join(project, '.now-fluent', 'state')}`)
+  if (skipped.length) {
+    console.warn(`  ${skipped.length} record(s) have no baseline, so pushing them will be refused `
+      + 'until you pull them successfully (or pass --force).')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// push
+// ---------------------------------------------------------------------------
+// Locate the built artifact that defines a sys_id. The filename is normally
+// <table>_<sysid>.xml, but a family child is embedded in its PARENT's artifact, so
+// fall back to scanning payload bodies for the sys_id.
+function findArtifactRecord(project, sysId, artifacts) {
+  const byName = artifacts.filter((file) => basename(file).includes(sysId))
+  for (const file of [...byName, ...artifacts.filter((f) => !byName.includes(f))]) {
+    const xml = readFileSync(file, 'utf8')
+    if (!xml.includes(sysId)) continue
+    const records = parseRecordUpdateRecords(xml)
+    const match = records.find((record) => record.sysId === sysId)
+    if (match) return { file, xml, record: match }
+  }
+  return null
+}
+
+// Render a write body for --dry-run without dumping whole scripts into the terminal.
+function previewPayload(payload) {
+  const preview = {}
+  for (const [name, value] of Object.entries(payload)) {
+    const text = String(value)
+    preview[name] = text.length > 120 ? `${text.slice(0, 117)}...` : text
+  }
+  return JSON.stringify(preview, null, 2).split('\n').map((line) => `      ${line}`).join('\n')
+}
+
+// EXPERIMENTAL: point the calling user's session at an update set before writing, so
+// Table API writes to metadata tables are captured for promotion like any UI edit.
+// The platform stores this as the sys_update_set user preference.
+async function setCurrentUpdateSet(instance, ref) {
+  const isSysId = SYS_ID_RE.test(ref)
+  const sets = await snRequest(instance, 'GET', '/api/now/table/sys_update_set', {
+    params: {
+      ...RAW_READ_PARAMS,
+      sysparm_query: isSysId ? `sys_id=${ref}` : `name=${ref}^state=in progress`,
+      sysparm_fields: 'sys_id,name,state',
+      sysparm_limit: '10'
+    }
+  })
+  const rows = Array.isArray(sets) ? sets : []
+  if (!rows.length) fail(`No sys_update_set matched --update-set ${ref}.`)
+  if (rows.length > 1) {
+    fail(`--update-set ${ref} matched ${rows.length} update sets:\n`
+      + rows.map((r) => `  ${r.sys_id}  ${r.name} (${r.state})`).join('\n')
+      + '\nPass the exact --update-set <sys_id>.')
+  }
+  const target = rows[0]
+  if (target.state !== 'in progress') {
+    fail(`Update set "${target.name}" is ${target.state}, not "in progress" — it cannot capture changes.`)
+  }
+
+  const me = await snRequest(instance, 'GET', '/api/now/ui/user/current_user')
+  const userId = me && (me.user_sys_id || me.sys_id)
+  if (!userId) fail('Could not resolve the current user, so --update-set cannot set the session update set.')
+
+  const existing = await snRequest(instance, 'GET', '/api/now/table/sys_user_preference', {
+    params: { ...RAW_READ_PARAMS, sysparm_query: `name=sys_update_set^user=${userId}`, sysparm_fields: 'sys_id,value', sysparm_limit: '1' }
+  })
+  const current = Array.isArray(existing) && existing.length ? existing[0] : null
+  if (current) {
+    await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${current.sys_id}`, { body: { value: target.sys_id } })
+  } else {
+    await snRequest(instance, 'POST', '/api/now/table/sys_user_preference', {
+      body: { name: 'sys_update_set', user: userId, value: target.sys_id, type: 'string' }
+    })
+  }
+  console.log(`Current update set for this account: "${target.name}" (${target.sys_id})`)
+
+  // This preference is the account's, not the command's: leaving it repointed would
+  // keep capturing the user's later UI edits into this update set. Always put it back.
+  return {
+    target,
+    async restore() {
+      if (current) {
+        await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${current.sys_id}`,
+          { body: { value: current.value || '' }, throwOnError: true })
+        console.log(`Restored the previous update set preference (${current.value || 'none'}).`)
+      } else {
+        // An empty id would address the COLLECTION, so check before sending anything.
+        const id = await findPreferenceId(instance, userId)
+        if (!id) throw new Error('could not find the sys_update_set preference to remove')
+        await snRequest(instance, 'DELETE', `/api/now/table/sys_user_preference/${id}`,
+          { allow404: true, throwOnError: true })
+        console.log('Removed the update set preference this push created.')
+      }
+    }
+  }
+}
+
+async function findPreferenceId(instance, userId) {
+  const rows = await snRequest(instance, 'GET', '/api/now/table/sys_user_preference', {
+    params: { ...RAW_READ_PARAMS, sysparm_query: `name=sys_update_set^user=${userId}`, sysparm_fields: 'sys_id', sysparm_limit: '1' },
+    throwOnError: true
+  })
+  return Array.isArray(rows) && rows.length ? rows[0].sys_id : ''
+}
+
+// Push ONE built record. Returns the bucket it belongs in; throws on a transport
+// error so the caller can record the failure and carry on with the next record.
+async function pushRecord(target, label, context) {
+  const { project, instance, flags, auth, dryRun, force } = context
+  const { table, sysId, action } = target.record
+
+  // Apply the same known-defect fixes update-set-package applies before packaging.
+  const { xml: sanitized, fixes } = sanitizeSdkPayload(target.xml)
+  const record = fixes && sanitized !== target.xml
+    ? (parseRecordUpdateRecords(sanitized).find((r) => r.sysId === sysId) || target.record)
+    : target.record
+
+  // Only THIS record's own action decides whether it is a delete. isDeletePayload()
+  // looks at whichever record element comes first in the file, so using it here would
+  // delete an INSERT_OR_UPDATE record that merely shares an artifact with a DELETE.
+  const deleting = action === 'DELETE'
+  if (deleting && !flags['allow-delete']) {
+    console.log(`${label} SKIPPED (a delete; pass --allow-delete to apply it)`)
+    return 'unchanged'
+  }
+
+  const payload = recordFieldsToPayload(record.fields, { keepScope: !flags['no-scope'] })
+  const live = dryRun ? null : await snGetRecord(instance, table, sysId, 'sys_id,sys_updated_on,sys_mod_count', { throwOnError: true })
+
+  // A baseline pulled from a DIFFERENT instance describes a different record, so it is
+  // no basis for a diff (and would be overwritten with this instance's values). Drop it
+  // and let the "no baseline" guard below refuse the push.
+  const stored = readBaseline(project, table, sysId)
+  const foreign = Boolean(stored && !dryRun && stored.instance && stored.instance !== instance.origin)
+  if (foreign) {
+    console.warn(`${label} the stored baseline was pulled from ${stored.instance}, not ${instance.origin} — ignoring it.`)
+  }
+  const baseline = foreign ? null : stored
+
+  // ---- has somebody else changed it since the pull? ------------------------
+  const drifted = Boolean(live && baseline
+    && (live.sys_updated_on !== baseline.sys_updated_on || live.sys_mod_count !== baseline.sys_mod_count))
+
+  if (live && !flags['no-drift-check'] && !force) {
+    if (!baseline) {
+      console.error(`${label} REFUSED: the record exists on the instance but this project has no usable pull `
+        + "baseline for it, so a push cannot tell your edits from someone else's.\n"
+        + `      Pull it first (now-fluent pull --project ... --auth ${auth} --sys-id ${sysId}), `
+        + 'or re-run with --force / --no-drift-check.')
+      return 'failed'
+    }
+    if (drifted) {
+      console.error(`${label} REFUSED: changed on the instance since you pulled it.\n`
+        + `      pulled:   ${baseline.sys_updated_on} (mod_count ${baseline.sys_mod_count})\n`
+        + `      instance: ${live.sys_updated_on} (mod_count ${live.sys_mod_count})\n`
+        + '      Re-pull to take the instance version, or --force to overwrite it.')
+      return 'failed'
+    }
+  }
+
+  // ---- DELETE, now that the guards above have had their say ----------------
+  // Destroying a record deserves at least the checks an update gets: the drift and
+  // baseline guards ran above and already returned 'failed' if they were not satisfied.
+  if (deleting) {
+    if (!dryRun && !live) {
+      console.log(`${label} already absent`)
+      rmSync(statePath(project, table, sysId), { force: true })
+      return 'unchanged'
+    }
+    if (dryRun) {
+      console.log(`${label}\n      DELETE ${instance.origin}/api/now/table/${table}/${sysId}`)
+      return 'deleted'
+    }
+    await snRequest(instance, 'DELETE', `/api/now/table/${table}/${sysId}`, { allow404: true, throwOnError: true })
+    rmSync(statePath(project, table, sysId), { force: true })
+    console.log(`${label} deleted`)
+    return 'deleted'
+  }
+
+  // ---- send only what actually changed -------------------------------------
+  // A stale baseline is not a safe diff reference: diffing against it would send only
+  // the fields YOU edited and silently keep the other party's edits to everything else,
+  // which is not the "overwrite it" that --force (and --no-drift-check) promise.
+  const diffable = !flags.full && baseline && live && !drifted
+  if (drifted && !flags.full) {
+    console.warn(`${label} overwriting a drifted record — sending every modelled field, not just your edits.`)
+  }
+  let body = payload
+  if (diffable) {
+    body = {}
+    for (const [name, value] of Object.entries(payload)) {
+      if (String(baseline.fields[name] ?? '') !== String(value)) body[name] = value
+    }
+    if (!Object.keys(body).length) {
+      console.log(`${label} unchanged`)
+      return 'unchanged'
+    }
+  }
+
+  // A dry run deliberately contacts nothing, so it cannot know whether the record
+  // exists — say so rather than guessing a verb, and show the FULL payload, which is
+  // the most a real run could send (a real run diffs it down to what changed).
+  if (dryRun) {
+    console.log(`${label}\n`
+      + `      PUT  ${instance.origin}/api/now/table/${table}/${sysId}   (if it exists)\n`
+      + `      POST ${instance.origin}/api/now/table/${table}   (if it does not, with sys_id: ${sysId})\n`
+      + `      ${Object.keys(body).length} field(s) at most; a real push sends only what differs from the baseline\n`
+      + previewPayload(body))
+    return 'updated'
+  }
+
+  // A Table API insert honours a supplied sys_id, which is what keeps the record's
+  // identity equal to the sys_id the SDK's Now.ID generated for it.
+  const creating = !live
+  if (creating) body = { ...body, sys_id: sysId }
+  const method = creating ? 'POST' : 'PUT'
+  const path = creating ? `/api/now/table/${table}` : `/api/now/table/${table}/${sysId}`
+
+  await snRequest(instance, method, path, { body, params: { sysparm_fields: 'sys_id' }, throwOnError: true })
+
+  // Refresh the baseline from what the instance now holds, so the next push diffs
+  // against reality (business rules may have changed fields on the way in). The WRITE
+  // has already succeeded, so a failure of this READ must not report it as failed —
+  // it would send the user into a retry that the stale baseline then rejects as drift.
+  try {
+    const written = await snGetRecord(instance, table, sysId, undefined, { throwOnError: true })
+    if (written) writeBaseline(project, table, sysId, instance, written)
+  } catch (error) {
+    rmSync(statePath(project, table, sysId), { force: true })
+    console.warn(`${label} written, but its baseline could not be refreshed `
+      + `(${error && error.message ? error.message : error}). Removed the stale baseline — pull it again.`)
+  }
+  console.log(`${label} ${creating ? 'created' : 'updated'} (${Object.keys(body).length} field(s))`)
+  return creating ? 'created' : 'updated'
+}
+
+async function commandPush(flags, config, positional) {
+  const project = projectPath(flags, config)
+  if (!existsSync(project)) fail(`Project path does not exist: ${project}`)
+  const auth = flags.auth || config.auth
+  if (!auth) fail('Missing required --auth for push')
+  const dryRun = Boolean(flags['dry-run'])
+  const force = Boolean(flags.force)
+  const pushAll = Boolean(flags.all)
+  const expectedTable = flags.table || config.table
+
+  if (!pushAll && !(flags['sys-id'] ?? flags.sysId ?? flags.ids ?? config.sysIds ?? positional.length)) {
+    fail('push needs --sys-id <32hex> (repeatable/comma-separated) or --all.')
+  }
+
+  // ---- 1. build -----------------------------------------------------------
+  if (flags['no-build']) console.log('--no-build: pushing whatever is already in the build output.')
+  else runSdk(['build'], { cwd: project, dryRun })
+
+  // ---- 2. select the records to push --------------------------------------
+  const includes = toTokenList(flags.include)
+  const excludes = toTokenList(flags.exclude)
+  if (!pushAll && (includes.length || excludes.length)) {
+    console.warn('Note: --include/--exclude only select records for --all; an explicit --sys-id list is '
+      + 'pushed as given.')
+  }
+  const artifacts = collectArtifactFiles(project, pushAll ? { includes, excludes } : {})
+  if (!artifacts.length) {
+    fail('No built XML artifacts found. Run a build first (drop --no-build), or check dist/app/update.')
+  }
+
+  const targets = []
+  const unresolved = []
+  if (pushAll) {
+    for (const file of artifacts) {
+      const xml = readFileSync(file, 'utf8')
+      for (const record of parseRecordUpdateRecords(xml)) {
+        if (!record.sysId) continue
+        if (expectedTable && record.table !== expectedTable) continue
+        targets.push({ file, xml, record })
+      }
+    }
+    if (!targets.length) fail('No records selected by --all (check --include/--exclude/--table).')
+  } else {
+    for (const sysId of sysIdsFrom(flags, config, positional)) {
+      const found = findArtifactRecord(project, sysId, artifacts)
+      if (!found) {
+        // A per-record problem, so it must not abandon the records that ARE buildable.
+        console.error(`  ! No built record found for sys_id ${sysId}. Is it defined in this project, `
+          + 'and did the build succeed?\n'
+          + '    Tip: pull it first (now-fluent pull --sys-id ...) so it exists as Fluent source.')
+        unresolved.push(sysId)
+        continue
+      }
+      // A contradicted --table means the command line is wrong about what it is pushing,
+      // so stop before writing anything anywhere.
+      if (expectedTable && found.record.table !== expectedTable) {
+        fail(`--table ${expectedTable} does not match the built record: ${sysId} is a ${found.record.table} `
+          + `(from ${relative(project, found.file)}).`)
+      }
+      targets.push(found)
+    }
+    if (!targets.length && unresolved.length) fail(`push failed for: ${unresolved.join(', ')}`)
+  }
+
+  // ---- 3. push each record -------------------------------------------------
+  const instance = dryRun ? { alias: auth, origin: 'https://<instance>', headers: {} } : resolveInstance(auth)
+  let updateSetSession = null
+  if (flags['update-set']) {
+    if (dryRun) console.log(`[dry-run] would set the session update set to: ${flags['update-set']}`)
+    else updateSetSession = await setCurrentUpdateSet(instance, flags['update-set'])
+  }
+
+  console.log(dryRun
+    ? `\n[dry-run] ${targets.length} record(s) would be pushed to the instance behind alias "${auth}". Nothing is sent.`
+    : `\nPushing ${targets.length} record(s) to ${instance.origin}...`)
+  const results = { created: [], updated: [], deleted: [], unchanged: [], failed: [...unresolved] }
+  const context = { project, instance, flags, auth, dryRun, force }
+
+  try {
+    for (const [index, target] of targets.entries()) {
+      const { table, sysId } = target.record
+      const label = `[${index + 1}/${targets.length}] ${table} ${sysId}`
+      let outcome
+      try {
+        outcome = await pushRecord(target, label, context)
+      } catch (error) {
+        // One refused record must not abandon the rest of the run.
+        console.error(`${label} FAILED: ${error && error.message ? error.message : error}`)
+        outcome = 'failed'
+      }
+      results[outcome].push(sysId)
+    }
+  } finally {
+    if (updateSetSession) {
+      try {
+        await updateSetSession.restore()
+      } catch (error) {
+        console.error('WARNING: could not restore your previous update set preference '
+          + `(${error && error.message ? error.message : error}).\n`
+          + `  Your session is still pointed at "${updateSetSession.target.name}" — reset it in ServiceNow.`)
+      }
+    }
+  }
+
+  const summary = Object.entries(results).filter(([, v]) => v.length).map(([k, v]) => `${v.length} ${k}`).join(', ')
+  console.log(`\npush${dryRun ? ' [dry-run, nothing sent]' : ''}: ${summary || 'nothing to do'}`)
+  if (results.failed.length) fail(`push failed for: ${results.failed.join(', ')}`)
+}
+
+// ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------
 function commandDoctor(flags) {
@@ -2210,6 +2953,26 @@ function commandDoctor(flags) {
       + '— import --via query and import-update-set --sys-id will not work'}`)
   }
 
+  // push/pull write through the plain Table API using a credential the SDK hands out
+  // via `auth --print`, so report whether that credential store has anything usable.
+  if (sdkVersion.status === 0) {
+    const listed = runSdk(['auth', '--list'], { capture: true, allowFailure: true, quiet: true })
+    const hosts = parseAuthHosts(stripAnsi(`${listed.stdout || ''}\n${listed.stderr || ''}`))
+    if (!hosts.size) {
+      console.log('push/pull: NOT ready — no stored credentials (now-fluent auth --add <instance>)')
+    } else {
+      // Each alias resolves separately, so a global verdict would be wrong the moment
+      // the first alias is not the one being used.
+      console.log('push/pull credentials:')
+      for (const [alias, host] of hosts) {
+        const probe = runSdk(['auth', '--print', alias, '--format', 'headers'],
+          { capture: true, allowFailure: true, quiet: true })
+        const ok = probe.status === 0 && hasAuthHeader(parseHeaderLines(stripAnsi(probe.stdout || '')))
+        console.log(`  ${alias} -> ${host}  ${ok ? 'ready' : 'NOT ready ("auth --print" gave no auth header; SDK too old? needs 4.10+)'}`)
+      }
+    }
+  }
+
   const cfg = resolve('.now-fluent.json')
   console.log(`config: ${existsSync(cfg) ? cfg : 'none'}`)
 }
@@ -2217,7 +2980,7 @@ function commandDoctor(flags) {
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-function main() {
+async function main() {
   const argv = process.argv.slice(2)
   const command = argv[0]
 
@@ -2229,6 +2992,13 @@ function main() {
   if (!ENHANCED.has(command)) {
     // Any now-sdk command (and future ones): forward verbatim.
     passthrough(argv)
+    return
+  }
+
+  // `now-fluent <enhanced> --help` is what anyone types first. Without this it hits
+  // the flag parser, which wants a VALUE for --help and fails with a puzzling error.
+  if (argv.slice(1).some((arg) => arg === '--help' || arg === '-h')) {
+    printHelp()
     return
   }
 
@@ -2256,9 +3026,33 @@ function main() {
     case 'update-set-package':
       commandUpdateSetPackage(flags, config)
       break
+    case 'pull':
+      await commandPull(flags, config, positional)
+      break
+    case 'push':
+      await commandPush(flags, config, positional)
+      break
     default:
       fail(`Unknown command: ${command}. Run "now-fluent help".`)
   }
 }
 
-main()
+// Only run as a CLI. Importing the file (the test suite does) must not execute it.
+function invokedDirectly() {
+  if (!process.argv[1]) return false
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)) } catch { return false }
+}
+
+if (invokedDirectly()) {
+  main().catch((error) => {
+    fail(error && error.stack ? error.stack : String(error))
+  })
+}
+
+// Exported for the test suite only; the CLI surface is the command line.
+export {
+  maskCdata, unmaskCdata, parseFieldElements, parseRecordUpdateRecords, recordFieldsToPayload,
+  recordJsonToXml, parseAuthHosts, parseHeaderLines, decodeXmlEntities, PUSH_READONLY_FIELDS,
+  // used by scripts/verify-push.mjs so the spike exercises push's REAL transport
+  resolveInstance, snRequest, snGetRecord, RAW_READ_PARAMS
+}

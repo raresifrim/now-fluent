@@ -5,8 +5,8 @@ You are working in or near a ServiceNow SDK/Fluent project. Use the local `now-f
 `now-fluent` is a thin wrapper around `now-sdk`:
 
 - It **forwards every now-sdk command and its exact arguments verbatim**, so anything you'd run as `now-sdk <cmd> ...` you run as `now-fluent <cmd> ...` (current and future commands alike).
-- It **adds four enhanced commands**: `import`, `import-update-set`, `export-xml`, and `update-set-package`.
-- Two of them read the instance through `now-sdk query` (SDK 4.10+), the plain Table REST API: `import --via query` and `import-update-set --sys-id`. That path is not gated by the scope checks that block `move`, the online `transform`, `download`, and the SDK's own update-set download — so it is the fallback that works in ServiceNow-owned scopes. `now-fluent doctor` reports whether the installed SDK has `query`.
+- It **adds six enhanced commands**: `pull`, `push`, `import`, `import-update-set`, `export-xml`, and `update-set-package`.
+- Several of them reach the instance through the plain Table REST API rather than a scope-gated SDK endpoint: `import --via query` and `import-update-set --sys-id` READ it through `now-sdk query` (SDK 4.10+), and `pull`/`push` READ AND WRITE it directly, authenticating with the credential `now-sdk auth --print` hands out. That path is not gated by the scope checks that block `move`, the online `transform`, `download`, and the SDK's own update-set download — so it is the fallback that works in ServiceNow-owned scopes. `now-fluent doctor` reports whether the installed SDK has `query` and whether push/pull credentials resolve.
 
 The official ServiceNow SDK plugin/skills may also be installed. Use those for SDK knowledge, Fluent API guidance, and `now-sdk explain`-style lookups. Use `now-fluent` for local execution.
 
@@ -15,10 +15,12 @@ The official ServiceNow SDK plugin/skills may also be installed. Use those for S
 1. Do not commit to Git unless the user explicitly asks.
 2. Do not run a deploying command (`now-fluent install` / `now-sdk install`, etc.) without explicit user approval.
 3. Prefer `now-fluent` over raw `now-sdk`. Since `now-fluent` forwards unknown commands verbatim, the same arguments always work.
-4. Use `--dry-run` with the enhanced commands (`import`, `update-set-package`, `export-xml`) when the command shape is uncertain.
+4. Use `--dry-run` with the enhanced commands (`push`, `import`, `update-set-package`, `export-xml`) when the command shape is uncertain. For `push`, a dry run is also the safe way to show the user exactly what would be written before asking for approval.
 5. Treat ServiceNow-owned scopes such as Hardware Asset Management as high risk. Prefer read-only analysis, local transform/import, scope-bound projects, and update-set workflows over installing into a vendor scope.
 6. Distinguish the artifacts: the raw `dist/app/update/*.xml` files are SDK `<record_update>` build artifacts and are NOT an update set; only the `update-set-*.xml` produced by `update-set-package` is a real, importable ServiceNow update set.
 7. Use `update-set-package` when the user wants an importable update set / manual governance path instead of an SDK install. It only writes files locally — import, preview, and commit stay manual steps in ServiceNow.
+8. `push` is the ONLY command that writes records to an instance. Treat it like `install`: do not run it without explicit user approval. `push --dry-run` is always safe and needs no approval.
+9. Before relying on `push` against an instance for the first time, run `npm run verify-push -- --auth <alias> [--scope <scope>]`. It proves the two platform behaviours push depends on (a Table API PUT merges rather than replaces; an insert honours a supplied sys_id) and whether that instance permits writes into the target scope at all.
 
 ## Forwarded now-sdk commands
 
@@ -39,7 +41,8 @@ The SDK executable defaults to `now-sdk`; override with `NOW_FLUENT_SDK` (e.g. `
 ## Discovery
 
 ```bash
-now-fluent doctor          # now-fluent + node + now-sdk versions, and whether now-sdk has `query`
+now-fluent doctor          # now-fluent + node + now-sdk versions, whether now-sdk has `query`,
+                           # and whether push/pull can resolve instance credentials
 now-fluent help            # now-fluent's own help
 now-fluent move --help     # forwarded to now-sdk for exact syntax
 now-fluent transform --help
@@ -60,6 +63,29 @@ now-fluent init --appName "My App" --packageName my-app --scopeName x_my_app --t
 now-fluent build
 now-fluent install --auth <alias>      # only after explicit approval
 ```
+
+## The edit loop on one live record (pull / push)
+
+`update-set-package` is the GOVERNED path for promoting a change you do not own. `pull`/`push` is the INNER LOOP for iterating on a record — the thing that makes small repeated edits bearable.
+
+```bash
+now-fluent pull --project ./work --auth <alias> --sys-id <32hex>
+# ...edit the Fluent source...
+now-fluent push --project ./work --auth <alias> --sys-id <32hex> --dry-run
+now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # needs user approval
+```
+
+- **Both ends are the plain Table REST API**, the same ungated path `import --via query` uses, so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's update-set export.
+- **Credentials come from the SDK's own store.** `now-sdk auth --print <alias> --format headers` exists to hand out a live credential for manual API calls; `--format env` also emits `SN_SDK_INSTANCE_URL`. There is no second profile, no keychain, and no ServiceNow CLI (`snc`) dependency — `snc` would add a native installer, an interactive-only profile setup, an OS-keychain credential store, and a `record` command group that is fetched from the instance rather than built into the binary.
+- **`pull` records a baseline** at `<project>/.now-fluent/state/<table>_<sysid>.json`: the record's full field values plus `sys_updated_on`/`sys_mod_count` as the instance held them. The import half is exactly `import --via query --force`.
+- **`push` builds, reads the compiled `<record_update>` artifact, and writes it back**: `PUT` for a record that exists, `POST` carrying the `sys_id` for one that does not (so the record keeps the identity `Now.ID` gave it). By default only fields that differ from the baseline are sent.
+- **Safety rails.** A record that changed on the instance since the pull is REFUSED (`--force` overrides). A record that exists but was never pulled is REFUSED — there is no baseline to separate your edits from someone else's. Instance-owned bookkeeping (`sys_created_*`, `sys_updated_*`, `sys_mod_count`, `sys_update_name`, `sys_package`, `sys_policy`, `sys_class_name`) is never written; `sys_scope` IS written, because that is what puts the record in the right scope (`--no-scope` omits it). A `DELETE` artifact is skipped unless `--allow-delete`, and even then it goes through the same baseline and drift guards as an update — an unpulled or drifted record is never destroyed. One refused record does not abandon the rest of the run.
+- **`--table` is optional for both.** push takes it from the built artifact and validates any `--table` you pass against it; pull resolves it from `sys_metadata.sys_class_name`.
+- **A baseline is instance-scoped.** One pulled from dev is never used as the diff reference for a prod push — push notices the mismatch and refuses.
+- **Two limitations to tell the user about.** (1) push CANNOT clear a field by removing it from the Fluent source: the write merges and the artifact only holds modelled fields, so removal means "not modelled", not "delete". Set an explicit empty value instead. (2) pull REPLACES local source for the records it names — it warns when a record already exists locally, but uncommitted edits are lost.
+- Other flags: `--all` (+ `--include`/`--exclude`) pushes every built record, `--full` sends every modelled field, `--no-build` skips the build, `--no-drift-check` disables the comparison, `--update-set <sys_id|name>` points the session at an update set first (EXPERIMENTAL — confirm with the spike).
+
+**A push is NOT an update set commit.** It is a record write, so it runs business rules exactly as editing the form would; committing an update set does not. For a script include the difference is nil; for dictionary and table records it is not. Prefer `update-set-package` for anything you do not own, and for vendor scopes keep to the update-set path unless the user's governance says otherwise — "the Table API allows it" is not "your process allows it".
 
 ## Bring records into a project (import)
 
