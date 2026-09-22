@@ -45,12 +45,15 @@ note "doctor — must say push/pull credentials are ready for alias '$AUTH'"
 $NF doctor
 
 hr "PHASE 1 — Phase 0 spike, Global scope"
-note "PUT merge / POST honours sys_id / writes permitted / update-set capture"
+note "PUT merge / POST honours sys_id / sys_scope honoured? / can capture be steered?"
 ( cd "$REPO" && npm run verify-push -- --auth "$AUTH" )
 echo "verify-push (global) exit=$?"
 
 if [ -n "$SCOPE" ]; then
   hr "PHASE 2 — Phase 0 spike, scope: $SCOPE"
+  note "EXPECTED on a stock instance: the 'sys_scope is HONOURED' check FAILS."
+  note "That is the finding, not a bug in the spike — the Table API ignores sys_scope"
+  note "and puts the record in Global. push now refuses scoped CREATEs because of it."
   ( cd "$REPO" && npm run verify-push -- --auth "$AUTH" --scope "$SCOPE" )
   echo "verify-push (scope $SCOPE) exit=$?"
 else
@@ -129,12 +132,27 @@ echo "    $NF push --project . --auth $AUTH --sys-id $NEWID"
 echo "    now-sdk query sys_script_include --auth $AUTH -q sys_id=$NEWID -f sys_id,name"
 note "(left manual — it needs a hand-written Fluent source file)"
 
-hr "PHASE 4b — --update-set (EXPERIMENTAL: repoints + restores sys_update_set preference)"
+hr "PHASE 4b — --update-set (repoints the preference, then VERIFIES where capture landed)"
 note "BEFORE: your current update set preference"
 now-sdk query sys_user_preference --auth "$AUTH" -q "name=sys_update_set" -f user,value --limit 5
 note "create an in-progress update set in the UI, then:"
 echo "    $NF push --project . --auth $AUTH --sys-id $TARGET --update-set '<name>'"
+note "EXPECTED: push reports the capture landed somewhere ELSE (e.g. Default) and FAILS"
+note "the run. That is correct — a REST transaction resolves its own update set, so the"
+note "flag can only report the truth, not steer it. Use update-set-package to promote."
 note "AFTER the push, re-run the query above — the value MUST be back to what it was."
+
+hr "PHASE 4c — --target-scope (scoped project -> Global)"
+note "From a SCOPED project, a create is refused unless you name the outcome:"
+echo "    $NF push --project . --auth $AUTH --sys-id <new sys_id>"
+note "  EXPECTED: REFUSED, naming --target-scope global"
+echo "    $NF push --project . --auth $AUTH --sys-id <new sys_id> --target-scope global"
+note "  EXPECTED: created, with a line saying it landed in GLOBAL and what api_name it got"
+echo "    $NF push --project . --auth $AUTH --sys-id <new sys_id> --target-scope x_other"
+note "  EXPECTED: refused before any request, pointing at update-set-package"
+note "NOTE: a scope-bound project cannot compile apiName: 'global.X' (TS11), so this"
+note "works for tables WITHOUT an apiName (business rules, UI policies). For script"
+note "includes use a Global-bound project or update-set-package."
 
 hr "DONE — transcript: $LOG"
 echo "throwaway record left behind for inspection: sys_script_include $TARGET"
