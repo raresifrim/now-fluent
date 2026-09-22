@@ -40,11 +40,27 @@ values and its `sys_updated_on` / `sys_mod_count`. `--no-state` skips the baseli
 | `action="DELETE"` artifact | skipped unless `--allow-delete` |
 
 Never written: `sys_created_*`, `sys_updated_*`, `sys_mod_count`, `sys_update_name`,
-`sys_package`, `sys_policy`, `sys_class_name`. **Is** written: `sys_scope` (that is what
-puts the record in the right scope) — `--no-scope` omits it.
+`sys_package`, `sys_policy`, `sys_class_name`.
 
-Flags: `--dry-run` (print requests, send nothing), `--all` + `--include`/`--exclude`,
-`--full`, `--no-build`, `--no-drift-check`, `--update-set <id|name>` (experimental).
+**Scope (verified live): `sys_scope` is INERT on a Table API write.** The platform uses
+the scope the REST transaction runs in (Global) and rewrites `api_name` to match. So:
+
+- updates are unaffected (the record's scope is already set);
+- a CREATE from a scoped artifact is REFUSED — it would land in Global silently;
+- `--target-scope global` is the explicit opt-in, and reports what it actually got;
+- `--target-scope <other>` is refused — use `update-set-package --scope <scope>`;
+- every write reads the scope back and FAILS the record if it landed elsewhere;
+- `--no-scope` only trims the body; it changes nothing on the instance.
+- A scoped project cannot compile `apiName: 'global.X'` (TS11), so scoped-project →
+  Global does not work for tables carrying an apiName even with `--target-scope`.
+
+**Update set capture (verified live): `--update-set` cannot steer it.** A REST
+transaction resolves its own update set; a write made while the session pointed at a
+named set was captured into `Default`. The flag sets the preference, restores it after,
+and — the actual value — reports where each write really landed, failing on a mismatch.
+
+Flags: `--dry-run` (builds, then prints requests and sends nothing), `--all` +
+`--include`/`--exclude`, `--full`, `--no-build`, `--no-drift-check`.
 One refused record does not abandon the rest of the run.
 
 **Not an update set commit.** A push runs business rules like a form edit; a commit does

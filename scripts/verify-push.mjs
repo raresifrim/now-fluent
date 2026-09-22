@@ -96,9 +96,15 @@ async function exercise(instance, label, scope) {
     afterInsert ? `sys_id on the instance: ${afterInsert.sys_id}` : 'record not readable after insert')
 
   if (scope) {
-    record(`${label}/scope`, `[${label}] the record landed in scope ${scope.scope}`,
-      Boolean(afterInsert) && afterInsert.sys_scope === scope.sys_id,
-      afterInsert ? `sys_scope: ${afterInsert.sys_scope} (wanted ${scope.sys_id})` : '')
+    // The one that decides whether push can create anything outside Global.
+    const landed = afterInsert ? afterInsert.sys_scope : ''
+    record(`${label}/scope`, `[${label}] sys_scope on the write is HONOURED (record landed in ${scope.scope})`,
+      landed === scope.sys_id,
+      landed === scope.sys_id
+        ? `sys_scope: ${landed}`
+        : `sys_scope was IGNORED: asked for ${scope.sys_id} (${scope.scope}), got "${landed}". `
+          + `api_name is now "${afterInsert ? afterInsert.api_name : '?'}". push cannot create records outside `
+          + 'Global — promote scoped records with update-set-package instead.')
   }
 
   // Q2 — does PUT MERGE (leave unspecified fields alone) rather than replace?
@@ -120,6 +126,9 @@ async function exercise(instance, label, scope) {
 }
 
 // --- update set capture ----------------------------------------------------
+// Two separate questions, and conflating them is a FALSE GREEN: "a capture row exists"
+// is not "it landed where we asked". Live testing found a record captured into Default
+// while the session was pointed at a named set, and the old check called that a pass.
 async function checkUpdateSetCapture(instance, ids) {
   console.log('\n--- update set capture ---')
   const names = ids.map((id) => `sys_script_include_${id}`)
@@ -127,17 +136,80 @@ async function checkUpdateSetCapture(instance, ids) {
     ...THROW,
     params: {
       ...RAW_READ_PARAMS,
-      sysparm_query: `nameIN${names.join(',')}`,
+      sysparm_query: `nameIN${names.join(',')}^ORDERBYDESCsys_created_on`,
       sysparm_fields: 'sys_id,name,update_set',
-      sysparm_limit: '10'
+      sysparm_limit: '20'
     }
   })
   const captured = Array.isArray(rows) ? rows : []
-  record('update-set', 'Table API writes are captured into the session update set',
+  record('capture', 'Table API writes are captured into SOME update set',
     captured.length > 0,
     captured.length
-      ? `${captured.length} sys_update_xml row(s); update_set ${captured[0].update_set || '(none)'} — --update-set is viable`
-      : 'no sys_update_xml rows for these writes — push does NOT produce an update set; keep using update-set-package to promote')
+      ? `${captured.length} sys_update_xml row(s)`
+      : 'no sys_update_xml rows — push produces no update set at all; promote with update-set-package')
+  if (!captured.length) return
+
+  const setIds = [...new Set(captured.map((r) => r.update_set).filter(Boolean))]
+  const setRows = setIds.length
+    ? await snRequest(instance, 'GET', '/api/now/table/sys_update_set', {
+      ...THROW,
+      params: { ...RAW_READ_PARAMS, sysparm_query: `sys_idIN${setIds.join(',')}`, sysparm_fields: 'sys_id,name', sysparm_limit: '20' }
+    })
+    : []
+  const nameOf = new Map((Array.isArray(setRows) ? setRows : []).map((r) => [r.sys_id, r.name]))
+  const where = setIds.map((id) => `${nameOf.get(id) || id}`).join(', ')
+
+  // The real question --update-set rests on: can the session STEER the destination?
+  const steered = await probe(() => steerAndCheck(instance, captured))
+  record('capture-steering', '--update-set can steer WHERE the writes are captured',
+    steered.ok && steered.value === true,
+    steered.ok
+      ? (steered.value === true
+        ? 'the sys_update_set preference decided the destination'
+        : `the platform chose the update set itself (writes landed in: ${where}). `
+          + '--update-set cannot deliver a named set — push reports the mismatch instead of claiming success')
+      : reason(steered.error))
+}
+
+// Point the session at a fresh update set, write once more, and see where it lands.
+async function steerAndCheck(instance, previousCaptures) {
+  const setId = sysId()
+  await snRequest(instance, 'POST', '/api/now/table/sys_update_set', {
+    ...THROW,
+    body: { sys_id: setId, name: `now-fluent spike ${suffix}`, description: 'now-fluent push spike — safe to delete' },
+    params: { sysparm_fields: 'sys_id' }
+  })
+  created.push({ table: 'sys_update_set', sysId: setId })
+
+  const me = await snRequest(instance, 'GET', '/api/now/ui/user/current_user', THROW)
+  const userId = me && (me.user_sys_id || me.sys_id)
+  if (!userId) throw new Error('could not resolve the current user')
+  const existing = await snRequest(instance, 'GET', '/api/now/table/sys_user_preference', {
+    ...THROW,
+    params: { ...RAW_READ_PARAMS, sysparm_query: `name=sys_update_set^user=${userId}`, sysparm_fields: 'sys_id,value', sysparm_limit: '1' }
+  })
+  const pref = Array.isArray(existing) && existing.length ? existing[0] : null
+  const before = pref ? pref.value : null
+  if (pref) await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${pref.sys_id}`, { ...THROW, body: { value: setId } })
+  else await snRequest(instance, 'POST', '/api/now/table/sys_user_preference', { ...THROW, body: { name: 'sys_update_set', user: userId, value: setId, type: 'string' } })
+
+  try {
+    const probeId = sysId()
+    await snRequest(instance, 'POST', '/api/now/table/sys_script_include', {
+      ...THROW,
+      body: { sys_id: probeId, name: `NowFluentSteer${suffix}`, script: `var NowFluentSteer${suffix} = Class.create();`, description: 'now-fluent push spike — safe to delete' },
+      params: { sysparm_fields: 'sys_id' }
+    })
+    created.push({ table: 'sys_script_include', sysId: probeId })
+    const rows = await snRequest(instance, 'GET', '/api/now/table/sys_update_xml', {
+      ...THROW,
+      params: { ...RAW_READ_PARAMS, sysparm_query: `name=sys_script_include_${probeId}^ORDERBYDESCsys_created_on`, sysparm_fields: 'update_set', sysparm_limit: '1' }
+    })
+    const landed = Array.isArray(rows) && rows.length ? rows[0].update_set : null
+    return landed === setId
+  } finally {
+    if (pref) await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${pref.sys_id}`, { ...THROW, body: { value: before || '' } })
+  }
 }
 
 // --- main ------------------------------------------------------------------
@@ -181,7 +253,7 @@ if (keep) {
   for (const item of created) console.log(`  ${item.table} ${item.sysId}`)
 } else if (created.length) {
   console.log('\n--- cleanup ---')
-  for (const item of created) {
+  for (const item of [...created].reverse()) {
     const removed = await probe(() => snRequest(instance, 'DELETE', `/api/now/table/${item.table}/${item.sysId}`, { ...THROW, allow404: true }))
     console.log(`  ${removed.ok ? 'deleted' : `COULD NOT DELETE (${reason(removed.error)})`} ${item.table} ${item.sysId}`)
   }

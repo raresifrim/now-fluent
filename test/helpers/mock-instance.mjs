@@ -7,7 +7,7 @@
 // cannot themselves prove the platform provides them.
 import { createServer } from 'node:http'
 
-export async function startMockInstance({ records = {} } = {}) {
+export async function startMockInstance({ records = {}, honoursScope = false } = {}) {
   const store = new Map(Object.entries(records))
   const log = []
   let clock = 0
@@ -52,13 +52,24 @@ export async function startMockInstance({ records = {} } = {}) {
       const id = parsed && parsed.sys_id
       if (!id) return send(400, { error: { message: 'insert without sys_id' } })
       if (store.has(`${table}/${id}`)) return send(403, { error: { message: 'already exists' } })
-      store.set(`${table}/${id}`, { ...parsed, sys_updated_on: stamp(), sys_mod_count: '0' })
+      // VERIFIED LIVE: the Table API IGNORES sys_scope and puts the record in the scope
+      // the REST transaction runs in — Global — rewriting api_name to match. The mock
+      // reproduces that by default; honoursScope:true models the world we wrongly
+      // assumed, so a test can prove push behaves correctly in both.
+      const row = { ...parsed, sys_updated_on: stamp(), sys_mod_count: '0' }
+      if (!honoursScope && row.sys_scope && row.sys_scope !== 'global') {
+        row.sys_scope = 'global'
+        if (row.api_name) row.api_name = String(row.api_name).replace(/^[^.]+\./, 'global.')
+      }
+      store.set(`${table}/${id}`, row)
       return send(201, { result: { sys_id: id } })
     }
     if (req.method === 'PUT') {
       const row = store.get(key)
       if (!row) return send(404, { error: { message: 'No record found' } })
-      store.set(key, { ...row, ...parsed, sys_updated_on: stamp(), sys_mod_count: String(Number(row.sys_mod_count || 0) + 1) })
+      const next = { ...row, ...parsed, sys_updated_on: stamp(), sys_mod_count: String(Number(row.sys_mod_count || 0) + 1) }
+      if (!honoursScope) next.sys_scope = row.sys_scope // inert on update too
+      store.set(key, next)
       return send(200, { result: { sys_id: sysId } })
     }
     if (req.method === 'DELETE') {

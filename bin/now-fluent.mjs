@@ -166,7 +166,8 @@ Enhanced commands (handled by now-fluent):
   push --project <path> --auth <alias>
        (--sys-id <32hex>[,<32hex>...] | --all [--include <substr>...] [--exclude <substr>...])
        [--table <table>] [--no-build] [--full] [--force] [--no-drift-check]
-       [--no-scope] [--allow-delete] [--update-set <sys_id|name>] [--dry-run]
+       [--target-scope global] [--no-scope] [--allow-delete]
+       [--update-set <sys_id|name>] [--dry-run]
       Build the project, take the compiled <record_update> artifact for each selected
       record, and write it straight back to the instance through the Table REST API
       (PUT for a record that exists, POST carrying the sys_id for one that does not,
@@ -182,12 +183,28 @@ Enhanced commands (handled by now-fluent):
       --table is optional: the table comes from the built artifact, and a --table you
       do pass is validated against it. --all pushes every built record, selected with
       the same --include/--exclude substring tokens as update-set-package.
-      --no-scope omits sys_scope from the write; --allow-delete applies DELETE
-      artifacts (removed Fluent code) instead of skipping them.
+      SCOPE (verified live): sys_scope is INERT on a Table API write. The platform
+      puts the record in the scope the REST transaction runs in — Global — and
+      rewrites api_name to match. push therefore cannot choose a destination scope:
+        - updating an existing record is unaffected (its scope is already set);
+        - CREATING a record whose artifact is scoped is REFUSED, because it would
+          land in Global and leave the project and the instance disagreeing;
+        - --target-scope global says "yes, I want it in Global anyway" and creates
+          it, reporting the scope and api_name it actually got;
+        - --target-scope <anything else> is refused: this transport cannot do it.
+          Use update-set-package, whose payload carries sys_scope.
+      Every write reads the scope back and FAILS the record if it landed elsewhere.
+      --no-scope omits sys_scope from the body; since the field is ignored anyway
+      this changes nothing on the instance — it exists to keep the write minimal.
+      --allow-delete applies DELETE artifacts (removed Fluent code) instead of
+      skipping them, subject to the same baseline and drift guards.
       --update-set <sys_id|name> points your account's session at an in-progress
-      update set first, so the writes are captured for promotion (EXPERIMENTAL —
-      verify it on your instance with scripts/verify-push.mjs).
-      --dry-run prints the method, URL and body for each record and sends nothing.
+      update set and then CHECKS where the writes were really captured. Verified
+      live: a REST transaction resolves its own update set and may ignore the
+      preference, so the check is the point — a mismatch is reported per record
+      and fails the run rather than being claimed as success.
+      --dry-run builds (locally, as always) and prints the method, URL and body for
+      each record, sending nothing.
 
   export-xml --project <path> [--out <path>] [--build-local] [--zip]
              [--include <substr>...] [--exclude <substr>...]
@@ -965,6 +982,13 @@ function createHealer({ project, keepFailed }) {
   }
   const removeNamed = (out, indent = '    ') => {
     const bad = keepFailed ? [] : extractErrorFilePaths(out, project)
+    // Print WHY before printing what was done about it. Without this the user sees
+    // "removed <file>" and "handle these records manually" while the one line that
+    // explains it all (e.g. "error TS11: apiName must begin with 'x_my_app.'") is
+    // swallowed with the rest of the build output.
+    if (bad.length) {
+      for (const line of extractErrorLines(out)) console.warn(`${indent}${line}`)
+    }
     let handled = 0
     for (const p of bad) {
       const rel = relative(project, p)
@@ -989,18 +1013,30 @@ function createHealer({ project, keepFailed }) {
   }
   // A broken file can be left by a transform that exited 0 (the damage only surfaces
   // on the next build), so verify with a real build and clean up anything it names.
+  // Returns whether the project builds at the end. A caller that reports "imported N
+  // records" while this is false is lying: the project does not compile.
   const verifyProjectBuild = () => {
     console.log('\nVerifying the project still builds...')
     for (let attempt = 0; attempt < 5; attempt++) {
       const b = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
-      if (b.status === 0) { console.log('  build OK'); return }
+      if (b.status === 0) { console.log('  build OK'); return true }
       const out = `${b.stdout || ''}${b.stderr || ''}`
       if (!removeNamed(out, '  ')) {
-        process.stdout.write(out)
-        console.error('  ! the build is failing but no file path could be extracted from its errors — fix manually')
-        return
+        for (const line of extractErrorLines(out)) console.error(`  ${line}`)
+        console.error(keepFailed
+          ? '  ! the project does NOT build. --keep-failed left the offending files in place, so this is '
+            + 'expected — fix or remove them before pushing anything.'
+          : '  ! the build is failing but no file path could be extracted from its errors — fix manually')
+        return false
       }
     }
+    // Five rounds of removals and it still will not build.
+    const final = runSdk(['build'], { cwd: project, allowFailure: true, capture: true })
+    if (final.status !== 0) {
+      console.error('  ! the project still does not build after repeated healing — fix manually')
+      return false
+    }
+    return true
   }
   const report = () => {
     if (!removedForErrors.length) return
@@ -1143,6 +1179,7 @@ function commandImport(flags, config, positional) {
   }
 
   let pending = [...sysIds]
+  let queryBuildOk = true
   const importedBy = { move: [], transform: [], query: [] }
 
   // ---- 2. move -------------------------------------------------------------
@@ -1231,6 +1268,7 @@ function commandImport(flags, config, positional) {
         outDir: flags.out, keep: Boolean(flags.keep)
       })
       importedBy.query = result.imported
+      queryBuildOk = result.buildOk
       // Records with no resolvable table never reached the query path — they are
       // still failures and must not vanish from the summary.
       pending = [...result.failed, ...noTable]
@@ -1241,6 +1279,11 @@ function commandImport(flags, config, positional) {
   const by = Object.entries(importedBy).filter(([, v]) => v.length).map(([k, v]) => `${v.length} via ${k}`).join(', ')
   console.log(`\nimport: ${total} record(s) into ${project}${by ? ` (${by})` : ''}`)
   if (pending.length) fail(`import failed for: ${pending.join(', ')}`)
+  // "imported N records" is not success if what landed does not compile.
+  if (!queryBuildOk) {
+    fail('import wrote records but the project does NOT build. Fix the files named above before pushing '
+      + 'anything — a push from a broken project would send stale or missing artifacts.')
+  }
 }
 
 // Pull records off the instance as JSON, rebuild their <record_update> XML locally
@@ -1307,9 +1350,10 @@ function importViaQuery({ targets, auth, project, extra, related, keepFailed, pr
   // A transform can exit 0 and still leave the project unbuildable; the damage only
   // shows on the next build. If verification had to remove a record's own file, that
   // record did NOT land, however green its transform looked.
-  if (units.length && !keepFailed) {
+  let buildOk = true
+  if (units.length) {
     const before = healer.removedForErrors.length
-    healer.verifyProjectBuild()
+    buildOk = healer.verifyProjectBuild()
     for (const removed of healer.removedForErrors.slice(before)) {
       const at = imported.findIndex((id) => removed.includes(id))
       if (at >= 0) {
@@ -1323,7 +1367,7 @@ function importViaQuery({ targets, auth, project, extra, related, keepFailed, pr
   if (keep || outDir) console.log(`\nKept rebuilt record XML at: ${workDir}`)
   else rmSync(workDir, { recursive: true, force: true })
   healer.report()
-  return { imported, failed }
+  return { imported, failed, buildOk }
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,6 +1541,18 @@ function loadProjectRecordIds(project) {
     }
   }
   return ids
+}
+
+// The compiler diagnostics themselves, for showing the user what actually went wrong.
+function extractErrorLines(output) {
+  const lines = []
+  for (const raw of stripAnsi(output).split('\n')) {
+    const line = raw.trim()
+    if (/\berror TS\d+|ERROR:\s*\S+:\d+:\d+|is defined \d+ times/.test(line)) {
+      lines.push(line.replace(/^\[now-sdk\]\s*/, ''))
+    }
+  }
+  return [...new Set(lines)].slice(0, 12)
 }
 
 function extractErrorFilePaths(output, project) {
@@ -2546,7 +2602,13 @@ async function commandPull(flags, config, positional) {
   // pushing one is refused for "no usable pull baseline". Anything newly registered in
   // keys.ts by this import counts.
   const nowLocal = loadProjectRecordIds(project)
-  const imported = [...new Set([...sysIds, ...[...nowLocal].filter((id) => !alreadyLocal.has(id))])]
+  const discovered = [...nowLocal].filter((id) => !alreadyLocal.has(id) && !sysIds.includes(id))
+  const imported = [...sysIds, ...discovered]
+  // The ids the USER named deserve a warning when they get no baseline. The ones the
+  // import happened to register do not: keys.ts also carries the SDK's own scaffolding
+  // (the sys_module rows for bom.json/package.json), which are build bookkeeping and
+  // have no instance record at all — warning about those is pure noise.
+  const namedByUser = new Set(sysIds)
 
   // The baseline needs each record's table. --table covers the ids the user named;
   // resolve the rest the same way import does.
@@ -2563,10 +2625,15 @@ async function commandPull(flags, config, positional) {
   for (const sysId of imported) {
     const recordTable = tableFor.get(sysId)
     if (!recordTable) {
-      console.warn(`  ! ${sysId}: table unknown, no baseline recorded (pass --table <table>)`)
-      skipped.push(sysId)
+      if (namedByUser.has(sysId)) {
+        console.warn(`  ! ${sysId}: table unknown, no baseline recorded (pass --table <table>)`)
+        skipped.push(sysId)
+      }
       continue
     }
+    // Local build bookkeeping the SDK registers for bom.json/package.json — not a
+    // record on the instance, so there is nothing to snapshot.
+    if (recordTable === 'sys_module' && !namedByUser.has(sysId)) continue
     // One unreadable record must not cost every later record its baseline.
     try {
       const row = await snGetRecord(instance, recordTable, sysId, undefined, { throwOnError: true })
@@ -2618,6 +2685,27 @@ function previewPayload(payload) {
   return JSON.stringify(preview, null, 2).split('\n').map((line) => `      ${line}`).join('\n')
 }
 
+// ---------------------------------------------------------------------------
+// Application scope on a Table API write
+// ---------------------------------------------------------------------------
+// VERIFIED LIVE (dev instance, SDK 4.12.x): sys_scope is INERT on both POST and PUT.
+// The platform sets it from the scope the REST transaction runs in, which for
+// /api/now/table is Global — and it is not steerable by the apps.current_app user
+// preference either. A create from a scoped project therefore lands in Global and the
+// platform rewrites api_name (x_my_app.Thing -> global.Thing), silently.
+//
+// So push cannot choose a destination scope. What it CAN do is refuse to make the
+// mistake quietly: a create that would land somewhere other than where the artifact
+// says is blocked unless the caller names that outcome with --target-scope global.
+// Cross-scope promotion belongs to update-set-package, which writes sys_scope INTO the
+// payload where import/preview/commit honours it.
+const GLOBAL_SCOPE_ID = 'global'
+
+function scopeOf(fields) {
+  const value = fields.sys_scope
+  return value ? String(value) : ''
+}
+
 // EXPERIMENTAL: point the calling user's session at an update set before writing, so
 // Table API writes to metadata tables are captured for promotion like any UI edit.
 // The platform stores this as the sys_update_set user preference.
@@ -2658,7 +2746,9 @@ async function setCurrentUpdateSet(instance, ref) {
       body: { name: 'sys_update_set', user: userId, value: target.sys_id, type: 'string' }
     })
   }
-  console.log(`Current update set for this account: "${target.name}" (${target.sys_id})`)
+  console.log(`Pointed this account's session at update set "${target.name}" (${target.sys_id}).`)
+  console.log('  NOTE: verified live that a REST transaction resolves its own update set and may IGNORE this '
+    + 'preference.\n  Where the writes actually landed is checked and reported after the push.')
 
   // This preference is the account's, not the command's: leaving it repointed would
   // keep capturing the user's later UI edits into this update set. Always put it back.
@@ -2681,6 +2771,55 @@ async function setCurrentUpdateSet(instance, ref) {
   }
 }
 
+// VERIFIED LIVE: setting the sys_update_set preference does NOT steer where a Table API
+// write is captured — a record written while the session pointed at a named set was
+// captured into Default instead. So never claim capture; go and look.
+async function reportUpdateSetCapture(instance, target, written) {
+  if (!written.length) return true
+  const names = written.map(({ table, sysId }) => `${table}_${sysId}`)
+  const rows = await snRequest(instance, 'GET', '/api/now/table/sys_update_xml', {
+    params: {
+      ...RAW_READ_PARAMS,
+      sysparm_query: `nameIN${names.join(',')}^ORDERBYDESCsys_created_on`,
+      sysparm_fields: 'name,update_set,sys_created_on',
+      sysparm_limit: String(Math.max(names.length * 2, 20))
+    },
+    throwOnError: true
+  })
+  const captures = Array.isArray(rows) ? rows : []
+  if (!captures.length) {
+    console.error('\nUPDATE SET: none of these writes were captured into any update set. '
+      + 'They cannot be promoted from here — use update-set-package.')
+    return false
+  }
+
+  // One row per record: the newest capture wins, which the DESC sort already gives us.
+  const newest = new Map()
+  for (const row of captures) if (!newest.has(row.name)) newest.set(row.name, row)
+  const elsewhere = [...newest.values()].filter((row) => row.update_set !== target.sys_id)
+  if (!elsewhere.length) {
+    console.log(`\nUPDATE SET: all ${newest.size} capture(s) landed in "${target.name}" as asked.`)
+    return true
+  }
+
+  const setIds = [...new Set(elsewhere.map((row) => row.update_set).filter(Boolean))]
+  const setRows = setIds.length
+    ? await snRequest(instance, 'GET', '/api/now/table/sys_update_set', {
+      params: { ...RAW_READ_PARAMS, sysparm_query: `sys_idIN${setIds.join(',')}`, sysparm_fields: 'sys_id,name', sysparm_limit: '20' },
+      throwOnError: true
+    })
+    : []
+  const nameOf = new Map((Array.isArray(setRows) ? setRows : []).map((r) => [r.sys_id, r.name]))
+
+  console.error(`\nUPDATE SET: ${elsewhere.length} of ${newest.size} capture(s) did NOT land in "${target.name}".`)
+  for (const row of elsewhere) {
+    console.error(`  ${row.name} -> ${nameOf.get(row.update_set) || row.update_set || '(none)'}`)
+  }
+  console.error('  The platform resolved the update set itself and ignored the preference push set. Move these\n'
+    + '  captures by hand, or promote with update-set-package, which builds the update set directly.')
+  return false
+}
+
 async function findPreferenceId(instance, userId) {
   const rows = await snRequest(instance, 'GET', '/api/now/table/sys_user_preference', {
     params: { ...RAW_READ_PARAMS, sysparm_query: `name=sys_update_set^user=${userId}`, sysparm_fields: 'sys_id', sysparm_limit: '1' },
@@ -2692,7 +2831,7 @@ async function findPreferenceId(instance, userId) {
 // Push ONE built record. Returns the bucket it belongs in; throws on a transport
 // error so the caller can record the failure and carry on with the next record.
 async function pushRecord(target, label, context) {
-  const { project, instance, flags, auth, dryRun, force } = context
+  const { project, instance, flags, auth, dryRun, force, writtenRecords } = context
   const { table, sysId, action } = target.record
 
   // Apply the same known-defect fixes update-set-package applies before packaging.
@@ -2802,21 +2941,56 @@ async function pushRecord(target, label, context) {
   const method = creating ? 'POST' : 'PUT'
   const path = creating ? `/api/now/table/${table}` : `/api/now/table/${table}/${sysId}`
 
+  // ---- a create cannot choose its scope, so do not let it choose wrongly ---
+  const artifactScope = scopeOf(record.fields)
+  const targetScope = flags['target-scope']
+  if (creating && artifactScope && artifactScope !== GLOBAL_SCOPE_ID && targetScope !== GLOBAL_SCOPE_ID) {
+    console.error(`${label} REFUSED: this record does not exist yet, and a Table API create cannot put it `
+      + `in scope ${artifactScope}.\n`
+      + '      sys_scope is inert on a REST write — the record would be created in GLOBAL and the platform\n'
+      + '      would rewrite its api_name, leaving this project and the instance disagreeing.\n'
+      + '      Either promote it with update-set-package (which sets the scope in the payload), or, if you\n'
+      + '      really do want it in Global, say so: --target-scope global')
+    return 'failed'
+  }
+
   await snRequest(instance, method, path, { body, params: { sysparm_fields: 'sys_id' }, throwOnError: true })
 
   // Refresh the baseline from what the instance now holds, so the next push diffs
   // against reality (business rules may have changed fields on the way in). The WRITE
   // has already succeeded, so a failure of this READ must not report it as failed —
   // it would send the user into a retry that the stale baseline then rejects as drift.
+  let written = null
   try {
-    const written = await snGetRecord(instance, table, sysId, undefined, { throwOnError: true })
+    written = await snGetRecord(instance, table, sysId, undefined, { throwOnError: true })
     if (written) writeBaseline(project, table, sysId, instance, written)
   } catch (error) {
     rmSync(statePath(project, table, sysId), { force: true })
     console.warn(`${label} written, but its baseline could not be refreshed `
       + `(${error && error.message ? error.message : error}). Removed the stale baseline — pull it again.`)
   }
+
+  // ---- where did it ACTUALLY land? ----------------------------------------
+  // Never trust the write: read the scope back. This is the only thing standing
+  // between a scoped project and a silently mis-scoped instance record.
+  const landedScope = written ? scopeOf(written) : ''
+  if (artifactScope && landedScope && landedScope !== artifactScope) {
+    const apiNameNote = written.api_name ? ` Its api_name is now "${written.api_name}".` : ''
+    if (targetScope === GLOBAL_SCOPE_ID && landedScope === GLOBAL_SCOPE_ID) {
+      console.warn(`${label} landed in GLOBAL, as --target-scope global asked `
+        + `(the project has it in ${artifactScope}).${apiNameNote}`)
+    } else {
+      console.error(`${label} WROTE THE RECORD, BUT IT LANDED IN THE WRONG SCOPE.\n`
+        + `      the project says: ${artifactScope}\n`
+        + `      the instance says: ${landedScope}${apiNameNote}\n`
+        + '      sys_scope is inert on a Table API write. Fix this on the instance, and promote scoped\n'
+        + '      records with update-set-package instead of push.')
+      return 'failed'
+    }
+  }
+
   console.log(`${label} ${creating ? 'created' : 'updated'} (${Object.keys(body).length} field(s))`)
+  if (writtenRecords) writtenRecords.push({ table, sysId })
   return creating ? 'created' : 'updated'
 }
 
@@ -2835,8 +3009,11 @@ async function commandPush(flags, config, positional) {
   }
 
   // ---- 1. build -----------------------------------------------------------
+  // The build is local and touches no instance, so a dry run MUST still run it —
+  // otherwise the preview shows the last build's artifacts and can differ from the
+  // source you are about to push, which is worse than no preview at all.
   if (flags['no-build']) console.log('--no-build: pushing whatever is already in the build output.')
-  else runSdk(['build'], { cwd: project, dryRun })
+  else runSdk(['build'], { cwd: project })
 
   // ---- 2. select the records to push --------------------------------------
   const includes = toTokenList(flags.include)
@@ -2885,6 +3062,19 @@ async function commandPush(flags, config, positional) {
   }
 
   // ---- 3. push each record -------------------------------------------------
+  // Only Global is reachable: the Table API runs the write in its own scope, so
+  // "put it in x_other" is not something this transport can be asked for.
+  const targetScope = flags['target-scope']
+  if (targetScope && targetScope !== GLOBAL_SCOPE_ID) {
+    fail(`--target-scope ${targetScope} is not possible through the Table API: a REST write always lands in `
+      + 'Global, and sys_scope is ignored.\n'
+      + `  To put records in ${targetScope}, build an update set for it — that payload carries the scope and `
+      + 'import/preview/commit honours it:\n'
+      + `    now-fluent update-set-package --project <p> --update-set-name "<name>" --scope ${targetScope} `
+      + '--scope-id <sys_id> --build-local\n'
+      + '  --target-scope global is the only value this transport can actually deliver.')
+  }
+
   const instance = dryRun ? { alias: auth, origin: 'https://<instance>', headers: {} } : resolveInstance(auth)
   let updateSetSession = null
   if (flags['update-set']) {
@@ -2896,7 +3086,8 @@ async function commandPush(flags, config, positional) {
     ? `\n[dry-run] ${targets.length} record(s) would be pushed to the instance behind alias "${auth}". Nothing is sent.`
     : `\nPushing ${targets.length} record(s) to ${instance.origin}...`)
   const results = { created: [], updated: [], deleted: [], unchanged: [], failed: [...unresolved] }
-  const context = { project, instance, flags, auth, dryRun, force }
+  const writtenRecords = []
+  const context = { project, instance, flags, auth, dryRun, force, writtenRecords }
 
   try {
     for (const [index, target] of targets.entries()) {
@@ -2915,6 +3106,11 @@ async function commandPush(flags, config, positional) {
   } finally {
     if (updateSetSession) {
       try {
+        // Look BEFORE restoring: the capture rows are what they are, but checking while
+        // the session is still pointed there keeps the two steps' failures separate.
+        if (!await reportUpdateSetCapture(instance, updateSetSession.target, writtenRecords)) {
+          results.failed.push(...writtenRecords.map(({ sysId }) => `${sysId} (capture)`))
+        }
         await updateSetSession.restore()
       } catch (error) {
         console.error('WARNING: could not restore your previous update set preference '
@@ -2968,7 +3164,18 @@ function commandDoctor(flags) {
         const probe = runSdk(['auth', '--print', alias, '--format', 'headers'],
           { capture: true, allowFailure: true, quiet: true })
         const ok = probe.status === 0 && hasAuthHeader(parseHeaderLines(stripAnsi(probe.stdout || '')))
-        console.log(`  ${alias} -> ${host}  ${ok ? 'ready' : 'NOT ready ("auth --print" gave no auth header; SDK too old? needs 4.10+)'}`)
+        if (ok) {
+          console.log(`  ${alias} -> ${host}  ready`)
+          continue
+        }
+        // Do not guess a cause. An OAuth credential needing a refresh, an expired
+        // session and an old SDK all land here and look nothing alike.
+        const why = stripAnsi(`${probe.stderr || ''}${probe.stdout || ''}`).trim().split('\n')
+          .map((l) => l.trim()).filter(Boolean).pop()
+        console.log(`  ${alias} -> ${host}  NOT ready`)
+        console.log(`      "now-sdk auth --print ${alias} --format headers" exited ${probe.status} `
+          + 'without an auth header. Run it yourself to see why.')
+        if (why) console.log(`      last line: ${why.slice(0, 160)}`)
       }
     }
   }

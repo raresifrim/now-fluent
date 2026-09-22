@@ -64,9 +64,15 @@ in vendor scopes. `--table` is optional for both.
 - `push` builds, diffs the compiled artifact against that baseline, and sends only the
   changed fields (`PUT`, or `POST` with the `sys_id` when the record does not exist).
 - Refuses a record that drifted on the instance, or that exists but was never pulled
-  (`--force` overrides). Never writes `sys_*` bookkeeping; does write `sys_scope`.
+  (`--force` overrides). Never writes `sys_*` bookkeeping.
+- **Scope, verified live: `sys_scope` is IGNORED on a Table API write** — the record
+  lands in Global and `api_name` is rewritten. So a CREATE from a scoped artifact is
+  refused; `--target-scope global` is the explicit opt-in; any other target scope is
+  refused. Every write reads the scope back and fails if it landed elsewhere.
+  Use `update-set-package --scope <scope>` to place records in a real scope.
 - **A push is not an update set commit** — it runs business rules like a form edit, and
-  creates no update set unless `--update-set <id|name>` is passed (experimental).
+  `--update-set` cannot steer capture (verified live); it only reports where the writes
+  actually landed and fails on a mismatch.
 
 ### Import record(s) by sys_id
 

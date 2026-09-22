@@ -102,6 +102,37 @@ now-fluent push --project ./work --auth dev --sys-id 0123456789abcdef0123456789a
 
 The snapshot lives in `<project>/.now-fluent/state/<table>_<sysid>.json`. It is what makes the diff and the drift check possible; add it to `.gitignore` if you do not want it committed. A snapshot taken against one instance is never used as the diff reference for another — push notices and refuses.
 
+### Scope: push cannot choose one
+
+**Verified live (dev instance, SDK 4.12.x): `sys_scope` is inert on a Table API write.** The platform sets it from the scope the REST transaction runs in — Global for `/api/now/table` — and rewrites `api_name` to match (`x_my_app.Thing` → `global.Thing`). The `apps.current_app` user preference does not steer it either.
+
+So push cannot put a record in a scope of your choosing. What it does instead:
+
+| case | behaviour |
+| --- | --- |
+| updating an existing record | unaffected — its scope is already set, and the field is ignored |
+| **creating** a record whose artifact is scoped | **refused** — it would land in Global and leave project and instance disagreeing |
+| `--target-scope global` | creates it in Global on purpose, and reports the scope and `api_name` it actually got |
+| `--target-scope <other scope>` | refused before any request — this transport cannot do it |
+
+Every write reads `sys_scope` back afterwards and fails the record if it landed somewhere else. That check is the whole point: before it existed, a scoped create reported `created (13 field(s))` while silently producing a Global record with a rewritten `api_name`.
+
+**To get records into a specific scope, use `update-set-package`** — its payload carries `sys_scope`, and import/preview/commit places records properly:
+
+```bash
+now-fluent update-set-package --project ./work --update-set-name "To Global"   --scope global --scope-id global --build-local
+```
+
+One local constraint to know: a scope-bound project will not compile `apiName: 'global.Thing'` (TS11 — it must start with the project's scope). So for tables that carry an `apiName` (script includes, script actions), "author in a scoped project, push to Global" does not work even with `--target-scope global`; use a Global-bound project or `update-set-package`. Tables without an `apiName` (business rules, UI policies) build fine.
+
+### Update set capture: reported, not controlled
+
+`--update-set <sys_id|name>` points your account's session at an in-progress update set. **Verified live: that does not reliably steer capture** — a REST transaction resolves its own update set, and a record written while the session pointed at a named set was captured into `Default` instead.
+
+So the flag's real job is the check that follows: after the push, it looks at where each write was actually captured and, on a mismatch, names the set it went to and fails the run. It restores your previous update set preference afterwards either way.
+
+If you need changes in a specific update set, build one with `update-set-package` rather than hoping capture follows.
+
 ### Two limitations worth knowing
 
 **push cannot clear a field by deleting it from the Fluent source.** A Table API write merges, and the built artifact only contains the fields your Fluent code models — so "absent from the artifact" means "not modelled", not "delete this value". Removing a property leaves the old value on the record. Set it to an explicit empty value instead.
@@ -133,15 +164,16 @@ It creates throwaway `sys_script_include` records, checks each assumption, delet
 
 | flag | effect |
 | --- | --- |
-| `--dry-run` | print the method, URL and body for each record; send nothing |
+| `--dry-run` | build, then print the method, URL and body for each record; send nothing |
 | `--all` | push every built record (`--include`/`--exclude` select, same tokens as `update-set-package`) |
 | `--full` | send every modelled field, not just the changed ones |
 | `--force` | push anyway when the record drifted |
 | `--no-drift-check` | skip the drift comparison entirely |
 | `--no-build` | push whatever is already in the build output |
-| `--no-scope` | omit `sys_scope` from the write |
+| `--target-scope global` | create in Global on purpose from a scoped project (the only value this transport can deliver) |
+| `--no-scope` | omit `sys_scope` from the body — a no-op on the instance, since the field is ignored either way |
 | `--allow-delete` | apply `DELETE` artifacts instead of skipping them |
-| `--update-set <id\|name>` | point your session at an in-progress update set first (experimental) |
+| `--update-set <id\|name>` | point your session at an update set, then verify where capture actually landed |
 
 `--table` is optional for both commands: `push` reads it from the built artifact (and validates a `--table` you do pass against it), and `pull` resolves it from `sys_metadata.sys_class_name`.
 
