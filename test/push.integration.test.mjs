@@ -299,3 +299,41 @@ test('one unbuilt sys_id does not abort the whole run', async () => {
   assert.match(result.stderr + result.stdout, /No built record found/)
   assert.ok(instance.store.has(`sys_script_include/${SYS_ID}`), 'the buildable record must still be pushed')
 })
+
+test('--all skips the SDK\'s own sys_module scaffolding records', async () => {
+  const moduleId = '77'.repeat(16)
+  writeFileSync(join(project, 'dist', 'app', 'update', `sys_module_${moduleId}.xml`),
+    '<record_update table="sys_module"><sys_module action="INSERT_OR_UPDATE">'
+    + `<name>bom.json</name><sys_id>${moduleId}</sys_id></sys_module></record_update>`)
+
+  const result = await push('--all')
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(!instance.store.has(`sys_module/${moduleId}`), 'build bookkeeping must not be written')
+  assert.ok(instance.store.has(`sys_script_include/${SYS_ID}`), 'the real record still goes')
+  assert.match(result.stdout, /skipping the SDK's own sys_module/)
+})
+
+test('--all --include sys_module opts back in', async () => {
+  const moduleId = '77'.repeat(16)
+  writeFileSync(join(project, 'dist', 'app', 'update', `sys_module_${moduleId}.xml`),
+    '<record_update table="sys_module"><sys_module action="INSERT_OR_UPDATE">'
+    + `<name>bom.json</name><sys_id>${moduleId}</sys_id></sys_module></record_update>`)
+
+  const result = await push('--all', '--include', 'sys_module')
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(instance.store.has(`sys_module/${moduleId}`))
+})
+
+test('a baseline filed under a different table is still found', async () => {
+  // pull --table X writes X_<id>.json; the artifact may say table Y. Keying only on
+  // the artifact's table made push miss it and refuse the record on every attempt.
+  await push('--sys-id', SYS_ID)
+  const { renameSync } = await import('node:fs')
+  const dir = join(project, '.now-fluent', 'state')
+  renameSync(join(dir, `sys_script_include_${SYS_ID}.json`), join(dir, `sys_ui_policy_${SYS_ID}.json`))
+  writeArtifact({ name: 'MyInclude', script: 'var a = 9;', description: 'first' })
+
+  const result = await push('--sys-id', SYS_ID)
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /updated \(1 field\(s\)\)/, 'should diff against the found baseline, not refuse')
+})

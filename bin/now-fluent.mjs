@@ -521,8 +521,14 @@ function parseHeaderLines(stdout) {
     const idx = line.indexOf(':')
     if (idx <= 0) continue
     const name = line.slice(0, idx).trim()
-    if (!/^[A-Za-z0-9-]+$/.test(name)) continue
-    headers[name] = line.slice(idx + 1).trim()
+    const value = line.slice(idx + 1).trim()
+    // A stray log line is shaped like a header ("https://host" splits into name
+    // "https"), and sending it would either break every request with an
+    // unrelated-looking TypeError from fetch, or leak the line to the instance.
+    if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(name)) continue
+    if (/^https?$/i.test(name)) continue
+    if (!value || /[\u0000-\u001f\u007f]/.test(value)) continue
+    headers[name] = value
   }
   return headers
 }
@@ -2525,6 +2531,13 @@ function statePath(project, table, sysId) {
 }
 
 // Baselines are keyed <table>_<sysid>; when the table is not known, find by sys_id.
+// Remove a record's baseline wherever it is filed, not just under the expected table.
+function removeBaseline(project, table, sysId) {
+  rmSync(statePath(project, table, sysId), { force: true })
+  const other = findBaselineFor(project, sysId)
+  if (other) rmSync(other, { force: true })
+}
+
 function findBaselineFor(project, sysId) {
   const dir = join(project, '.now-fluent', 'state')
   if (!existsSync(dir)) return null
@@ -2533,8 +2546,14 @@ function findBaselineFor(project, sysId) {
 }
 
 function readBaseline(project, table, sysId) {
-  const file = statePath(project, table, sysId)
-  if (!existsSync(file)) return null
+  // The artifact's table and the table pull filed the baseline under can differ — an
+  // explicit `pull --table sys_ui_policy` of a catalog_ui_policy record writes
+  // sys_ui_policy_<id>.json. Keying only on the artifact's table made push miss it and
+  // refuse the record forever, so fall back to finding it by sys_id.
+  const file = existsSync(statePath(project, table, sysId))
+    ? statePath(project, table, sysId)
+    : findBaselineFor(project, sysId)
+  if (!file || !existsSync(file)) return null
   try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return null }
 }
 
@@ -2714,7 +2733,9 @@ async function setCurrentUpdateSet(instance, ref) {
   const sets = await snRequest(instance, 'GET', '/api/now/table/sys_update_set', {
     params: {
       ...RAW_READ_PARAMS,
-      sysparm_query: isSysId ? `sys_id=${ref}` : `name=${ref}^state=in progress`,
+      // Deliberately NOT filtered by state: a set that exists but is complete should
+      // be reported as complete, not as "no such update set".
+      sysparm_query: isSysId ? `sys_id=${ref}` : `name=${ref}`,
       sysparm_fields: 'sys_id,name,state',
       sysparm_limit: '10'
     }
@@ -2774,8 +2795,10 @@ async function setCurrentUpdateSet(instance, ref) {
 // VERIFIED LIVE: setting the sys_update_set preference does NOT steer where a Table API
 // write is captured — a record written while the session pointed at a named set was
 // captured into Default instead. So never claim capture; go and look.
+// Returns the sys_ids whose capture did NOT land in the requested set.
 async function reportUpdateSetCapture(instance, target, written) {
-  if (!written.length) return true
+  if (!written.length) return []
+  const sysIdOf = new Map(written.map(({ table, sysId }) => [`${table}_${sysId}`, sysId]))
   const names = written.map(({ table, sysId }) => `${table}_${sysId}`)
   const rows = await snRequest(instance, 'GET', '/api/now/table/sys_update_xml', {
     params: {
@@ -2790,7 +2813,7 @@ async function reportUpdateSetCapture(instance, target, written) {
   if (!captures.length) {
     console.error('\nUPDATE SET: none of these writes were captured into any update set. '
       + 'They cannot be promoted from here — use update-set-package.')
-    return false
+    return written.map(({ sysId }) => sysId)
   }
 
   // One row per record: the newest capture wins, which the DESC sort already gives us.
@@ -2799,7 +2822,7 @@ async function reportUpdateSetCapture(instance, target, written) {
   const elsewhere = [...newest.values()].filter((row) => row.update_set !== target.sys_id)
   if (!elsewhere.length) {
     console.log(`\nUPDATE SET: all ${newest.size} capture(s) landed in "${target.name}" as asked.`)
-    return true
+    return []
   }
 
   const setIds = [...new Set(elsewhere.map((row) => row.update_set).filter(Boolean))]
@@ -2817,7 +2840,9 @@ async function reportUpdateSetCapture(instance, target, written) {
   }
   console.error('  The platform resolved the update set itself and ignored the preference push set. Move these\n'
     + '  captures by hand, or promote with update-set-package, which builds the update set directly.')
-  return false
+  // Only the records that actually mis-captured. Failing all ten because one went
+  // astray would bury the one that matters.
+  return elsewhere.map((row) => sysIdOf.get(row.name)).filter(Boolean)
 }
 
 async function findPreferenceId(instance, userId) {
@@ -2889,7 +2914,7 @@ async function pushRecord(target, label, context) {
   if (deleting) {
     if (!dryRun && !live) {
       console.log(`${label} already absent`)
-      rmSync(statePath(project, table, sysId), { force: true })
+      removeBaseline(project, table, sysId)
       return 'unchanged'
     }
     if (dryRun) {
@@ -2897,7 +2922,7 @@ async function pushRecord(target, label, context) {
       return 'deleted'
     }
     await snRequest(instance, 'DELETE', `/api/now/table/${table}/${sysId}`, { allow404: true, throwOnError: true })
-    rmSync(statePath(project, table, sysId), { force: true })
+    removeBaseline(project, table, sysId)
     console.log(`${label} deleted`)
     return 'deleted'
   }
@@ -2964,8 +2989,15 @@ async function pushRecord(target, label, context) {
   try {
     written = await snGetRecord(instance, table, sysId, undefined, { throwOnError: true })
     if (written) writeBaseline(project, table, sysId, instance, written)
+    else {
+      // A 404 or empty projection after a successful write. Keeping the old baseline
+      // would make the NEXT push see our own write as somebody else's drift.
+      removeBaseline(project, table, sysId)
+      console.warn(`${label} written, but reading it back returned nothing. Removed the stale baseline — `
+        + 'pull it again before the next push.')
+    }
   } catch (error) {
-    rmSync(statePath(project, table, sysId), { force: true })
+    removeBaseline(project, table, sysId)
     console.warn(`${label} written, but its baseline could not be refreshed `
       + `(${error && error.message ? error.message : error}). Removed the stale baseline — pull it again.`)
   }
@@ -3022,7 +3054,17 @@ async function commandPush(flags, config, positional) {
     console.warn('Note: --include/--exclude only select records for --all; an explicit --sys-id list is '
       + 'pushed as given.')
   }
-  const artifacts = collectArtifactFiles(project, pushAll ? { includes, excludes } : {})
+  // The SDK emits sys_module records for the project's own bom.json/package.json.
+  // They are local build bookkeeping, not instance records anyone means to write, and
+  // an unguarded `push --all` would POST them to the live instance. update-set-package
+  // documents excluding them; push just excludes them, unless you ask for them by name.
+  const askedForModules = includes.some((token) => token.includes('sys_module'))
+  const effectiveExcludes = pushAll && !askedForModules ? [...excludes, 'sys_module'] : excludes
+  if (pushAll && !askedForModules) {
+    console.log('--all: skipping the SDK\'s own sys_module scaffolding records '
+      + '(bom.json/package.json). Pass --include sys_module if you really want them.')
+  }
+  const artifacts = collectArtifactFiles(project, pushAll ? { includes, excludes: effectiveExcludes } : {})
   if (!artifacts.length) {
     fail('No built XML artifacts found. Run a build first (drop --no-build), or check dist/app/update.')
   }
@@ -3105,12 +3147,18 @@ async function commandPush(flags, config, positional) {
     }
   } finally {
     if (updateSetSession) {
+      // TWO separate try blocks on purpose. The capture check is a nice-to-have; the
+      // restore is not. Sharing one block meant a failed check skipped the restore and
+      // left the account's update set preference permanently repointed.
       try {
-        // Look BEFORE restoring: the capture rows are what they are, but checking while
-        // the session is still pointed there keeps the two steps' failures separate.
-        if (!await reportUpdateSetCapture(instance, updateSetSession.target, writtenRecords)) {
-          results.failed.push(...writtenRecords.map(({ sysId }) => `${sysId} (capture)`))
+        for (const sysId of await reportUpdateSetCapture(instance, updateSetSession.target, writtenRecords)) {
+          results.failed.push(`${sysId} (captured into the wrong update set)`)
         }
+      } catch (error) {
+        console.error('WARNING: could not verify where the writes were captured '
+          + `(${error && error.message ? error.message : error}). Check the update set by hand.`)
+      }
+      try {
         await updateSetSession.restore()
       } catch (error) {
         console.error('WARNING: could not restore your previous update set preference '

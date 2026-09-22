@@ -7,14 +7,27 @@
 // cannot themselves prove the platform provides them.
 import { createServer } from 'node:http'
 
-export async function startMockInstance({ records = {}, honoursScope = false } = {}) {
+// captureInto: where the platform files sys_update_xml rows for metadata writes.
+// Default 'default-set', deliberately NOT whatever the sys_update_set preference says —
+// that is the live-verified behaviour --update-set has to cope with. Set
+// captureFollowsPreference:true to model an instance where the preference IS honoured.
+export async function startMockInstance({
+  records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false
+} = {}) {
   const store = new Map(Object.entries(records))
   const log = []
   let clock = 0
   const stamp = () => `2026-01-01 00:00:${String(++clock).padStart(2, '0')}`
 
+  const CAPTURED = new Set(['sys_script_include', 'sys_script', 'sys_ui_policy', 'sys_properties'])
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
+
+    if (url.pathname === '/api/now/ui/user/current_user') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      return res.end(JSON.stringify({ result: { user_sys_id: 'user0000000000000000000000000001', user_name: 'admin' } }))
+    }
+
     const [, , , , table, sysId] = url.pathname.split('/') // /api/now/table/<t>/<id>
     let raw = ''
     for await (const chunk of req) raw += chunk
@@ -37,16 +50,13 @@ export async function startMockInstance({ records = {}, honoursScope = false } =
       return row ? send(200, { result: project(row) }) : send(404, { error: { message: 'No record found' } })
     }
     if (req.method === 'GET') {
-      // Just enough sysparm_query to serve the shapes now-fluent actually sends.
-      const q = url.searchParams.get('sysparm_query') || ''
-      const wanted = q.startsWith('sys_idIN') ? q.slice('sys_idIN'.length).split(/[,^]/)
-        : q.startsWith('sys_id=') ? [q.slice('sys_id='.length).split('^')[0]]
-          : null
       const rows = [...store.entries()]
         .filter(([k]) => k.startsWith(`${table}/`))
         .map(([, v]) => v)
-        .filter((row) => !wanted || wanted.includes(row.sys_id))
-      return send(200, { result: rows.map(project) })
+        .filter((row) => matchesQuery(row, url.searchParams.get('sysparm_query') || ''))
+      applyOrder(rows, url.searchParams.get('sysparm_query') || '')
+      const limit = Number(url.searchParams.get('sysparm_limit') || rows.length)
+      return send(200, { result: rows.slice(0, limit).map(project) })
     }
     if (req.method === 'POST') {
       const id = parsed && parsed.sys_id
@@ -62,6 +72,7 @@ export async function startMockInstance({ records = {}, honoursScope = false } =
         if (row.api_name) row.api_name = String(row.api_name).replace(/^[^.]+\./, 'global.')
       }
       store.set(`${table}/${id}`, row)
+      noteCapture(table, id)
       return send(201, { result: { sys_id: id } })
     }
     if (req.method === 'PUT') {
@@ -70,6 +81,7 @@ export async function startMockInstance({ records = {}, honoursScope = false } =
       const next = { ...row, ...parsed, sys_updated_on: stamp(), sys_mod_count: String(Number(row.sys_mod_count || 0) + 1) }
       if (!honoursScope) next.sys_scope = row.sys_scope // inert on update too
       store.set(key, next)
+      noteCapture(table, sysId)
       return send(200, { result: { sys_id: sysId } })
     }
     if (req.method === 'DELETE') {
@@ -78,6 +90,52 @@ export async function startMockInstance({ records = {}, honoursScope = false } =
     }
     return send(405, { error: { message: 'method not allowed' } })
   })
+
+  // A small encoded-query evaluator: enough of ServiceNow's syntax for the shapes
+  // now-fluent actually sends (field=value, fieldINa,b, and ORDERBY clauses), so the
+  // mock filters like the real Table API instead of returning everything.
+  function matchesQuery(row, query) {
+    if (!query) return true
+    for (const clause of query.split('^')) {
+      if (!clause || /^ORDERBY/i.test(clause)) continue
+      const inMatch = clause.match(/^(\w+)IN(.*)$/)
+      if (inMatch) {
+        const [, field, list] = inMatch
+        if (!list.split(',').includes(String(row[field] ?? ''))) return false
+        continue
+      }
+      const eq = clause.match(/^(\w+)=(.*)$/)
+      if (eq) {
+        const [, field, value] = eq
+        if (String(row[field] ?? '') !== value) return false
+        continue
+      }
+      const ne = clause.match(/^(\w+)!=(.*)$/)
+      if (ne && String(row[ne[1]] ?? '') === ne[2]) return false
+    }
+    return true
+  }
+
+  function applyOrder(rows, query) {
+    const desc = query.match(/ORDERBYDESC(\w+)/i)
+    const asc = query.match(/(?:^|\^)ORDERBY(?!DESC)(\w+)/i)
+    const field = desc ? desc[1] : asc ? asc[1] : null
+    if (!field) return
+    rows.sort((a, b) => String(a[field] ?? '').localeCompare(String(b[field] ?? '')))
+    if (desc) rows.reverse()
+  }
+
+  function noteCapture(table, id) {
+    if (!CAPTURED.has(table)) return
+    const pref = [...store.entries()].find(([k, v]) => k.startsWith('sys_user_preference/') && v.name === 'sys_update_set')
+    const destination = captureFollowsPreference && pref && pref[1].value
+      ? pref[1].value
+      : (captureInto || 'default-set')
+    const rowId = `cap${String(++clock).padStart(29, '0')}`
+    store.set(`sys_update_xml/${rowId}`, {
+      sys_id: rowId, name: `${table}_${id}`, update_set: destination, sys_created_on: stamp()
+    })
+  }
 
   await new Promise((done) => server.listen(0, '127.0.0.1', done))
   const { port } = server.address()
