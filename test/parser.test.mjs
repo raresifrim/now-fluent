@@ -188,3 +188,45 @@ test('single-quoted attributes parse too', () => {
   assert.equal(record.action, 'INSERT_OR_UPDATE')
   assert.equal(record.fields.name, 'x')
 })
+
+// --- against REAL now-sdk build output ------------------------------------
+// Hand-written XML only proves the parser handles what we thought to write. These are
+// genuine SDK 4.12.2 artifacts; see test/fixtures/real-sdk-build/README.md.
+
+test('parses real now-sdk build artifacts', async () => {
+  const { readdirSync, readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const dir = join(import.meta.dirname, 'fixtures', 'real-sdk-build')
+  const files = readdirSync(dir).filter((f) => f.endsWith('.xml'))
+  assert.ok(files.length >= 3, 'fixtures should be present')
+
+  for (const file of files) {
+    const records = parseRecordUpdateRecords(readFileSync(join(dir, file), 'utf8'))
+    assert.equal(records.length, 1, `${file} should yield exactly one record`)
+    const [record] = records
+    assert.equal(record.action, 'INSERT_OR_UPDATE', `${file}: action= is not the first attribute here`)
+    assert.match(record.sysId, /^[0-9a-f]{32}$/, `${file}: sys_id should parse`)
+    assert.ok(file.startsWith(record.table), `${file}: table should match the filename`)
+
+    const payload = recordFieldsToPayload(record.fields)
+    assert.ok(!('sys_update_name' in payload), `${file}: sys_update_name must never be written`)
+    assert.ok(!('sys_id' in payload), `${file}: sys_id goes in the URL, not the body`)
+    assert.ok(Object.keys(payload).length > 0, `${file}: payload should not be empty`)
+  }
+})
+
+test('a real CDATA script survives the round trip byte for byte', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const xml = readFileSync(join(import.meta.dirname, 'fixtures', 'real-sdk-build',
+    'sys_script_include_26476609112c407ea8c36e346de767b1.xml'), 'utf8')
+  const [record] = parseRecordUpdateRecords(xml)
+
+  // Exactly the bytes between <![CDATA[ and ]]> in the artifact.
+  const expected = xml.match(/<script><!\[CDATA\[([\s\S]*?)\]\]><\/script>/)[1]
+  assert.equal(record.fields.script, expected)
+  assert.match(record.fields.script, /Class\.create\(\)/, 'the class body should be intact')
+  assert.match(record.fields.script, /round: function \(n\) \{/, 'newlines and braces should survive')
+  assert.equal(record.fields.caller_access, '', 'an empty element parses as an empty string')
+  assert.equal(record.fields.sys_scope, 'e5d61884beaf441ebd67932b798cb00b', 'the value, not the display_value')
+})

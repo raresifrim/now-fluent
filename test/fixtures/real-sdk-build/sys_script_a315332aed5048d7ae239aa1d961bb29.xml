@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<record_update table="sys_script">
+  <sys_script action="INSERT_OR_UPDATE" apply_defaults="true">
+    <sys_id>a315332aed5048d7ae239aa1d961bb29</sys_id>
+    <sys_scope display_value="x_push_demo">e5d61884beaf441ebd67932b798cb00b</sys_scope>
+    <sys_update_name>sys_script_a315332aed5048d7ae239aa1d961bb29</sys_update_name>
+    <abort_action>false</abort_action>
+    <access>package_private</access>
+    <action_delete>false</action_delete>
+    <action_insert>true</action_insert>
+    <action_query>false</action_query>
+    <action_update>false</action_update>
+    <active>true</active>
+    <add_message>false</add_message>
+    <advanced>true</advanced>
+    <change_fields>false</change_fields>
+    <client_callable>false</client_callable>
+    <collection>incident</collection>
+    <condition/>
+    <description/>
+    <execute_function>false</execute_function>
+    <filter_condition/>
+    <is_rest>false</is_rest>
+    <message/>
+    <name>Stamp price on insert</name>
+    <order>100</order>
+    <priority>100</priority>
+    <rest_method/>
+    <rest_method_text/>
+    <rest_service/>
+    <rest_service_text/>
+    <rest_variables/>
+    <role_conditions/>
+    <script><![CDATA[;(function executeRule(current, previous) {
+    current.short_description = 'stamped: ' + current.short_description
+})()
+]]></script>
+    <sys_name>Stamp price on insert</sys_name>
+    <sys_policy/>
+    <template/>
+    <when>before</when>
+  </sys_script>
+</record_update>
