@@ -128,6 +128,10 @@ Only your edits are sent; the scope and `api_name` translate back and diff out.
 | edit it in place, quickly | `push` |
 | move it into your project's scope | `update-set-package --move-adopted` — says which `api_name`s will change |
 
+Packaging records built in your project's scope for **another** scope (`--scope global`) rewrites their `api_name` along with `sys_scope` — `x_my_app.Helper` becomes `global.Helper` — so each payload matches the scope it lands in. It says so, and lists the renamed records: committing creates them in that scope, or moves them there if they already exist in yours. `--keep-payload-scope` leaves both as built.
+
+`import` (on the query path) and `import-update-set` adopt the same way: records from another scope are rewritten before the transform, and their origin is recorded once they land. Flows go through the SDK's online transform and are not adopted.
+
 Adoption happens on the query path (pull's default), because only that path's rebuilt XML is ours to rewrite and record. `--no-adopt-scope` skips the *rewrite* only — the record's origin is still recorded, because the SDK build stamps the project's scope onto every artifact whether or not the source was rewritten, and forgetting the origin would let `update-set-package` package it as a move. (Without the rewrite, a record carrying an `apiName` will fail the build with TS11.)
 
 ### Scope: push cannot choose one

@@ -52,7 +52,7 @@ Enhanced commands (handled by now-fluent):
   doctor
       Report now-fluent, Node, and now-sdk versions.
 
-  import [--project <path>] --auth <alias>
+  import [--project <path>] --auth <alias> [--no-adopt-scope]
          [--sys-id <32hex>[,<32hex>...] | --query <encoded query> --table <table>]
          [--table <table>] [--via auto|move|transform|query] [--limit <n>]
          [--no-related] [--out <dir>] [--keep] [--keep-failed] [--force]
@@ -252,6 +252,12 @@ Enhanced commands (handled by now-fluent):
       exact record; a table name selects a type. The SDK emits sys_module records
       for bom.json/package.json — exclude them (e.g. --exclude sys_module) unless
       wanted.
+
+      Packaging for a scope other than the project's (--scope global) rewrites
+      api_name along with sys_scope (x_my_app.X -> global.X) so each payload
+      matches where it lands, and lists what changes: committing creates the
+      records there, or MOVES them if they exist in the project's scope.
+      --keep-payload-scope leaves both as built.
 
       Adopted records (pulled from another scope — see pull) are never silently
       moved: packaging one for the project's scope is REFUSED, because committing
@@ -1831,6 +1837,14 @@ function commandImportUpdateSet(flags, config, positional) {
   const workDir = flags.out ? resolve(flags.out) : join(tmpdir(), `now-fluent-us-${randomUUID()}`)
   mkdirSync(workDir, { recursive: true })
 
+  // Records from another scope are ADOPTED exactly as pull adopts them: rewritten into
+  // the project's scope before the transform (so an apiName-bearing record compiles
+  // instead of failing TS11), and their origin recorded once they land — so push
+  // returns them where they live and update-set-package never packages them as a move.
+  const projectScope = projectScopeOf(project)
+  const rewriteScope = !flags['no-adopt-scope']
+  const pendingAdoptions = new Map() // sys_id -> { table, from } | { table, from: null }
+
   const records = []         // non-flow records → offline `transform --from`
   const flowSeedSet = new Set()   // sys_hub_flow sys_ids → online per-flow transform
   const actionSeedSet = new Set() // sys_hub_action_type_definition sys_ids → online per-action transform
@@ -1859,7 +1873,10 @@ function commandImportUpdateSet(flags, config, positional) {
     }
     // The decoded payload often already carries its own <?xml?> prolog; strip any
     // leading declaration so we emit exactly one (two is invalid XML).
-    const body = payload.replace(/^\s*<\?xml[^>]*\?>\s*/i, '')
+    const adoption = adoptPayloadScope(payload.replace(/^\s*<\?xml[^>]*\?>\s*/i, ''), projectScope,
+      { rewrite: rewriteScope })
+    const body = adoption.xml
+    for (const record of adoption.records) pendingAdoptions.set(record.sysId, record)
     // Family tables (TRANSFORM_TOGETHER) go into a per-group subfolder so the whole
     // family is transformed in ONE --from call (separate transforms would define the
     // children twice — embedded in the parent AND as standalone Record() files).
@@ -1873,6 +1890,19 @@ function commandImportUpdateSet(flags, config, positional) {
   }
   const flows = [...flowSeedSet]
   const actions = [...actionSeedSet]
+
+  const foreignRecords = [...pendingAdoptions.values()].filter((record) => record.from)
+  if (foreignRecords.length) {
+    const byOrigin = new Map()
+    for (const record of foreignRecords) byOrigin.set(record.from.name, (byOrigin.get(record.from.name) || 0) + 1)
+    const origins = [...byOrigin].map(([name, count]) => `${name}: ${count}`).join(', ')
+    console.log(rewriteScope
+      ? `\n${foreignRecords.length} record(s) live outside ${projectScope.scope} (${origins}) and are ADOPTED: written in `
+        + `${projectScope.scope}'s terms so they compile. push returns them where they live; update-set-package will `
+        + 'not package them as a move.'
+      : `\n${foreignRecords.length} record(s) live outside ${projectScope.scope} (${origins}). --no-adopt-scope: not `
+        + 'rewritten, so any that carry an apiName will fail TS11 — their origin is still recorded.')
+  }
 
   if (records.length === 0 && flows.length === 0 && actions.length === 0) {
     rmSync(workDir, { recursive: true, force: true })
@@ -2112,6 +2142,28 @@ function commandImportUpdateSet(flags, config, positional) {
     console.log(`[dry-run] left extracted record XML at ${workDir}`)
     return
   }
+
+  // Record adoptions only for records that LANDED. keys.ts is the truth here: the
+  // verification build prunes entries for anything the healer removed, and a record
+  // skipped as already present is registered from an earlier run — its source was built
+  // in the project's scope just the same, so its origin belongs on record too.
+  if (projectScope && pendingAdoptions.size) {
+    const landed = loadProjectRecordIds(project)
+    const since = new Date().toISOString()
+    let recorded = 0
+    for (const [sysId, record] of pendingAdoptions) {
+      if (!landed.has(sysId)) continue
+      setAdoption(project, sysId, record.from ? {
+        table: record.table,
+        from: record.from,
+        to: { scopeId: projectScope.scopeId, name: projectScope.scope, apiPrefix: projectScope.scope },
+        since
+      } : null)
+      if (record.from) recorded++
+    }
+    if (recorded) console.log(`\nRecorded ${recorded} adopted record(s) in .now-fluent/adopted.json (commit it with the source).`)
+  }
+
   if (keep || flags.out) {
     console.log(`\nKept extracted record XML at: ${workDir}`)
   } else {
@@ -2302,6 +2354,37 @@ function commandUpdateSetPackage(flags, config) {
     if (staying.length) {
       console.log(`${staying.length} adopted record(s) packaged as IN-PLACE edits in their origin scope `
         + '(sys_scope and api_name translated back).')
+    }
+
+    // Everything else is being put into THIS update set's scope. When that is not the
+    // project's own, the payload's sys_scope gets rewritten to it (buildUpdateSetXml) —
+    // and api_name must move with it. The build stamped the PROJECT's prefix on it
+    // (x_my_app.Thing); left alone, a record would reach Global as sys_scope=global with
+    // api_name=x_my_app.Thing, a combination nothing on the instance could call.
+    const ownScope = projectScopeOf(project)
+    if (!flags['keep-payload-scope'] && ownScope && scopeId !== ownScope.scopeId) {
+      const translatedInPlace = new Set(staying.map((entry) => entry.record))
+      const ownApiPrefix = `<api_name>${ownScope.scope}.`
+      const ownSysScope = new RegExp(`<sys_scope\\b[^>]*>${escapeRegExp(ownScope.scopeId)}</sys_scope>`)
+      const rescoped = []
+      for (const record of records) {
+        if (translatedInPlace.has(record)) continue
+        const before = record.rawXml
+        if (!ownSysScope.test(before) && !before.includes(ownApiPrefix)) continue
+        record.rawXml = before.split(ownApiPrefix).join(`<api_name>${scope}.`)
+        rescoped.push({ record, renamed: record.rawXml !== before })
+      }
+      if (rescoped.length) {
+        const renamed = rescoped.filter((entry) => entry.renamed).length
+        console.warn(`${rescoped.length} record(s) built in ${ownScope.scope} are packaged for ${scope}: committing the update `
+          + `set creates them in ${scope} — or MOVES them there, if they already exist in ${ownScope.scope}.`)
+        if (renamed) {
+          console.warn(`  api_name rewritten ${ownScope.scope}.* -> ${scope}.* on ${renamed} of them, so each payload matches `
+            + 'the scope it lands in. Anything calling them by the old name must change:')
+          for (const { record } of rescoped.filter((entry) => entry.renamed)) console.warn(`    ${record.targetName}`)
+        }
+        console.warn('  (--keep-payload-scope leaves both sys_scope and api_name exactly as built.)')
+      }
     }
 
     const keepPayloadScope = Boolean(flags['keep-payload-scope'])
@@ -2982,6 +3065,43 @@ function translateAdoptedPayload(xml, adoptedScope) {
   return out
 }
 
+// The same classification and rewrite as adoptRowScope, for a <record_update> payload
+// (import-update-set's input) instead of a queried row. Returns the payload — rewritten
+// when `rewrite` and anything in it lives elsewhere — plus one entry per record in it:
+// `from` set for records living outside the project's scope, null for records inside it
+// (so an earlier, now-stale adoption can be cleared).
+function adoptPayloadScope(xml, projectScope, { rewrite = true } = {}) {
+  const records = []
+  if (!projectScope) return { xml, records }
+  for (const record of parseRecordUpdateRecords(xml)) {
+    if (!record.sysId) continue
+    const originScopeId = record.fields.sys_scope || ''
+    if (!originScopeId || originScopeId === projectScope.scopeId) {
+      records.push({ table: record.table, sysId: record.sysId, from: null })
+      continue
+    }
+    const display = firstMatch(xml, new RegExp(
+      `<sys_scope\\b[^>]*\\bdisplay_value="([^"]*)"[^>]*>${escapeRegExp(originScopeId)}</sys_scope>`))
+    records.push({
+      table: record.table,
+      sysId: record.sysId,
+      from: {
+        scopeId: originScopeId,
+        name: display ? decodeXmlEntities(display) : (originScopeId === GLOBAL_SCOPE_ID ? 'Global' : originScopeId),
+        apiPrefix: apiPrefixOf(record.fields.api_name)
+      }
+    })
+  }
+  const foreign = records.filter((record) => record.from)
+  if (!foreign.length || !rewrite) return { xml, records }
+  // rewriteSysScope is the one place that already handles every form <sys_scope> takes.
+  let out = rewriteSysScope(String(xml), projectScope.scope, projectScope.scopeId)
+  for (const prefix of new Set(foreign.map((record) => record.from.apiPrefix).filter(Boolean))) {
+    out = out.replace(new RegExp(`<api_name>${escapeRegExp(prefix)}\\.`, 'g'), `<api_name>${projectScope.scope}.`)
+  }
+  return { xml: out, records }
+}
+
 // The inverse, for push: turn the built artifact's project-scoped fields back into the
 // origin's. Only fields that still carry the project's values are touched, so a record
 // whose source was edited to name some other scope is left for the scope guard to judge.
@@ -3604,7 +3724,12 @@ async function main() {
       commandDoctor(flags)
       break
     case 'import':
-      commandImport(flags, config, positional)
+      // Adopt like pull does. Only the query path rewrites (its XML is ours); the origin
+      // of any record landing from another scope is recorded either way.
+      commandImport(flags, config, positional, {
+        projectScope: flags.project || config.project ? projectScopeOf(projectPath(flags, config)) : null,
+        rewriteScope: !flags['no-adopt-scope']
+      })
       break
     case 'import-update-set':
       commandImportUpdateSet(flags, config, positional)
