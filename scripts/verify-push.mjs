@@ -148,6 +148,17 @@ async function exercise(instance, label, scope) {
       // application can refuse a delete run from Global (seen live: HTTP 403 in sn_sow).
       if (scopeTx) tracked.scope = scopeTx
       if (scopeTx && scopeTx !== 'global') {
+        // push UPDATES records in an app AS that app, falling back to Global on a 403.
+        // Measure both, so a "no" on either is visible.
+        const fromGlobal = await probe(() => snRequest(instance, 'PUT', `/api/now/table/sys_script_include/${scopedId}`,
+          { ...THROW, body: { description: 'now-fluent push spike — updated from Global' }, params: { sysparm_fields: 'sys_id' } }))
+        record(`${label}/update-from-global`, `[${label}] a record in ${scope.scope} can be UPDATED from Global`,
+          fromGlobal.ok, fromGlobal.ok ? 'accepted' : `refused: ${reason(fromGlobal.error)}`, 'capability')
+        const asApp = await probe(() => snRequest(instance, 'PUT', `/api/now/table/sys_script_include/${scopedId}`,
+          { ...THROW, body: { description: 'now-fluent push spike — updated as the app' },
+            params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: scopeTx } }))
+        record(`${label}/update-as-app`, `[${label}] a record in ${scope.scope} can be UPDATED run AS ${scope.scope}`,
+          asApp.ok, asApp.ok ? 'accepted' : `refused: ${reason(asApp.error)}`, 'capability')
         const removed = await probe(() => snDeleteRecord(instance, 'sys_script_include', scopedId, scopeTx))
         if (removed.ok) created.splice(created.indexOf(tracked), 1)
         record(`${label}/delete-as-app`, `[${label}] a record created AS ${scope.scope} can be deleted again`,
@@ -335,6 +346,8 @@ const ADAPTATION = {
   write: 'push gets a 403 per record in this scope, reports it with a hint, and carries on.',
   'transaction-scope': 'push cannot create records in a project\'s own scope here: its once-per-run probe finds that\n'
     + '            out and refuses, creating none of yours. Use install or update-set-package; push still UPDATES them.',
+  'update-from-global': 'push runs updates of records in an app AS that app, so this only matters if that is refused too.',
+  'update-as-app': 'push falls back to a Global write when running as the app gets a 403.',
   'delete-as-app': 'push could not clean up its own scope probe here, so it refuses own-scope creates after the first\n'
     + '            attempt (and names the probe record to delete by hand). Use install or update-set-package.',
   'update-set': 'the probe itself failed — check capture by hand.'

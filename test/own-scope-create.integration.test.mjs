@@ -256,3 +256,15 @@ test('--allow-delete of a record in the project\'s app runs the delete AS the ap
     assert.match(result.output, /deleted/)
     assert.ok(!instance.store.has(`sys_script_include/${NEW_ID}`))
   }))
+
+test('an update of a record inside the app runs AS the app, so a Global-refusing app still accepts it', () =>
+  withInstance({ honoursTransactionScope: true, protectedFromGlobal: true }, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', NEW_ID)).status, 0)
+    writeArtifact('sys_script_include', NEW_ID, 'edited')
+    instance.log.length = 0
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.equal(result.status, 0, result.output)
+    const put = instance.writes().find((w) => w.method === 'PUT')
+    assert.equal(put.params.sysparm_transaction_scope, PROJECT_SCOPE_ID)
+    assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).description, 'edited')
+  }))

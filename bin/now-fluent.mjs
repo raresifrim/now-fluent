@@ -630,8 +630,8 @@ async function snDeleteRecord(instance, table, sysId, scopeId) {
 // instead, so a caller can keep going — push does that per record, and the Phase 0
 // spike needs it to reach its cleanup step.
 async function snRequest(instance, method, path, { body, params, allow404, throwOnError } = {}) {
-  const abort = (message) => {
-    if (throwOnError) throw new Error(message)
+  const abort = (message, status) => {
+    if (throwOnError) throw Object.assign(new Error(message), { status })
     fail(message)
   }
   const url = new URL(path, instance.origin)
@@ -665,7 +665,7 @@ async function snRequest(instance, method, path, { body, params, allow404, throw
       hint = '\n  Forbidden: the account lacks write access to this table, or the record belongs to a '
         + 'protected application (sys_scope.protection_policy). Use update-set-package for that record instead.'
     }
-    abort(`${method} ${url.pathname} -> HTTP ${response.status}: ${detail || response.statusText}${hint}`)
+    abort(`${method} ${url.pathname} -> HTTP ${response.status}: ${detail || response.statusText}${hint}`, response.status)
   }
   return parsed && 'result' in parsed ? parsed.result : parsed
 }
@@ -3538,7 +3538,20 @@ async function pushRecord(target, label, context) {
     return creating ? 'created' : 'updated'
   }
 
-  await snRequest(instance, method, path, { body, params: writeParams, throwOnError: true })
+  // An UPDATE of a record that lives in an application runs AS that application, the way
+  // editing it in that app would: a write from Global into another app's record can be
+  // refused (a Global DELETE of a record in sn_sow was, live, with HTTP 403). Only a 403 —
+  // which wrote nothing — falls back to Global.
+  if (!creating && liveScope && liveScope !== GLOBAL_SCOPE_ID) {
+    try {
+      await snRequest(instance, method, path, { body, params: { ...writeParams, sysparm_transaction_scope: liveScope }, throwOnError: true })
+    } catch (error) {
+      if (!error || error.status !== 403) throw error
+      await snRequest(instance, method, path, { body, params: writeParams, throwOnError: true })
+    }
+  } else {
+    await snRequest(instance, method, path, { body, params: writeParams, throwOnError: true })
+  }
 
   // Refresh the baseline from what the instance now holds, so the next push diffs
   // against reality (business rules may have changed fields on the way in). The WRITE

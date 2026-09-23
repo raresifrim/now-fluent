@@ -10,10 +10,12 @@
 #   ./live-validate.sh --auth dev                      # phases 0-2
 #   ./live-validate.sh --auth dev --scope sn_hamp      # + scoped spike
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-4
-#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --app x_1234_push_demo
-#       binds the demo project to a scoped app that ALREADY EXISTS on the instance
-#       (create an empty one in Studio first), so phase 4c really creates records in it.
-#       Without --app the project is only init-ed locally and 4c can only show the refusal.
+#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --project-scope sn_sow
+#       binds the demo project to a scope that ALREADY EXISTS on the instance — a
+#       ServiceNow or Store app such as sn_sow / sn_hamp, the way a vendor-scope project
+#       is set up (now.config.json scope + scopeId) — so phase 4c really creates records
+#       in it. Without it the project is a local-only x_push_demo and 4c can only show
+#       push refusing (that app does not exist on the instance). --app is an alias.
 #
 # Everything is teed into live-validate-<timestamp>.log — send me that file.
 # ---------------------------------------------------------------------------
@@ -28,15 +30,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --auth)       AUTH="$2"; shift 2 ;;
     --scope)      SCOPE="$2"; shift 2 ;;
-    --app)        APP="$2"; shift 2 ;;
+    --project-scope|--app) APP="$2"; shift 2 ;;
     --round-trip) ROUND_TRIP=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
-[ -n "$AUTH" ] || { echo "Usage: $0 --auth <alias> [--scope <scope>] [--app <existing x_ scope>] [--round-trip]"; exit 2; }
-# The demo project's scope: an existing app on the instance (--app), or a local-only x_push_demo.
+[ -n "$AUTH" ] || { echo "Usage: $0 --auth <alias> [--scope <scope>] [--project-scope <existing scope>] [--round-trip]"; exit 2; }
+# The demo project's scope: an existing scope on the instance (--project-scope), or a local-only x_push_demo.
 PSCOPE="${APP:-x_push_demo}"
-# With --app and no --scope, the phase 2 spike tests the app push will actually create into.
+# With --project-scope and no --scope, the phase 2 spike tests the scope push will actually write into.
 [ -z "$SCOPE" ] && [ -n "$APP" ] && SCOPE="$APP"
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -61,9 +63,9 @@ echo "verify-push (global) exit=$?"
 
 if [ -n "$SCOPE" ]; then
   hr "PHASE 2 — Phase 0 spike, scope: $SCOPE"
-  note "EXPECTED on a stock instance: the 'sys_scope is HONOURED' check FAILS."
-  note "That is the finding, not a bug in the spike — the Table API ignores sys_scope"
-  note "and puts the record in Global. push now refuses scoped CREATEs because of it."
+  note "EXPECTED (seen live): 'sys_scope on a write is honoured' NO — the body's sys_scope is ignored —"
+  note "but 'a create run AS $SCOPE' YES. Also read the UPDATED from Global / run AS and deleted-again"
+  note "lines: they say how push must write to records that live inside $SCOPE."
   ( cd "$REPO" && npm run verify-push -- --auth "$AUTH" --scope "$SCOPE" )
   echo "verify-push (scope $SCOPE) exit=$?"
 else
@@ -89,20 +91,21 @@ if [ -n "$APP" ]; then WORK="$REPO/../push-demo-$APP"; else WORK="$REPO/../push-
 hr "PHASE 3 — cross-scope round trip: a GLOBAL record, edited in a SCOPED project ($PSCOPE)"
 if [ ! -d "$WORK" ]; then
   mkdir -p "$WORK" && cd "$WORK"
+  # init with a placeholder x_ scope (init expects one), then bind to the real scope below.
   now-sdk init --appName "Push Demo" --packageName push-demo \
-    --scopeName "$PSCOPE" --template base && npm install
+    --scopeName x_push_demo --template base && npm install
 fi
 cd "$WORK"
 
 if [ -n "$APP" ]; then
-  note "binding the project to the EXISTING app $APP (now.config.json scope + scopeId from the instance)"
+  note "binding the project to the EXISTING scope $APP (now.config.json scope + scopeId from the instance)"
   APP_ID=$(node --input-type=module -e "
 import { resolveInstance, snRequest, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
 const rows = await snRequest(resolveInstance('$AUTH'), 'GET', '/api/now/table/sys_scope', { throwOnError: true,
   params: { ...RAW_READ_PARAMS, sysparm_query: 'scope=$APP', sysparm_fields: 'sys_id', sysparm_limit: '1' } })
 console.log(rows && rows.length ? rows[0].sys_id : '')")
   if [ -z "$APP_ID" ]; then
-    echo "no application with scope '$APP' exists on the instance — create it in Studio first. Stopping."
+    echo "no scope '$APP' exists on the instance (check sys_scope). Stopping."
     exit 1
   fi
   node -e "

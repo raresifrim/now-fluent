@@ -23,7 +23,8 @@ import { createServer } from 'node:http'
 // cannot tell where a record landed.
 // protectedFromGlobal:true models what was seen live in sn_sow: a record inside an
 // application refuses a DELETE run from any other scope (HTTP 403) and accepts one run
-// AS that application (?sysparm_transaction_scope). undeletableScopes: rows in these
+// AS that application (?sysparm_transaction_scope). (Live, only the DELETE was seen; the
+// mock refuses a PUT the same way, which the spike's update lines check on a real instance.) undeletableScopes: rows in these
 // scopes refuse every DELETE.
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
@@ -102,6 +103,10 @@ export async function startMockInstance({
     if (req.method === 'PUT') {
       const row = store.get(key)
       if (!row) return send(404, { error: { message: 'No record found' } })
+      if (protectedFromGlobal && row.sys_scope && row.sys_scope !== 'global'
+        && row.sys_scope !== (url.searchParams.get('sysparm_transaction_scope') || 'global')) {
+        return send(403, { error: { message: 'Operation Failed', detail: 'write not permitted from this scope' } })
+      }
       const base = putReplaces ? { sys_id: row.sys_id, sys_scope: row.sys_scope } : row
       const next = { ...base, ...parsed, sys_updated_on: stamp(), sys_mod_count: String(Number(row.sys_mod_count || 0) + 1) }
       if (!honoursScope) next.sys_scope = row.sys_scope // inert on update too

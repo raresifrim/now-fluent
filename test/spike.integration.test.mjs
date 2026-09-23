@@ -101,3 +101,11 @@ test('a record created AS the app that cannot be deleted at all is reported, wit
   assert.match(output, /push could not clean up its own scope probe here/)
   assert.match(output, /COULD NOT DELETE [\s\S]*? sys_script_include [0-9a-f]{32}/, 'and cleanup names the leftover')
 })
+
+test('the spike measures updating a record inside the app from Global and AS the app', async () => {
+  const { status, output } = await spike({ honoursTransactionScope: true, protectedFromGlobal: true }, '--scope', 'sn_sow')
+  assert.equal(status, 0, output)
+  assert.match(output, /NO {3}\[scope:sn_sow\] a record in sn_sow can be UPDATED from Global/)
+  assert.match(output, /yes {2}\[scope:sn_sow\] a record in sn_sow can be UPDATED run AS sn_sow/)
+  assert.match(output, /push runs updates of records in an app AS that app/)
+})
