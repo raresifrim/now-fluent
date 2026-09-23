@@ -71,6 +71,12 @@ test('reports the mismatch and fails when capture ignores the preference', async
     const output = result.stdout + result.stderr
     assert.match(output, /did NOT land in "NowFluent Push Test Set"/)
     assert.match(output, /-> Default/, 'should name where it actually went')
+    // Live run showed "1 updated, 1 failed" and "push failed for" for ONE record whose
+    // write had succeeded. It must say the write happened and must not invite a retry.
+    assert.match(output, /push: 1 (created|updated) \(1 captured into the wrong update set\)/)
+    assert.ok(!/push failed for/.test(output), 'the write succeeded; it did not fail')
+    assert.match(output, /the write was made/)
+    assert.match(output, /Do not re-push/)
     // ...and the record itself was still written.
     assert.ok(instance.store.has(`sys_script_include/${SYS_ID}`))
   } finally { await instance.stop() }

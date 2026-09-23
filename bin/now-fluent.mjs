@@ -3441,6 +3441,7 @@ async function commandPush(flags, config, positional) {
     : `\nPushing ${targets.length} record(s) to ${instance.origin}...`)
   const results = { created: [], updated: [], deleted: [], unchanged: [], failed: [...unresolved] }
   const writtenRecords = []
+  const misCaptured = []
   const context = { project, instance, flags, auth, dryRun, force, writtenRecords }
 
   try {
@@ -3463,9 +3464,9 @@ async function commandPush(flags, config, positional) {
       // restore is not. Sharing one block meant a failed check skipped the restore and
       // left the account's update set preference permanently repointed.
       try {
-        for (const sysId of await reportUpdateSetCapture(instance, updateSetSession.target, writtenRecords)) {
-          results.failed.push(`${sysId} (captured into the wrong update set)`)
-        }
+        // Not "failed": these records WERE written. Only their capture went elsewhere, and
+        // calling that a failed push invites a retry of something that already happened.
+        misCaptured.push(...await reportUpdateSetCapture(instance, updateSetSession.target, writtenRecords))
       } catch (error) {
         console.error('WARNING: could not verify where the writes were captured '
           + `(${error && error.message ? error.message : error}). Check the update set by hand.`)
@@ -3480,9 +3481,20 @@ async function commandPush(flags, config, positional) {
     }
   }
 
-  const summary = Object.entries(results).filter(([, v]) => v.length).map(([k, v]) => `${v.length} ${k}`).join(', ')
-  console.log(`\npush${dryRun ? ' [dry-run, nothing sent]' : ''}: ${summary || 'nothing to do'}`)
+  // A dry run reports what WOULD happen; the buckets must not read as done deeds.
+  const verb = { created: 'would create', updated: 'would update', deleted: 'would delete' }
+  const summary = Object.entries(results).filter(([, v]) => v.length)
+    .map(([k, v]) => `${v.length} ${dryRun && verb[k] ? verb[k] : k}`).join(', ')
+  const captureNote = misCaptured.length ? ` (${misCaptured.length} captured into the wrong update set)` : ''
+  console.log(`\npush${dryRun ? ' [dry-run, nothing written]' : ''}: ${summary || 'nothing to do'}${captureNote}`)
   if (results.failed.length) fail(`push failed for: ${results.failed.join(', ')}`)
+  if (misCaptured.length) {
+    // Still a non-zero exit — the user asked for a specific update set and did not get it
+    // — but worded as what it is: the writes are done, do not retry them.
+    fail(`the write${misCaptured.length === 1 ? ' was' : 's were'} made, but ${misCaptured.length} capture(s) did not `
+      + `land in the requested update set: ${misCaptured.join(', ')}. Do not re-push; move the captures by hand, `
+      + 'or promote with update-set-package.')
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -320,6 +320,7 @@ test('push --dry-run previews only the real diff', async () => {
   const result = await cli('push', '--sys-id', SYS_ID, '--dry-run')
   assert.equal(result.status, 0, result.output)
   assert.match(result.output, /would PUT .*\(1 field\(s\)\)/)
+  assert.match(result.output, /\[dry-run, nothing written\]: 1 would update/, 'no past tense for things not done')
   assert.deepEqual(instance.writes(), [], 'reads only')
 })
 
