@@ -10,6 +10,10 @@
 #   ./live-validate.sh --auth dev                      # phases 0-2
 #   ./live-validate.sh --auth dev --scope sn_hamp      # + scoped spike
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-4
+#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --app x_1234_push_demo
+#       binds the demo project to a scoped app that ALREADY EXISTS on the instance
+#       (create an empty one in Studio first), so phase 4c really creates records in it.
+#       Without --app the project is only init-ed locally and 4c can only show the refusal.
 #
 # Everything is teed into live-validate-<timestamp>.log — send me that file.
 # ---------------------------------------------------------------------------
@@ -18,16 +22,22 @@ set -uo pipefail   # deliberately NOT -e: a failing assumption is a finding, not
 
 AUTH=""
 SCOPE=""
+APP=""
 ROUND_TRIP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --auth)       AUTH="$2"; shift 2 ;;
     --scope)      SCOPE="$2"; shift 2 ;;
+    --app)        APP="$2"; shift 2 ;;
     --round-trip) ROUND_TRIP=1; shift ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
-[ -n "$AUTH" ] || { echo "Usage: $0 --auth <alias> [--scope <scope>] [--round-trip]"; exit 2; }
+[ -n "$AUTH" ] || { echo "Usage: $0 --auth <alias> [--scope <scope>] [--app <existing x_ scope>] [--round-trip]"; exit 2; }
+# The demo project's scope: an existing app on the instance (--app), or a local-only x_push_demo.
+PSCOPE="${APP:-x_push_demo}"
+# With --app and no --scope, the phase 2 spike tests the app push will actually create into.
+[ -z "$SCOPE" ] && [ -n "$APP" ] && SCOPE="$APP"
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 LOG="$REPO/live-validate-$(date +%Y%m%d-%H%M%S).log"
@@ -75,14 +85,32 @@ if [ "${CONFIRM_PUSH:-}" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-WORK="$REPO/../push-demo-live"
-hr "PHASE 3 — cross-scope round trip: a GLOBAL record, edited in a SCOPED project (x_push_demo)"
+if [ -n "$APP" ]; then WORK="$REPO/../push-demo-$APP"; else WORK="$REPO/../push-demo-live"; fi
+hr "PHASE 3 — cross-scope round trip: a GLOBAL record, edited in a SCOPED project ($PSCOPE)"
 if [ ! -d "$WORK" ]; then
   mkdir -p "$WORK" && cd "$WORK"
   now-sdk init --appName "Push Demo" --packageName push-demo \
-    --scopeName x_push_demo --template base && npm install
+    --scopeName "$PSCOPE" --template base && npm install
 fi
 cd "$WORK"
+
+if [ -n "$APP" ]; then
+  note "binding the project to the EXISTING app $APP (now.config.json scope + scopeId from the instance)"
+  APP_ID=$(node --input-type=module -e "
+import { resolveInstance, snRequest, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
+const rows = await snRequest(resolveInstance('$AUTH'), 'GET', '/api/now/table/sys_scope', { throwOnError: true,
+  params: { ...RAW_READ_PARAMS, sysparm_query: 'scope=$APP', sysparm_fields: 'sys_id', sysparm_limit: '1' } })
+console.log(rows && rows.length ? rows[0].sys_id : '')")
+  if [ -z "$APP_ID" ]; then
+    echo "no application with scope '$APP' exists on the instance — create it in Studio first. Stopping."
+    exit 1
+  fi
+  node -e "
+const fs = require('fs'); const c = JSON.parse(fs.readFileSync('now.config.json', 'utf8'))
+c.scope = '$APP'; c.scopeId = '$APP_ID'
+fs.writeFileSync('now.config.json', JSON.stringify(c, null, 4) + '\\n')"
+  echo "now.config.json: scope $APP, scopeId $APP_ID"
+fi
 
 note "creating a THROWAWAY sys_script_include to round-trip (safer than editing an OOB record)"
 # Create the target through push's OWN transport (the spike already proved inserts work):
@@ -120,7 +148,7 @@ if ! $NF pull --project . --auth "$AUTH" --sys-id "$TARGET"; then
   exit 1
 fi
 
-note "adoption — EXPECTED: .now-fluent/adopted.json has an entry for it, from global to x_push_demo"
+note "adoption — EXPECTED: .now-fluent/adopted.json has an entry for it, from global to $PSCOPE"
 node -e "const a = require('./.now-fluent/adopted.json'); console.log(JSON.stringify(a['$TARGET'] || 'NOT RECORDED', null, 2))" 2>/dev/null \
   || echo "NOT RECORDED: .now-fluent/adopted.json missing"
 note "baseline — EXPECTED: the LIVE record, still global / global.NowFluentRoundTrip..."
@@ -129,7 +157,7 @@ node -e "const fs=require('fs'); const f=fs.readdirSync('.now-fluent/state').fin
 note "edit ONLY the description in the generated Fluent source"
 GEN=$(grep -rl "$TARGET" src/ 2>/dev/null | head -1)
 echo "generated file: $GEN"
-note "EXPECTED: its apiName starts with 'x_push_demo.' — that is what makes it compile"
+note "EXPECTED: its apiName starts with '$PSCOPE.' — that is what makes it compile"
 grep -n "apiName" "$GEN" 2>/dev/null
 [ -n "$GEN" ] && sed -i.bak "s/round-trip target — safe to delete/EDITED BY PUSH/" "$GEN" && grep -n "EDITED BY PUSH" "$GEN"
 
@@ -141,7 +169,7 @@ $NF push --project . --auth "$AUTH" --sys-id "$TARGET"
 echo "push exit=$?"
 
 note "verify ON THE INSTANCE — EXPECTED: description='EDITED BY PUSH', script still 'marker: ORIGINAL BODY',"
-note "sys_scope STILL 'global', api_name STILL 'global.NowFluentRoundTrip...' (NOT x_push_demo.)"
+note "sys_scope STILL 'global', api_name STILL 'global.NowFluentRoundTrip...' (NOT $PSCOPE.)"
 now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$TARGET" -f name,api_name,description,script,sys_scope,sys_mod_count
 
 note "push again with no edit — EXPECTED: unchanged, nothing sent"
@@ -149,14 +177,14 @@ $NF push --project . --auth "$AUTH" --sys-id "$TARGET"
 
 # ---------------------------------------------------------------------------
 hr "PHASE 3b — update-set-package and an ADOPTED record (local only, writes nothing)"
-note "packaging it for the PROJECT scope — EXPECTED: REFUSED ('would MOVE them into x_push_demo')"
+note "packaging it for the PROJECT scope — EXPECTED: REFUSED ('would MOVE them into $PSCOPE')"
 $NF update-set-package --project . --update-set-name "nf adopted check" --include "$TARGET"
 echo "exit=$? (non-zero expected)"
 note "packaging it for its ORIGIN — EXPECTED: 'IN-PLACE edits in their origin scope'"
 $NF update-set-package --project . --update-set-name "nf adopted check" --include "$TARGET" \
   --scope global --scope-id global
-note "EXPECTED: the payload says global.NowFluentRoundTrip..., never x_push_demo."
-grep -o "global\.NowFluentRoundTrip[0-9a-f]*\|x_push_demo\.NowFluentRoundTrip[0-9a-f]*" \
+note "EXPECTED: the payload says global.NowFluentRoundTrip..., never $PSCOPE."
+grep -o "global\.NowFluentRoundTrip[0-9a-f]*\|$PSCOPE\.NowFluentRoundTrip[0-9a-f]*" \
   exports/nf-adopted-check/update-set-*.xml 2>/dev/null | sort | uniq -c
 
 # ---------------------------------------------------------------------------
@@ -226,42 +254,47 @@ EOF
     echo "$BUILD_OUT" | tail -20
     rm -f "$SRC"; NEWID=""
   else
-    echo "wrote $SRC — Now.ID gave it sys_id $NEWID (api_name in source: x_push_demo.$AUTHORED)"
+    echo "wrote $SRC — Now.ID gave it sys_id $NEWID (api_name in source: $PSCOPE.$AUTHORED)"
   fi
 }
 
 delete_record() {
   node --input-type=module -e "
-import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
-await snRequest(resolveInstance('$AUTH'), 'DELETE', '/api/now/table/sys_script_include/$1', { allow404: true, throwOnError: true })
-console.log('deleted sys_script_include $1')" || echo "could not delete $1 — remove it in the UI"
+import { resolveInstance, snGetRecord, snDeleteRecord } from '$REPO/bin/now-fluent.mjs'
+// A record inside an app can refuse a delete run from Global (seen live), so delete it AS its app.
+const inst = resolveInstance('$AUTH')
+const row = await snGetRecord(inst, 'sys_script_include', '$1', 'sys_id,sys_scope', { throwOnError: true })
+if (!row) { console.log('sys_script_include $1 is already gone'); process.exit(0) }
+const how = await snDeleteRecord(inst, 'sys_script_include', '$1', row.sys_scope)
+console.log('deleted sys_script_include $1 (' + (how === 'as-app' ? 'run as its application' : 'from Global') + ')')" \
+    || echo "could not delete $1 — remove it in the UI"
 }
 
 # ---------------------------------------------------------------------------
-hr "PHASE 4c — a NEW record in the project's OWN scope (x_push_demo), no install"
+hr "PHASE 4c — a NEW record in the project's OWN scope ($PSCOPE), no install"
 PROJECT_SCOPE_ID=$(node -e "console.log(require('./now.config.json').scopeId || '')")
 APP_EXISTS=$(node --input-type=module -e "
 import { resolveInstance, snGetRecord } from '$REPO/bin/now-fluent.mjs'
 const row = await snGetRecord(resolveInstance('$AUTH'), 'sys_scope', '$PROJECT_SCOPE_ID', 'sys_id', { throwOnError: true })
 console.log(row ? 'yes' : 'no')" 2>/dev/null)
-echo "does the x_push_demo application ($PROJECT_SCOPE_ID) exist on the instance? $APP_EXISTS"
+echo "does the $PSCOPE application ($PROJECT_SCOPE_ID) exist on the instance? $APP_EXISTS"
 author_record Own
 if [ -n "$NEWID" ]; then
   if [ "$APP_EXISTS" != "yes" ]; then
     note "the app is NOT on the instance (this project was only init-ed locally), so push must refuse up front."
-    note "EXPECTED: 'the application x_push_demo ... does not exist on this instance', nothing written"
+    note "EXPECTED: 'the application $PSCOPE ... does not exist on this instance', nothing written"
     $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
     echo "exit=$? (non-zero expected)"
     note "Whether the PLATFORM supports creating in an app's scope is answered by the spike's"
     note "'a create run AS <scope> (sysparm_transaction_scope) lands in it' line in phase 2."
   else
     note "push, no flag — EXPECTED one of:"
-    note "  'created in x_push_demo (run as that application)'  — the instance honours sysparm_transaction_scope"
-    note "  'ignored sysparm_transaction_scope ... deleted again' — it does not; nothing is left behind"
+    note "  'created in $PSCOPE (run as that application)'  — the instance honours sysparm_transaction_scope"
+    note "  'this instance does not create records AS $PSCOPE ... No record of yours was created' — it does not"
     $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --dry-run
     $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
     echo "push exit=$?"
-    note "on the instance — EXPECTED: sys_scope $PROJECT_SCOPE_ID and api_name x_push_demo.$AUTHORED, or no record at all"
+    note "on the instance — EXPECTED: sys_scope $PROJECT_SCOPE_ID and api_name $PSCOPE.$AUTHORED, or no record at all"
     now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$NEWID" -f sys_id,api_name,sys_scope,description
     note "edit and push again — EXPECTED (only if it was created): a plain update, 'updated (1 field(s))'"
     sed -i.bak "s/now-fluent live-validate — safe to delete/EDITED IN OWN SCOPE/" "$SRC" && rm -f "$SRC.bak"
