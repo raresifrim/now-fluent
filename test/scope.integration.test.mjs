@@ -129,7 +129,8 @@ test('when the platform DOES honour sys_scope, push just works', async () => {
       })
     assert.match(stdout, /created/)
     assert.ok(!/WRONG SCOPE/.test(stdout))
-    assert.equal(honouring.store.get(`sys_script_include/${SYS_ID}`).sys_scope, APP_SCOPE)
+    // --target-scope global says Global in the body too, so an honouring platform puts it there.
+    assert.equal(honouring.store.get(`sys_script_include/${SYS_ID}`).sys_scope, 'global')
   } finally {
     await honouring.stop()
   }

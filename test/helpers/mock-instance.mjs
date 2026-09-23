@@ -26,11 +26,27 @@ import { createServer } from 'node:http'
 // AS that application (?sysparm_transaction_scope). (Live, only the DELETE was seen; the
 // mock refuses a PUT the same way, which the spike's update lines check on a real instance.) undeletableScopes: rows in these
 // scopes refuse every DELETE.
+// currentApp: the account's current application (the app picker), as a sys_scope sys_id.
+// Seen live: with the picker on sn_sow, a plain REST create landed in sn_sow. A write
+// with no honoured ?sysparm_transaction_scope runs there; default 'global'. Stored as the
+// apps.current_app preference so a caller can read it.
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
-  honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = []
+  honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = [],
+  currentApp = 'global'
 } = {}) {
   const store = new Map(Object.entries(records))
+  const USER_ID = 'user0000000000000000000000000001'
+  if (currentApp !== 'global') {
+    store.set('sys_user_preference/pref00000000000000000000currentapp',
+      { sys_id: 'pref00000000000000000000currentapp', name: 'apps.current_app', user: USER_ID, value: currentApp })
+  }
+  // The scope a write runs in: the honoured transaction scope, else the current app.
+  const runsIn = (url, table) => {
+    const asked = url.searchParams.get('sysparm_transaction_scope')
+    const honoured = Array.isArray(honoursTransactionScope) ? honoursTransactionScope.includes(table) : honoursTransactionScope
+    return (honoured && asked) || currentApp
+  }
   const log = []
   let clock = 0
   const stamp = () => `2026-01-01 00:00:${String(++clock).padStart(2, '0')}`
@@ -41,7 +57,7 @@ export async function startMockInstance({
 
     if (url.pathname === '/api/now/ui/user/current_user') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      return res.end(JSON.stringify({ result: { user_sys_id: 'user0000000000000000000000000001', user_name: 'admin' } }))
+      return res.end(JSON.stringify({ result: { user_sys_id: USER_ID, user_name: 'admin' } }))
     }
 
     const [, , , , table, sysId] = url.pathname.split('/') // /api/now/table/<t>/<id>
@@ -83,18 +99,15 @@ export async function startMockInstance({
       // reproduces that by default; honoursScope:true models the world we wrongly
       // assumed, so a test can prove push behaves correctly in both.
       const row = { ...parsed, sys_id: id, sys_updated_on: stamp(), sys_mod_count: '0' }
-      const transactionScope = url.searchParams.get('sysparm_transaction_scope')
-      const honoured = Array.isArray(honoursTransactionScope)
-        ? honoursTransactionScope.includes(table) : honoursTransactionScope
-      if (honoured && transactionScope) {
-        row.sys_scope = transactionScope
-      } else if (!honoursScope && row.sys_scope && row.sys_scope !== 'global') {
-        row.sys_scope = 'global'
-        if (row.api_name) row.api_name = String(row.api_name).replace(/^[^.]+\./, 'global.')
+      // The record lands in the scope the transaction runs in, and api_name follows it.
+      if (!(honoursScope && row.sys_scope)) {
+        const scope = runsIn(url, table)
+        if (row.api_name) {
+          const name = scope === 'global' ? 'global' : (store.get(`sys_scope/${scope}`) || {}).scope || scope
+          row.api_name = String(row.api_name).replace(/^[^.]+\./, `${name}.`)
+        }
+        row.sys_scope = scope
       }
-      // Like the platform: a record created without a scope gets the transaction's —
-      // Global, unless the create ran as an application.
-      if (!row.sys_scope) row.sys_scope = (honoured && transactionScope) || 'global'
       if (noScopeTables.includes(table)) delete row.sys_scope
       store.set(`${table}/${id}`, row)
       noteCapture(table, id)
@@ -103,8 +116,7 @@ export async function startMockInstance({
     if (req.method === 'PUT') {
       const row = store.get(key)
       if (!row) return send(404, { error: { message: 'No record found' } })
-      if (protectedFromGlobal && row.sys_scope && row.sys_scope !== 'global'
-        && row.sys_scope !== (url.searchParams.get('sysparm_transaction_scope') || 'global')) {
+      if (protectedFromGlobal && row.sys_scope && row.sys_scope !== 'global' && row.sys_scope !== runsIn(url, table)) {
         return send(403, { error: { message: 'Operation Failed', detail: 'write not permitted from this scope' } })
       }
       const base = putReplaces ? { sys_id: row.sys_id, sys_scope: row.sys_scope } : row
@@ -117,9 +129,8 @@ export async function startMockInstance({
     if (req.method === 'DELETE') {
       const row = store.get(key)
       const rowScope = row && row.sys_scope
-      const runAs = url.searchParams.get('sysparm_transaction_scope') || 'global'
       if (rowScope && (undeletableScopes.includes(rowScope)
-        || (protectedFromGlobal && rowScope !== 'global' && rowScope !== runAs))) {
+        || (protectedFromGlobal && rowScope !== 'global' && rowScope !== runsIn(url, table)))) {
         return send(403, { error: { message: 'Operation Failed', detail: 'delete not permitted from this scope' } })
       }
       store.delete(key)

@@ -105,7 +105,20 @@ test('a record created AS the app that cannot be deleted at all is reported, wit
 test('the spike measures updating a record inside the app from Global and AS the app', async () => {
   const { status, output } = await spike({ honoursTransactionScope: true, protectedFromGlobal: true }, '--scope', 'sn_sow')
   assert.equal(status, 0, output)
-  assert.match(output, /NO {3}\[scope:sn_sow\] a record in sn_sow can be UPDATED from Global/)
+  assert.match(output, /NO {3}\[scope:sn_sow\] a record in sn_sow can be UPDATED run AS Global/)
   assert.match(output, /yes {2}\[scope:sn_sow\] a record in sn_sow can be UPDATED run AS sn_sow/)
   assert.match(output, /push runs updates of records in an app AS that app/)
+})
+
+test('with the app picker on the tested scope (seen live), the spike says so and does not mis-credit sys_scope', async () => {
+  const { status, output, instance } = await spike({ honoursTransactionScope: true, currentApp: '5ca1bcb3733320103e366238edf6a706' },
+    '--scope', 'sn_sow')
+  assert.equal(status, 0, output)
+  assert.match(output, /your account's current application \(app picker\): sn_sow/)
+  assert.match(output, /NO {3}\[global\] a create that names no scope lands in Global/)
+  assert.match(output, /yes {2}\[global\] a create run AS Global \(sysparm_transaction_scope=global\) lands in Global/)
+  assert.match(output, /\?\? +\[scope:sn_sow\] sys_scope on a write is honoured/)
+  assert.match(output, /cannot tell: sn_sow is your account's current application/)
+  const leftovers = [...instance.store.keys()].filter((key) => key.startsWith('sys_script_include/'))
+  assert.deepEqual(leftovers, [])
 })

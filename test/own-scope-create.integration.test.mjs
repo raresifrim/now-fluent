@@ -110,7 +110,7 @@ test('an instance that ignores it: the probe finds out, and NO record of yours i
     const result = await push(instance, '--sys-id', NEW_ID)
     assert.notEqual(result.status, 0)
     assert.match(result.output, /this instance does not create records AS x_push_demo/)
-    assert.match(result.output, /probe record run as that application landed in Global/)
+    assert.match(result.output, /probe record run as x_push_demo landed in Global/)
     assert.match(result.output, /No record of yours was created/)
     assert.ok(!instance.writes().some((w) => w.body && w.body.sys_id === NEW_ID), 'the real record was never sent')
     assert.ok(!instance.store.has(`sys_script_include/${NEW_ID}`))
@@ -176,17 +176,17 @@ test('--target-scope x_push_demo is accepted, and means the same as no flag', ()
     assert.match(result.output, /created in x_push_demo/)
   }))
 
-test('--target-scope global still creates in Global, with no probe and no transaction scope', () =>
+test('--target-scope global creates in Global, with no probe, run AS Global', () =>
   withInstance({ honoursTransactionScope: true }, async (instance) => {
     const result = await push(instance, '--sys-id', NEW_ID, '--target-scope', 'global')
     assert.equal(result.status, 0, result.output)
     assert.ok(!/Checking once/.test(result.output))
     const post = instance.writes().find((w) => w.method === 'POST')
-    assert.equal(post.params.sysparm_transaction_scope, undefined)
+    assert.equal(post.params.sysparm_transaction_scope, 'global')
     assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).sys_scope, 'global')
   }))
 
-test('a Global-bound project creates Global records exactly as before', () =>
+test('a Global-bound project creates Global records with one POST, run AS Global', () =>
   withInstance({ honoursTransactionScope: true }, async (instance) => {
     writeConfig({ scope: 'global', scopeId: 'global', name: 'Global stuff' })
     writeArtifact('sys_script_include', NEW_ID, 'global one', 'global')
@@ -194,7 +194,7 @@ test('a Global-bound project creates Global records exactly as before', () =>
     assert.equal(result.status, 0, result.output)
     assert.ok(!/Checking once/.test(result.output), 'no probe, no app lookup')
     assert.deepEqual(instance.writes().map((w) => w.method), ['POST'])
-    assert.equal(instance.writes()[0].params.sysparm_transaction_scope, undefined)
+    assert.equal(instance.writes()[0].params.sysparm_transaction_scope, 'global')
   }))
 
 test('a new record in a THIRD scope is still refused', () =>
@@ -239,7 +239,7 @@ test('a probe that cannot be deleted is named, and NOT retried for every record'
   }))
 
 test('--allow-delete of a record in the project\'s app runs the delete AS the application', () =>
-  withInstance({ protectedFromGlobal: true }, async (instance) => {
+  withInstance({ honoursTransactionScope: true, protectedFromGlobal: true }, async (instance) => {
     mkdirSync(join(project, 'dist', 'app', 'update'), { recursive: true })
     writeFileSync(join(project, 'dist', 'app', 'update', `sys_script_include_${NEW_ID}.xml`),
       `<record_update table="sys_script_include"><sys_script_include action="DELETE">`
@@ -267,4 +267,49 @@ test('an update of a record inside the app runs AS the app, so a Global-refusing
     const put = instance.writes().find((w) => w.method === 'PUT')
     assert.equal(put.params.sysparm_transaction_scope, PROJECT_SCOPE_ID)
     assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).description, 'edited')
+  }))
+
+// Seen live: with the account's app picker on sn_sow, a plain REST create landed in sn_sow,
+// and a --target-scope global push reported success for a record that was NOT in Global.
+const PICKER_APP = '5ca1bcb3733320103e366238edf6a706'
+
+test('with the app picker on another app, a Global create still lands in Global — run AS Global', () =>
+  withInstance({ honoursTransactionScope: true, currentApp: PICKER_APP }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID, '--target-scope', 'global')
+    assert.equal(result.status, 0, result.output)
+    assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).sys_scope, 'global')
+  }))
+
+test('...and an instance that ignores that is caught: the create is rolled back, the picker named', () =>
+  withInstance({ honoursTransactionScope: false, currentApp: PICKER_APP }, async (instance) => {
+    instance.store.set(`sys_scope/${PICKER_APP}`, { sys_id: PICKER_APP, scope: 'sn_sow' })
+    const result = await push(instance, '--sys-id', NEW_ID, '--target-scope', 'global')
+    assert.notEqual(result.status, 0, 'never reported as a success')
+    assert.match(result.output, /asked to create it AS Global, but this sys_script_include record was created in sn_sow/)
+    assert.match(result.output, /current application \(the app picker\)/)
+    assert.ok(!instance.store.has(`sys_script_include/${NEW_ID}`), 'rolled back')
+  }))
+
+test('an update of a Global record runs AS Global, whatever the picker says', () =>
+  withInstance({ honoursTransactionScope: true, currentApp: PICKER_APP }, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', NEW_ID, '--target-scope', 'global')).status, 0)
+    writeArtifact('sys_script_include', NEW_ID, 'edited')
+    instance.log.length = 0
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.equal(result.status, 0, result.output)
+    const put = instance.writes().find((w) => w.method === 'PUT')
+    assert.equal(put.params.sysparm_transaction_scope, 'global')
+    assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).sys_scope, 'global')
+  }))
+
+test('a Global schema create is probed first, and refused when the probe lands elsewhere', () =>
+  withInstance({ honoursTransactionScope: false, currentApp: PICKER_APP }, async (instance) => {
+    writeConfig({ scope: 'global', scopeId: 'global', name: 'Global stuff' })
+    const tableId = 'bb88cd34ef56ab12cd34ef56ab12cd34'
+    writeArtifact('sys_db_object', tableId, 'a table', 'global')
+    const result = await push(instance, '--sys-id', tableId)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /this instance does not create records AS Global/)
+    assert.match(result.output, /switch it to Global/)
+    assert.ok(!instance.store.has(`sys_db_object/${tableId}`), 'the table was never created')
   }))

@@ -134,15 +134,16 @@ Packaging records built in your project's scope for **another** scope (`--scope 
 
 Adoption happens on the query path (pull's default), because only that path's rebuilt XML is ours to rewrite and record. `--no-adopt-scope` skips the *rewrite* only — the record's origin is still recorded, because the SDK build stamps the project's scope onto every artifact whether or not the source was rewritten, and forgetting the origin would let `update-set-package` package it as a move. (Without the rewrite, a record carrying an `apiName` will fail the build with TS11.)
 
-### Scope: push cannot choose one
+### Scope: push names it on every write
 
-**Verified live (dev instance, SDK 4.12.x): `sys_scope` is inert on a Table API write.** The platform sets it from the scope the REST transaction runs in — Global for `/api/now/table` — and rewrites `api_name` to match (`x_my_app.Thing` → `global.Thing`). The `apps.current_app` user preference does not steer it either.
+**Verified live (dev instance, SDK 4.12.x): `sys_scope` in the body is inert on a Table API write.** The platform sets it from the scope the REST transaction runs in and rewrites `api_name` to match (`x_my_app.Thing` → `global.Thing`). A transaction that names no scope runs in the account's **current application** (the app picker): with the picker on Global that is Global; with the picker on `sn_sow`, a plain create landed in `sn_sow`.
 
-So push cannot put a record in a scope of your choosing. What it does instead:
+So push never leaves it to the picker. Every write carries `?sysparm_transaction_scope=`: a create the scope it must land in, an update or delete the scope the record already lives in (Global included). A 400/403 wrote nothing and falls back once to a write that names no scope. Whether naming Global pins a create while the picker is elsewhere is not yet verified live — the spike's `transaction-global` line answers it, and the spike prints your current application.
 
 | case | behaviour |
 | --- | --- |
-| updating an existing record | unaffected — its scope is already set, and the field is ignored |
+| updating an existing record | keeps its scope; the update runs as that scope |
+| **creating** a record in Global (a Global project, or `--target-scope global`) | run **as Global**; verified afterwards — landed elsewhere → deleted again and reported FAILED, naming the app picker. Global `sys_db_object`/`sys_dictionary` creates are probed first instead (a DELETE would drop the table/column). |
 | **creating** a record in the project's own scope | run **as that application** (`?sysparm_transaction_scope=`). **Probe first:** once per run a throwaway inactive script include is created as the app, its scope read back, and it is always deleted; your record is created only if the probe landed in the app — otherwise the create is refused and nothing of yours was written. Your record's scope is verified too (landed elsewhere → deleted and reported FAILED). The app must exist on the instance; `sys_db_object`/`sys_dictionary` creates are refused (a DELETE cannot un-make a table or column). Verified live on one dev instance (`sn_sow`); the spike's `transaction-scope` line checks yours. Updates and deletes of records inside an app run as that app (a Global DELETE was refused live with 403). |
 | **creating** a record in any other scope | **refused** |
 | `--target-scope global` | creates it in Global on purpose, and reports the scope and `api_name` it actually got |

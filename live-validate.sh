@@ -119,16 +119,20 @@ note "creating a THROWAWAY sys_script_include to round-trip (safer than editing 
 # Create the target through push's OWN transport (the spike already proved inserts work):
 TARGET=$(node --input-type=module -e "
 import { randomBytes } from 'node:crypto'
-import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+import { resolveInstance, snRequest, snGetRecord } from '$REPO/bin/now-fluent.mjs'
 const id = randomBytes(16).toString('hex')
 const inst = resolveInstance('$AUTH')
+// Named explicitly: a create that names no scope lands in the account's current application
+// (seen live: with the app picker on sn_sow, this 'Global' target landed in sn_sow).
 await snRequest(inst, 'POST', '/api/now/table/sys_script_include', {
   throwOnError: true,
   body: { sys_id: id, name: 'NowFluentRoundTrip' + id.slice(0, 6),
           script: 'var X = Class.create();\n// marker: ORIGINAL BODY',
           description: 'round-trip target — safe to delete', active: 'true' },
-  params: { sysparm_fields: 'sys_id' }
+  params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' }
 })
+const row = await snGetRecord(inst, 'sys_script_include', id, 'sys_scope', { throwOnError: true })
+if (!row || row.sys_scope !== 'global') console.error('WARNING: the target landed in ' + (row ? row.sys_scope : '?') + ', not Global — phase 3 will not test adoption. Switch the app picker to Global.')
 console.log(id)
 ")
 echo "target sys_id: $TARGET"
@@ -136,8 +140,8 @@ echo "target sys_id: $TARGET"
 # Delete the throwaway through push's own transport (now-sdk has no write command).
 cleanup_target() {
   node --input-type=module -e "
-import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
-await snRequest(resolveInstance('$AUTH'), 'DELETE', '/api/now/table/sys_script_include/$TARGET', { allow404: true, throwOnError: true })
+import { resolveInstance, snDeleteRecord } from '$REPO/bin/now-fluent.mjs'
+await snDeleteRecord(resolveInstance('$AUTH'), 'sys_script_include', '$TARGET', 'global')
 console.log('deleted throwaway sys_script_include $TARGET')
 " || echo "could not delete $TARGET — remove it in the UI"
 }
@@ -269,7 +273,7 @@ const inst = resolveInstance('$AUTH')
 const row = await snGetRecord(inst, 'sys_script_include', '$1', 'sys_id,sys_scope', { throwOnError: true })
 if (!row) { console.log('sys_script_include $1 is already gone'); process.exit(0) }
 const how = await snDeleteRecord(inst, 'sys_script_include', '$1', row.sys_scope)
-console.log('deleted sys_script_include $1 (' + (how === 'as-app' ? 'run as its application' : 'from Global') + ')')" \
+console.log('deleted sys_script_include $1 (' + (how === 'as-scope' ? 'run as its scope' : 'naming no scope') + ')')" \
     || echo "could not delete $1 — remove it in the UI"
 }
 

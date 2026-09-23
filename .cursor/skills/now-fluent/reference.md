@@ -52,9 +52,15 @@ in-place edit, or `--move-adopted` to move it on purpose. push refuses, before w
 update whose source scope differs from the live record's.
 
 **Scope (verified live): `sys_scope` is INERT on a Table API write.** The platform uses
-the scope the REST transaction runs in (Global) and rewrites `api_name` to match. So:
+the scope the REST transaction runs in and rewrites `api_name` to match. A transaction that
+names no scope runs in the account's current application (app picker) — seen live: picker on
+`sn_sow` → a plain create landed in `sn_sow`. So push names `?sysparm_transaction_scope=` on
+EVERY write (create: its target scope; update/delete: the record's scope, Global included;
+400/403 → one retry naming none). Naming Global is not yet verified live (spike
+`transaction-global`). So:
 
-- updates are unaffected (the record's scope is already set);
+- updates keep the record's scope, and run as it;
+- a Global create that lands elsewhere is deleted and FAILED (schema: probed first instead);
 - a CREATE in the project's own scope runs AS that app (`sysparm_transaction_scope`), but
   only after a once-per-run throwaway probe record (always deleted) proves the instance
   honours that — otherwise it is refused and nothing is written; the real record is still

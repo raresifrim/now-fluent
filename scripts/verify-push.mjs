@@ -62,6 +62,30 @@ async function probe(fn) {
 }
 function reason(error) { return String(error && error.message ? error.message : error) }
 
+// --- the account's current application (the app picker) ------------------------
+// Seen live: a REST write that names no scope runs in it. Read from the apps.current_app
+// preference; '' when it cannot be read.
+let currentAppId = ''
+async function readCurrentApp(instance) {
+  const me = await snRequest(instance, 'GET', '/api/now/ui/user/current_user', THROW)
+  const userId = me && (me.user_sys_id || me.sys_id)
+  if (!userId) return ''
+  const rows = await snRequest(instance, 'GET', '/api/now/table/sys_user_preference', {
+    ...THROW,
+    params: { ...RAW_READ_PARAMS, sysparm_query: `name=apps.current_app^user=${userId}`, sysparm_fields: 'value', sysparm_limit: '1' }
+  })
+  return Array.isArray(rows) && rows.length && rows[0].value ? rows[0].value : 'global'
+}
+async function scopeNameOf(instance, id) {
+  if (!id || id === 'global') return id ? 'Global' : ''
+  try {
+    const row = await snGetRecord(instance, 'sys_scope', id, 'scope', THROW)
+    return row && row.scope ? row.scope : id
+  } catch {
+    return id
+  }
+}
+
 // --- a scope to test in ----------------------------------------------------
 async function resolveScope(instance, ref) {
   const query = /^[0-9a-f]{32}$/i.test(ref) ? `sys_id=${ref}` : `scope=${ref}`
@@ -104,15 +128,54 @@ async function exercise(instance, label, scope) {
     Boolean(afterInsert) && afterInsert.sys_id === id,
     afterInsert ? `sys_id on the instance: ${afterInsert.sys_id}` : 'record not readable after insert')
 
-  if (scope) {
-    // The one that decides whether push can create anything outside Global.
+  if (!scope) {
+    // Seen live: a write that names no scope runs in the account's current application.
     const landed = afterInsert ? afterInsert.sys_scope : ''
+    record(`${label}/plain-lands`, `[${label}] a create that names no scope lands in Global`,
+      landed ? landed === 'global' : null,
+      !landed ? 'could not determine: the record could not be read back.'
+        : landed === 'global' ? 'sys_scope: global'
+          : `it landed in ${await scopeNameOf(instance, landed)} — the account's current application, not Global.`,
+      'capability')
+    // push names Global explicitly on every Global write. Does that pin it?
+    const pinnedId = sysId()
+    const pinned = await probe(() => snRequest(instance, 'POST', '/api/now/table/sys_script_include', {
+      ...THROW,
+      body: { sys_id: pinnedId, name: `NowFluentTxGlobal${suffix}`, script: `var NowFluentTxGlobal${suffix} = Class.create();`,
+        description: 'now-fluent push spike — safe to delete', active: 'false' },
+      params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' }
+    }))
+    if (!pinned.ok) {
+      record(`${label}/transaction-global`, `[${label}] a create run AS Global (sysparm_transaction_scope=global) lands in Global`,
+        false, `the create itself was refused: ${reason(pinned.error)}`, 'capability')
+    } else {
+      created.push({ table: 'sys_script_include', sysId: pinnedId, scope: 'global' })
+      const row = await snGetRecord(instance, 'sys_script_include', pinnedId, undefined, THROW)
+      const at = row ? row.sys_scope : ''
+      record(`${label}/transaction-global`, `[${label}] a create run AS Global (sysparm_transaction_scope=global) lands in Global`,
+        at ? at === 'global' : null,
+        !at ? 'could not determine: the record could not be read back.'
+          : at === 'global' ? `sys_scope: global${currentAppId && currentAppId !== 'global' ? ', although the app picker is elsewhere' : ''}`
+            : `ignored: it landed in ${await scopeNameOf(instance, at)}.`,
+        'capability')
+      if (at) created[created.length - 1].scope = at
+    }
+  }
+
+  if (scope) {
+    // The body's sys_scope. Only measurable when the account's current application is
+    // not this scope: otherwise the write lands here whatever the body says.
+    const landed = afterInsert ? afterInsert.sys_scope : ''
+    const confounded = currentAppId === scope.sys_id
     record(`${label}/scope`, `[${label}] sys_scope on a write is honoured (record lands in ${scope.scope})`,
-      landed === scope.sys_id,
-      landed === scope.sys_id
-        ? `sys_scope: ${landed}`
-        : `ignored: asked for ${scope.scope}, got "${landed}", api_name became `
-          + `"${afterInsert ? afterInsert.api_name : '?'}".`,
+      confounded ? null : landed === scope.sys_id,
+      confounded
+        ? `cannot tell: ${scope.scope} is your account's current application (app picker), so the write lands there `
+          + 'whatever its body says. Switch the picker to Global to measure this.'
+        : landed === scope.sys_id
+          ? `sys_scope: ${landed}`
+          : `ignored: asked for ${scope.scope}, got "${landed}", api_name became `
+            + `"${afterInsert ? afterInsert.api_name : '?'}".`,
       'capability')
   }
 
@@ -151,8 +214,9 @@ async function exercise(instance, label, scope) {
         // push UPDATES records in an app AS that app, falling back to Global on a 403.
         // Measure both, so a "no" on either is visible.
         const fromGlobal = await probe(() => snRequest(instance, 'PUT', `/api/now/table/sys_script_include/${scopedId}`,
-          { ...THROW, body: { description: 'now-fluent push spike — updated from Global' }, params: { sysparm_fields: 'sys_id' } }))
-        record(`${label}/update-from-global`, `[${label}] a record in ${scope.scope} can be UPDATED from Global`,
+          { ...THROW, body: { description: 'now-fluent push spike — updated from Global' },
+            params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' } }))
+        record(`${label}/update-from-global`, `[${label}] a record in ${scope.scope} can be UPDATED run AS Global`,
           fromGlobal.ok, fromGlobal.ok ? 'accepted' : `refused: ${reason(fromGlobal.error)}`, 'capability')
         const asApp = await probe(() => snRequest(instance, 'PUT', `/api/now/table/sys_script_include/${scopedId}`,
           { ...THROW, body: { description: 'now-fluent push spike — updated as the app' },
@@ -164,7 +228,7 @@ async function exercise(instance, label, scope) {
         record(`${label}/delete-as-app`, `[${label}] a record created AS ${scope.scope} can be deleted again`,
           removed.ok,
           removed.ok
-            ? (removed.value === 'as-app' ? 'deleted, run as the application' : 'deleted from Global')
+            ? (removed.value === 'as-scope' ? 'deleted, run as the application' : 'deleted naming no scope')
             : `refused both as the application and from Global: ${reason(removed.error)}`,
           'capability')
       }
@@ -288,6 +352,14 @@ record('read', 'the stored credential can read the Table API', reachable.ok,
   reachable.ok ? '' : reason(reachable.error))
 if (!reachable.ok) process.exit(1)
 
+const app = await probe(() => readCurrentApp(instance))
+currentAppId = app.ok ? app.value : ''
+console.log(app.ok
+  ? `  your account's current application (app picker): ${await scopeNameOf(instance, currentAppId)}`
+    + (currentAppId && currentAppId !== 'global'
+      ? '\n  NOTE: a REST write that names no scope runs there. push names the scope on every write.' : '')
+  : `  your account's current application could not be read (${reason(app.error)})`)
+
 // Everything from here on can create records, so failures must still reach cleanup.
 try {
   const ids = []
@@ -346,6 +418,10 @@ const ADAPTATION = {
   write: 'push gets a 403 per record in this scope, reports it with a hint, and carries on.',
   'transaction-scope': 'push cannot create records in a project\'s own scope here: its once-per-run probe finds that\n'
     + '            out and refuses, creating none of yours. Use install or update-set-package; push still UPDATES them.',
+  'plain-lands': 'push names the scope on every write (?sysparm_transaction_scope), so the picker does not decide.\n'
+    + '            Whether naming Global pins it is the next line.',
+  'transaction-global': 'push cannot pin Global writes here: a Global create that lands elsewhere is rolled back and\n'
+    + '            reported, and Global schema creates are refused after a probe. Switch the app picker to Global.',
   'update-from-global': 'push runs updates of records in an app AS that app, so this only matters if that is refused too.',
   'update-as-app': 'push falls back to a Global write when running as the app gets a 403.',
   'delete-as-app': 'push could not clean up its own scope probe here, so it refuses own-scope creates after the first\n'
