@@ -3,10 +3,11 @@
 `now-fluent` is a thin wrapper around the ServiceNow SDK (`now-sdk`). It does two things:
 
 1. **Forwards every now-sdk command verbatim** — use `now-fluent` exactly like `now-sdk`, with the same commands and arguments (including any future now-sdk commands).
-2. **Adds four Fluent-focused helpers** on top: `import` (move → online transform → Table-API query, whichever lands), `import-update-set` (a whole update set, from a file or straight off the instance), `export-xml`, and `update-set-package` (build a real, importable ServiceNow update set).
+2. **Adds six Fluent-focused helpers** on top: `pull`/`push` (the tight edit loop against one live record), `import` (move → online transform → Table-API query, whichever lands), `import-update-set` (a whole update set, from a file or straight off the instance), `export-xml`, and `update-set-package` (build a real, importable ServiceNow update set).
 
 ```text
 now-fluent <now-sdk-command> [...exact now-sdk args]   # forwarded to now-sdk
+now-fluent pull | push                                 # handled by now-fluent
 now-fluent import | import-update-set                  # handled by now-fluent
 now-fluent export-xml | update-set-package             # handled by now-fluent
 ```
@@ -16,6 +17,7 @@ now-fluent export-xml | update-set-package             # handled by now-fluent
 - It does not commit to Git.
 - It does not deploy anything to an instance unless you run an SDK command that does (`now-fluent install`, etc.) — those are just forwarded to now-sdk.
 - `update-set-package` can build a real, importable update set XML, but it only writes the file locally — **importing, previewing, and committing stay manual steps you perform in ServiceNow.**
+- `push` is the one command that **writes to an instance directly.** It only ever touches the records you name (or `--all` selects), it refuses a record that changed on the instance since you pulled it, and `--dry-run` shows you every request before you send one. Everything else in now-fluent is read-only or local.
 
 ## Requirements
 
@@ -70,6 +72,148 @@ now-fluent transform --help
 ```
 
 `now-fluent help` shows now-fluent's help; `now-fluent doctor` reports the now-fluent, Node, and now-sdk versions.
+
+## pull / push — the tight edit loop against a live record
+
+`update-set-package` is the *governed* path: build an update set, import it, preview it, commit it. That is right for promoting a change you do not own, and heavy for fixing a typo in a script include.
+
+`pull`/`push` is the inner loop. Both ends are the plain Table REST API — the same ungated path `import --via query` uses — so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's own update-set export.
+
+```bash
+# read the record into the project AND snapshot what the instance holds right now
+now-fluent pull --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
+
+# ...edit the Fluent source...
+
+# build, diff against the snapshot, and write only what changed back to the record
+now-fluent push --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
+```
+
+### How push decides what to do
+
+| situation | what push does |
+| --- | --- |
+| record does not exist on the instance | `POST` carrying the `sys_id`, so it keeps the identity `Now.ID` gave it |
+| record exists, fields changed locally | `PUT` with **only** the changed fields |
+| record exists, nothing changed locally | nothing — reported as `unchanged` |
+| record changed on the instance since you pulled | **refused** (`--force` overrides) |
+| record exists but was never pulled | **refused** — there is no baseline to tell your edits from someone else's |
+| artifact is a `DELETE` (you removed the Fluent code) | skipped unless `--allow-delete` — and then still subject to every guard above |
+
+The snapshot lives in `<project>/.now-fluent/state/<table>_<sysid>.json`. It is what makes the diff and the drift check possible, and it is disposable — add `.now-fluent/state/` to `.gitignore`. **Commit `.now-fluent/adopted.json`**, though: it records which sources were adopted from another scope (below), and it belongs with the source it describes. A snapshot taken against one instance is never used as the diff reference for another — push notices and refuses.
+
+### Cross-scope: pull adopts, push returns
+
+A Fluent project is bound to one scope, and the SDK enforces it at build time — a script include pulled from Global carries `apiName: 'global.X'`, which a project bound to `x_my_app` refuses to compile (`error TS11: apiName must begin with 'x_my_app.'`).
+
+So **pull adopts** a record from another scope: it rewrites `sys_scope` and the `api_name` prefix into the project's scope before the offline transform, and the source compiles as if the record had always been the project's. The baseline records the origin, and **push returns it there** — translating the fields back and updating the original record: same `sys_id`, same record, still in Global.
+
+```bash
+# project bound to x_my_app; the record lives in Global
+now-fluent pull --project ./work --auth dev --sys-id <global script include>
+#   pull ADOPTS them ... global -> x_my_app (push returns it to global)
+#   apiName in the source: x_my_app.PriceUtils
+now-fluent push --project ./work --auth dev --sys-id <same>
+#   adopted from global: pushing it back there (api_name x_my_app.PriceUtils -> global.PriceUtils)
+#   updated (1 field(s))
+```
+
+Only your edits are sent; the scope and `api_name` translate back and diff out.
+
+**`update-set-package` respects adoption too.** Packaging an adopted record into an update set for the project's scope would *move* it into that scope on commit and rename its `api_name` — so it refuses, and offers the choices:
+
+| you want to | run |
+| --- | --- |
+| edit it in place, governed | `update-set-package --scope global --scope-id global --include <sys_id>` — the payload is translated back to Global |
+| edit it in place, quickly | `push` |
+| move it into your project's scope | `update-set-package --move-adopted` — says which `api_name`s will change |
+
+Packaging records built in your project's scope for **another** scope (`--scope global`) rewrites their `api_name` along with `sys_scope` — `x_my_app.Helper` becomes `global.Helper` — so each payload matches the scope it lands in. It says so, and lists the renamed records: committing creates them in that scope, or moves them there if they already exist in yours. `--keep-payload-scope` leaves both as built.
+
+`import` (on the query path) and `import-update-set` adopt the same way: records from another scope are rewritten before the transform, and their origin is recorded once they land. Flows go through the SDK's online transform and are not adopted.
+
+Adoption happens on the query path (pull's default), because only that path's rebuilt XML is ours to rewrite and record. `--no-adopt-scope` skips the *rewrite* only — the record's origin is still recorded, because the SDK build stamps the project's scope onto every artifact whether or not the source was rewritten, and forgetting the origin would let `update-set-package` package it as a move. (Without the rewrite, a record carrying an `apiName` will fail the build with TS11.)
+
+### Scope: push names it on every write
+
+**Verified live (dev instance, SDK 4.12.x): `sys_scope` in the body is inert on a Table API write.** The platform sets it from the scope the REST transaction runs in and rewrites `api_name` to match (`x_my_app.Thing` → `global.Thing`). A transaction that names no scope runs in the account's **current application** (the app picker): with the picker on Global that is Global; with the picker on `sn_sow`, a plain create landed in `sn_sow`.
+
+So push never leaves it to the picker. Every write carries `?sysparm_transaction_scope=`: a create the scope it must land in, an update or delete the scope the record already lives in (Global included). A 400/403 wrote nothing and falls back once to a write that names no scope. Verified live with the picker on `sn_sow`: a create run as Global lands in Global, and an update of a record inside `sn_sow` is refused (403) when run as Global but accepted when run as `sn_sow`. The spike re-checks this per instance (`transaction-global`, `update-from-global`, `update-as-app`) and prints your current application.
+
+| case | behaviour |
+| --- | --- |
+| updating an existing record | keeps its scope; the update runs as that scope |
+| **creating** a record in Global (a Global project, or `--target-scope global`) | run **as Global**; verified afterwards — landed elsewhere → deleted again and reported FAILED, naming the app picker. Global `sys_db_object`/`sys_dictionary` creates are probed first instead (a DELETE would drop the table/column). |
+| **creating** a record in the project's own scope | run **as that application** (`?sysparm_transaction_scope=`). **Probe first:** once per run a throwaway inactive script include is created as the app, its scope read back, and it is always deleted; your record is created only if the probe landed in the app — otherwise the create is refused and nothing of yours was written. Your record's scope is verified too (landed elsewhere → deleted and reported FAILED). The app must exist on the instance; `sys_db_object`/`sys_dictionary` creates are refused (a DELETE cannot un-make a table or column). Verified live on one dev instance (`sn_sow`); the spike's `transaction-scope` line checks yours. Updates and deletes of records inside an app run as that app (a Global DELETE was refused live with 403). |
+| **creating** a record in any other scope | **refused** |
+| `--target-scope global` | creates it in Global on purpose, and reports the scope and `api_name` it actually got |
+| `--target-scope <other scope>` (not global, not the project's own) | refused before any request — this transport cannot do it |
+
+Every write reads `sys_scope` back afterwards and fails the record if it landed somewhere else. That check is the whole point: before it existed, a scoped create reported `created (13 field(s))` while silently producing a Global record with a rewritten `api_name`.
+
+**To get records into a specific scope, use `update-set-package`** — its payload carries `sys_scope`, and import/preview/commit places records properly:
+
+```bash
+now-fluent update-set-package --project ./work --update-set-name "To Global"   --scope global --scope-id global --build-local
+```
+
+`--target-scope global` is for records you **author** in a scoped project and want created in Global. A record you **pulled** from Global needs none of this — adoption returns it automatically (above).
+
+For an **authored** record, write its `apiName` in the project's scope (`x_my_app.Thing`) — the build still rejects `apiName: 'global.Thing'` in a scoped project (TS11). With `--target-scope global` the platform creates it in Global and rewrites the `api_name` to `global.Thing` itself; push reports what it got.
+
+push also refuses, **before writing**, any update whose source puts the record in a different scope from where it lives on the instance — sending it could rename the record's `api_name` out from under its callers. The usual cause is a record pulled without adoption; pulling it again fixes it.
+
+### Update set capture: reported, not controlled
+
+`--update-set <sys_id|name>` points your account's session at an in-progress update set. **Verified live: that does not reliably steer capture** — a REST transaction resolves its own update set, and a record written while the session pointed at a named set was captured into `Default` instead.
+
+So the flag's real job is the check that follows: after the push, it looks at where each write was actually captured and, on a mismatch, names the set it went to and fails the run. It restores your previous update set preference afterwards either way.
+
+If you need changes in a specific update set, build one with `update-set-package` rather than hoping capture follows.
+
+### Two limitations worth knowing
+
+**push cannot clear a field by deleting it from the Fluent source.** A Table API write merges, and the built artifact only contains the fields your Fluent code models — so "absent from the artifact" means "not modelled", not "delete this value". Removing a property leaves the old value on the record. Set it to an explicit empty value instead.
+
+**pull replaces local source.** It takes the instance version of the records you name, so uncommitted Fluent edits to those records are lost. It warns when a record already exists locally; commit or stash first.
+
+### Credentials
+
+`push`/`pull` use **the credential you already gave the SDK** — no second profile, no keychain, no extra tool. `now-sdk auth --print <alias>` exists to hand out a live credential for manual API calls, and that is exactly what now-fluent asks it for. `now-fluent doctor` reports whether that works.
+
+### What push is NOT
+
+A push is a **record write**, so it runs business rules exactly as editing the form would. Committing an update set does not. For a script include that difference is nil; for dictionary and table records it is not. `push` also produces no update set of its own unless you point the session at one with `--update-set <sys_id|name>` (experimental — see below).
+
+Use `update-set-package` to promote anything you do not own.
+
+### Before trusting it: run the spike
+
+Two platform behaviours `push` depends on — that a Table API `PUT` **merges** rather than replaces, and that an insert honours a supplied `sys_id` — plus whether your instance lets you write into a given application scope at all, are instance- and version-dependent. Prove them on a dev instance first:
+
+```bash
+npm run verify-push -- --auth dev                 # Global only
+npm run verify-push -- --auth dev --scope sn_hamp # ...and inside an application scope
+```
+
+It creates throwaway `sys_script_include` records, checks each assumption, deletes them again, and exits non-zero if any assumption fails. `--keep` leaves the records behind for inspection.
+
+### Useful flags
+
+| flag | effect |
+| --- | --- |
+| `--dry-run` | build, read the live records and run every guard, then print the exact verb, URL and (diffed) body — writes nothing |
+| `--all` | push every built record (`--include`/`--exclude` select, same tokens as `update-set-package`) |
+| `--full` | send every modelled field, not just the changed ones |
+| `--force` | push anyway when the record drifted |
+| `--no-drift-check` | skip the drift comparison entirely |
+| `--no-build` | push whatever is already in the build output |
+| `--target-scope global` | create in Global on purpose from a scoped project (the only value this transport can deliver) |
+| `--no-scope` | omit `sys_scope` from the body — a no-op on the instance, since the field is ignored either way |
+| `--allow-delete` | apply `DELETE` artifacts instead of skipping them |
+| `--update-set <id\|name>` | point your session at an update set, then verify where capture actually landed |
+
+`--table` is optional for both commands: `push` reads it from the built artifact (and validates a `--table` you do pass against it), and `pull` resolves it from `sys_metadata.sys_class_name`.
 
 ## import — bring records into a project
 
@@ -265,6 +409,7 @@ Create `.now-fluent.json` in your working directory to set defaults for the enha
   "project": "./my-app",
   "auth": "dev",
   "table": "sys_script_include",
+  "via": "query",
   "updateSetName": "My customizations",
   "scope": "sn_hamp",
   "scopeId": "6cd246601b9e0010cf95dd33dd4bcb8a",
@@ -281,7 +426,17 @@ ServiceNow-owned scopes (e.g. HAM, `sn_hamp`) should be treated differently from
 - Bind the project to the scope (its `now.config.json` `scope`/`scopeId`) so builds keep the correct `apiName`.
 - Prefer **`update-set-package`** to land customer changes through ServiceNow's import/preview/commit flow, rather than installing an SDK package into a vendor scope.
 - Do not `install` into a ServiceNow-owned scope unless your organization explicitly owns and governs that application/version.
+- `push` is *technically* not scope-gated (it is the plain Table API), but "the API allows it" is not "your governance allows it". Verify with `npm run verify-push -- --auth dev --scope <scope>` on a dev instance, and keep vendor-scope changes on the update-set path unless your process says otherwise.
 
 ## Working with the official ServiceNow SDK plugin/skills
 
-Use the official ServiceNow SDK plugin/skills for knowledge and code authoring (how to model a Business Rule, ACL, Table, Scripted REST API, Flow, etc., and `now-sdk explain`). Use `now-fluent` for execution: it is now-sdk plus `import`, `export-xml`, and `update-set-package`.
+Use the official ServiceNow SDK plugin/skills for knowledge and code authoring (how to model a Business Rule, ACL, Table, Scripted REST API, Flow, etc., and `now-sdk explain`). Use `now-fluent` for execution: it is now-sdk plus `pull`/`push`, `import`, `import-update-set`, `export-xml`, and `update-set-package`.
+
+## Tests
+
+```bash
+npm test                              # parser unit tests + push/pull end-to-end tests
+npm run verify-push -- --auth dev     # the live spike against a real instance
+```
+
+`npm test` needs no instance and no SDK: a fake `now-sdk` and an in-process mock Table API stand in for both. The mock encodes the two platform behaviours `push` relies on (PUT merges, POST honours a supplied `sys_id`), so the tests prove the *client* is correct **given** those semantics — `verify-push` is what proves the platform provides them.

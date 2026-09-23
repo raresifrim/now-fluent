@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<record_update table="sys_properties">
+  <sys_properties action="INSERT_OR_UPDATE" apply_defaults="true">
+    <sys_id>d0afdbaa3a5541ecade1741fccedfef5</sys_id>
+    <sys_scope display_value="x_push_demo">e5d61884beaf441ebd67932b798cb00b</sys_scope>
+    <sys_update_name>sys_properties_d0afdbaa3a5541ecade1741fccedfef5</sys_update_name>
+    <choices/>
+    <description>How PriceUtils rounds. A tiny record, ideal for push round-trips.</description>
+    <ignore_cache>false</ignore_cache>
+    <is_private>false</is_private>
+    <name>x_push_demo.rounding_mode</name>
+    <read_roles/>
+    <suffix>rounding_mode</suffix>
+    <type>string</type>
+    <value>half_up</value>
+    <write_roles/>
+  </sys_properties>
+</record_update>

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<record_update table="sys_script_include">
+  <sys_script_include action="INSERT_OR_UPDATE" apply_defaults="true">
+    <sys_id>26476609112c407ea8c36e346de767b1</sys_id>
+    <sys_scope display_value="x_push_demo">e5d61884beaf441ebd67932b798cb00b</sys_scope>
+    <sys_update_name>sys_script_include_26476609112c407ea8c36e346de767b1</sys_update_name>
+    <access>package_private</access>
+    <active>true</active>
+    <api_name>x_push_demo.PriceUtils</api_name>
+    <caller_access/>
+    <client_callable>false</client_callable>
+    <description>Rounding helpers. Edited to exercise now-fluent push.</description>
+    <mobile_callable>false</mobile_callable>
+    <name>PriceUtils</name>
+    <sandbox_callable>false</sandbox_callable>
+    <script><![CDATA[var PriceUtils = Class.create()
+PriceUtils.prototype = {
+    initialize: function () {},
+    round: function (n) {
+        return Math.round(n * 10000) / 1000  // now 3dp
+    },
+    type: 'PriceUtils',
+}
+]]></script>
+    <sys_name>PriceUtils</sys_name>
+  </sys_script_include>
+</record_update>
