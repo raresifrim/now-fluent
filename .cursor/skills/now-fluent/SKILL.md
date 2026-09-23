@@ -50,7 +50,8 @@ now-fluent install --auth <alias>   # only after explicit approval
 ### Edit one live record (pull → edit → push)
 
 ```bash
-now-fluent pull --project ./work --auth <alias> --sys-id <32hex>
+now-fluent pull --project ./work --auth <alias> --sys-id <32hex>[,<32hex>...]
+#   or: --table <table> --query "<encoded query>" [--limit <n>]   (not both)
 # ...edit the Fluent source...
 now-fluent push --project ./work --auth <alias> --sys-id <32hex> --dry-run
 now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # approval required

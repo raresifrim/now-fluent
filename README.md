@@ -101,11 +101,18 @@ now-fluent transform --help
 # read the record into the project AND snapshot what the instance holds right now
 now-fluent pull --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
 
+# ...or several: a comma list (mixed tables are fine), or every record a query matches
+now-fluent pull --project ./work --auth dev --sys-id <id1>,<id2>,<id3>
+now-fluent pull --project ./work --auth dev --table sys_script_include \
+  --query "sys_scope.scope=sn_hamp^nameSTARTSWITHHAM" --limit 50
+
 # ...edit the Fluent source...
 
 # build, diff against the snapshot, and write only what changed back to the record
 now-fluent push --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
 ```
+
+`pull` takes either a sys_id list or `--query` + `--table`, not both. A `--query` pull re-takes records that are already in the project (unlike `import --query`, which skips them so a bulk run can resume): pull always takes the instance version, and warns first when that replaces local source. `push` takes `--sys-id` lists too, or `--all` with `--include`/`--exclude`; each record is written or refused on its own, and the run exits non-zero if any failed.
 
 ### How push decides what to do
 

@@ -160,9 +160,10 @@ Enhanced commands (handled by now-fluent):
       matching ones (repeatable AND comma-separated). A good large-export filter:
       --exclude sys_documentation,sys_translated,sys_ui_message,sys_atf_test,sys_atf_step
 
-  pull --project <path> --auth <alias> --sys-id <32hex>[,<32hex>...]
-       [--table <table>] [--via query|transform|move|auto] [--no-adopt-scope]
-       [--no-state] [--dry-run]
+  pull --project <path> --auth <alias>
+       (--sys-id <32hex>[,<32hex>...] [--table <table>]
+        | --query <encoded query> --table <table> [--limit <n>])
+       [--via query|transform|move|auto] [--no-adopt-scope] [--no-state] [--dry-run]
       Import records into the project AND record a baseline snapshot of each one as
       the instance holds it right now (.now-fluent/state/<table>_<sysid>.json).
       The import itself is exactly "import --via query --force", so pull works in
@@ -170,8 +171,13 @@ Enhanced commands (handled by now-fluent):
       not gated by the scope checks that refuse move/transform/download.
       The baseline is what makes push safe — it is how push knows which fields you
       actually edited, and whether somebody else changed the record meanwhile.
-      --table is optional (resolved from sys_metadata.sys_class_name); --no-state
-      imports without recording a baseline (push then has no drift detection).
+      Name the records as a sys_id list (--table optional: resolved from
+      sys_metadata.sys_class_name), or select them with --query <encoded query>
+      against --table, e.g. --table sys_script_include --query
+      "sys_scope.scope=sn_hamp^nameSTARTSWITHHAM" (--limit caps how many). Unlike
+      import, a --query pull re-takes records already in the project — pull always
+      takes the instance version. --no-state imports without recording a baseline
+      (push then has no drift detection).
       CROSS-SCOPE: a record from another scope (say Global, pulled into a project
       bound to x_my_app) is ADOPTED — its sys_scope and api_name prefix are
       rewritten into the project's scope before the offline transform, so the
@@ -1219,6 +1225,9 @@ function commandImport(flags, config, positional, internal = {}) {
   } else {
     sysIds = sysIdsFrom(flags, config, positional)
   }
+  // pull needs to know what a --query selected: to warn before replacing local source,
+  // and to record a baseline for every matched record.
+  if (typeof internal.onSelected === 'function') internal.onSelected(sysIds)
 
   // A dry run cannot exercise the ladder (nothing actually fails), so print the plan
   // for whichever strategies --via selects instead of pretending the first one landed.
@@ -2820,19 +2829,33 @@ async function commandPull(flags, config, positional) {
   const auth = flags.auth || config.auth
   if (!auth) fail('Missing required --auth for pull')
   const dryRun = Boolean(flags['dry-run'])
-  const sysIds = sysIdsFrom(flags, config, positional)
+
+  // Two ways to name the records: a sys_id list, or an encoded query against --table.
+  // Only a --query typed on THIS command counts — a query in the config file (meant for
+  // import) must never turn "pull these ids" into "pull whatever that query matches".
+  const encodedQuery = flags.query
+  const table = flags.table || config.table
+  const namedIds = flags['sys-id'] ?? flags.sysId ?? flags.ids
+  if (encodedQuery && (namedIds || positional.length)) {
+    fail('pull takes EITHER --sys-id <ids> OR --query <encoded query> --table <table>, not both.')
+  }
+  if (encodedQuery && !table) fail('--query needs --table <table> (the table to run the encoded query against).')
+  let sysIds = encodedQuery ? [] : sysIdsFrom(flags, config, positional)
 
   // pull takes the INSTANCE version, so it replaces the local Fluent source for these
   // records. That is the contract, but it is silent data loss if the developer had
-  // uncommitted edits — so say which records are about to be overwritten.
+  // uncommitted edits — so say which records are about to be overwritten. With --query
+  // the records are only known once selected, just before anything is transformed.
   const alreadyLocal = loadProjectRecordIds(project)
-  const replacing = sysIds.filter((id) => alreadyLocal.has(id))
-  if (replacing.length) {
+  const warnReplacing = (ids) => {
+    const replacing = ids.filter((id) => alreadyLocal.has(id))
+    if (!replacing.length) return
     console.warn(`Warning: ${replacing.length} of these record(s) already exist as Fluent source in this `
       + 'project. pull takes the INSTANCE version, so any local edits to them will be replaced:')
     for (const id of replacing) console.warn(`  ${id}`)
     console.warn('  Commit or stash your work first if you need it back.\n')
   }
+  if (!encodedQuery) warnReplacing(sysIds)
 
   // pull defaults to the query strategy: it is the one that survives ServiceNow-owned
   // scopes, and the only one whose rebuilt XML we control — which scope adoption needs.
@@ -2851,7 +2874,12 @@ async function commandPull(flags, config, positional) {
   }
 
   const collect = []
-  commandImport({ ...flags, via, force: true }, config, positional, { projectScope, rewriteScope, collect })
+  // force: pull always takes the instance version, so a --query re-imports records that
+  // are already in keys.ts instead of skipping them the way a resumable import does.
+  commandImport({ ...flags, via, force: true, query: encodedQuery }, { ...config, query: undefined }, positional, {
+    projectScope, rewriteScope, collect,
+    onSelected: encodedQuery ? (ids) => { sysIds = ids; warnReplacing(ids) } : undefined
+  })
   if (dryRun) return
 
   const adopted = collect.filter((record) => record.adopted)
@@ -2881,7 +2909,6 @@ async function commandPull(flags, config, positional) {
   // whose old baselines are now stale. The non-query paths do not report what they
   // wrote, so for those fall back to whatever keys.ts newly registered.
   const tableFor = new Map()
-  const table = flags.table || config.table
   if (table) for (const id of sysIds) tableFor.set(id, table)
   for (const record of collect) if (!tableFor.has(record.sysId)) tableFor.set(record.sysId, record.table)
   const nowLocal = loadProjectRecordIds(project)

@@ -5,7 +5,7 @@ import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -149,4 +149,67 @@ test('warns before replacing Fluent source that already exists locally', async (
   const again = await pull('--sys-id', SYS_ID)
   assert.equal(again.status, 0, again.stderr)
   assert.match(again.stdout + again.stderr, /local edits to them will be replaced/)
+})
+
+// --- selecting by query ------------------------------------------------------
+const SECOND = 'cd34ef56ab12cd34ef56ab12cd34ef56'
+function seedSecond() {
+  instance.store.set(`sys_script_include/${SECOND}`, {
+    sys_id: SECOND, name: 'OtherInclude', script: 'var b = 2;', description: 'second',
+    active: 'false', sys_scope: 'global', sys_updated_on: '2026-03-04 04:04:04', sys_mod_count: '1'
+  })
+}
+
+test('--query pulls every matching record and records a baseline for each', async () => {
+  seedSecond()
+  const result = await pull('--query', 'active=true')
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /1 record\(s\) matched/)
+  assert.ok(existsSync(baselineFile()), 'the matched record has a baseline')
+  assert.ok(!existsSync(join(project, '.now-fluent', 'state', `sys_script_include_${SECOND}.json`)),
+    'the record the query did not match was not pulled')
+})
+
+test('--query re-takes records already in the project (pull always takes the instance version)', async () => {
+  assert.equal((await pull('--sys-id', SYS_ID)).status, 0)
+  instance.store.get(`sys_script_include/${SYS_ID}`).sys_mod_count = '6'
+  const result = await pull('--query', `sys_id=${SYS_ID}`)
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /already exist as Fluent source/, 'warns before replacing local source')
+  assert.equal(JSON.parse(readFileSync(baselineFile(), 'utf8')).sys_mod_count, '6', 'baseline refreshed, not skipped')
+})
+
+test('--query and --sys-id together are refused; --query without --table is refused', async () => {
+  const both = await pull('--query', 'active=true', '--sys-id', SYS_ID)
+  assert.notEqual(both.status, 0)
+  assert.match(both.stderr, /EITHER --sys-id .* OR --query/)
+
+  const { stderr } = await run(process.execPath,
+    [CLI, 'pull', '--project', project, '--auth', 'test', '--query', 'active=true'], {
+      encoding: 'utf8',
+      env: { ...process.env, NOW_FLUENT_SDK: `${process.execPath} ${FAKE_SDK}`, FAKE_SDK_HOST: instance.origin }
+    }).catch((error) => error)
+  assert.match(stderr, /--query needs --table/)
+})
+
+test('--query --dry-run selects nothing and writes nothing', async () => {
+  const result = await pull('--query', 'active=true', '--dry-run')
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /\[dry-run\] would select records/)
+  assert.ok(!existsSync(baselineFile()))
+  assert.ok(!instance.log.some((entry) => entry.method !== 'GET'), 'nothing written')
+})
+
+test('a query in the config file never turns "pull these ids" into "pull that query"', async () => {
+  seedSecond()
+  const config = join(project, 'cfg.json')
+  writeFileSync(config, JSON.stringify({ query: 'active=false' })) // would match SECOND only
+  const result = await pull('--sys-id', SYS_ID, '--config', config)
+  assert.equal(result.status, 0, result.stderr)
+  assert.doesNotMatch(result.stdout, /Selecting records/, "the config file's query was not run")
+  // Seen before the fix: the query's record was IMPORTED instead, and the named one got a
+  // baseline without ever being imported.
+  const keys = readFileSync(join(project, 'src', 'fluent', 'generated', 'keys.ts'), 'utf8')
+  assert.ok(keys.includes(SYS_ID), 'the named record was imported')
+  assert.ok(!keys.includes(SECOND), "the config query's record was not")
 })

@@ -19,6 +19,11 @@ All other commands forward to now-sdk unchanged.
 The inner edit loop. Both ends are the plain Table REST API, so neither is gated by the
 scope checks that refuse `move` / online `transform` / `download`.
 
+**Selecting records.** pull: `--sys-id a,b,c` (mixed tables fine) OR
+`--query "<encoded>" --table <t> [--limit n]` — never both; a query pull re-takes records
+already in the project, and a `query` in `.now-fluent.json` is ignored. push: `--sys-id`
+lists or `--all` (+ `--include`/`--exclude`); each record is written or refused on its own.
+
 **Credentials.** Taken from the SDK's own store: `now-sdk auth --list` gives the host,
 `now-sdk auth --print <alias> --format headers` gives live auth headers (that flag
 exists for exactly this — "for use in manual API calls"). No second profile, no

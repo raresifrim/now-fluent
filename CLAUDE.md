@@ -71,7 +71,8 @@ now-fluent install --auth <alias>      # only after explicit approval
 `update-set-package` is the GOVERNED path for promoting a change you do not own. `pull`/`push` is the INNER LOOP for iterating on a record — the thing that makes small repeated edits bearable.
 
 ```bash
-now-fluent pull --project ./work --auth <alias> --sys-id <32hex>
+now-fluent pull --project ./work --auth <alias> --sys-id <32hex>[,<32hex>...]
+now-fluent pull --project ./work --auth <alias> --table <table> --query "<encoded query>" [--limit <n>]
 # ...edit the Fluent source...
 now-fluent push --project ./work --auth <alias> --sys-id <32hex> --dry-run
 now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # needs user approval
@@ -80,6 +81,7 @@ now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # needs user 
 - **Both ends are the plain Table REST API**, the same ungated path `import --via query` uses, so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's update-set export.
 - **Credentials come from the SDK's own store.** `now-sdk auth --print <alias> --format headers` exists to hand out a live credential for manual API calls; `--format env` also emits `SN_SDK_INSTANCE_URL`. There is no second profile, no keychain, and no ServiceNow CLI (`snc`) dependency — `snc` would add a native installer, an interactive-only profile setup, an OS-keychain credential store, and a `record` command group that is fetched from the instance rather than built into the binary.
 - **`pull` records a baseline** at `<project>/.now-fluent/state/<table>_<sysid>.json`: the record's full field values plus `sys_updated_on`/`sys_mod_count` as the instance held them. The import half is exactly `import --via query --force`.
+- **Selecting records: a sys_id list OR a query, never both.** `--sys-id` takes a comma list, repeats, or positional ids (mixed tables fine). `--query <encoded query> --table <table>` pulls every match (`--limit` caps it) and, unlike `import --query`, re-takes records already in the project — pull always takes the instance version, and warns before replacing local source. Only a `--query` typed on the command counts: a `query` in `.now-fluent.json` is ignored by pull (it used to make `pull --sys-id A` import the config query's records instead). push takes `--sys-id` lists or `--all` (+ `--include`/`--exclude`); each record succeeds or is refused on its own.
 - **`push` builds, reads the compiled `<record_update>` artifact, and writes it back**: `PUT` for a record that exists, `POST` carrying the `sys_id` for one that does not (so the record keeps the identity `Now.ID` gave it). By default only fields that differ from the baseline are sent.
 - **Safety rails.** A record that changed on the instance since the pull is REFUSED (`--force` overrides). A record that exists but was never pulled is REFUSED — there is no baseline to separate your edits from someone else's. Instance-owned bookkeeping (`sys_created_*`, `sys_updated_*`, `sys_mod_count`, `sys_update_name`, `sys_package`, `sys_policy`, `sys_class_name`) is never written. A `DELETE` artifact is skipped unless `--allow-delete`, and even then it goes through the same baseline and drift guards as an update — an unpulled or drifted record is never destroyed. One refused record does not abandon the rest of the run.
 - **`--table` is optional for both.** push takes it from the built artifact and validates any `--table` you pass against it; pull resolves it from `sys_metadata.sys_class_name`.
