@@ -183,6 +183,8 @@ test('--target-scope global creates in Global, with no probe, run AS Global', ()
     assert.ok(!/Checking once/.test(result.output))
     const post = instance.writes().find((w) => w.method === 'POST')
     assert.equal(post.params.sysparm_transaction_scope, 'global')
+    assert.equal(post.body.sys_scope, 'global', 'the body says Global too')
+    assert.match(post.body.api_name, /^global\./, 'and so does the api_name prefix')
     assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).sys_scope, 'global')
   }))
 

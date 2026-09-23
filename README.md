@@ -138,7 +138,7 @@ Adoption happens on the query path (pull's default), because only that path's re
 
 **Verified live (dev instance, SDK 4.12.x): `sys_scope` in the body is inert on a Table API write.** The platform sets it from the scope the REST transaction runs in and rewrites `api_name` to match (`x_my_app.Thing` → `global.Thing`). A transaction that names no scope runs in the account's **current application** (the app picker): with the picker on Global that is Global; with the picker on `sn_sow`, a plain create landed in `sn_sow`.
 
-So push never leaves it to the picker. Every write carries `?sysparm_transaction_scope=`: a create the scope it must land in, an update or delete the scope the record already lives in (Global included). A 400/403 wrote nothing and falls back once to a write that names no scope. Whether naming Global pins a create while the picker is elsewhere is not yet verified live — the spike's `transaction-global` line answers it, and the spike prints your current application.
+So push never leaves it to the picker. Every write carries `?sysparm_transaction_scope=`: a create the scope it must land in, an update or delete the scope the record already lives in (Global included). A 400/403 wrote nothing and falls back once to a write that names no scope. Verified live with the picker on `sn_sow`: a create run as Global lands in Global, and an update of a record inside `sn_sow` is refused (403) when run as Global but accepted when run as `sn_sow`. The spike re-checks this per instance (`transaction-global`, `update-from-global`, `update-as-app`) and prints your current application.
 
 | case | behaviour |
 | --- | --- |

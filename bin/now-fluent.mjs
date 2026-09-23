@@ -3488,10 +3488,13 @@ async function pushRecord(target, label, context) {
   // the account's app picker on sn_sow, a plain REST create landed in sn_sow — a write that
   // names no scope runs in whatever the account last selected.
   const createScope = creating ? (createInOwnScope ? artifactScope : GLOBAL_SCOPE_ID) : ''
-  // --target-scope global on a project-scoped artifact: say Global in the body too, so the
-  // request is consistent (the field is inert on the instances tested, but not everywhere).
+  // --target-scope global on a project-scoped artifact: say Global in the body too — scope
+  // and api_name prefix — so the request is consistent with where it runs (the platform
+  // rewrites both anyway on the instances tested, but not every instance need).
   if (createScope === GLOBAL_SCOPE_ID && body.sys_scope && body.sys_scope !== GLOBAL_SCOPE_ID) {
     body = { ...body, sys_scope: GLOBAL_SCOPE_ID }
+    const prefix = apiPrefixOf(body.api_name)
+    if (prefix && prefix !== 'global') body.api_name = `global.${String(body.api_name).slice(prefix.length + 1)}`
   }
   if (createInOwnScope) {
     // A record can only live in the project's scope if that APPLICATION exists there.

@@ -56,8 +56,8 @@ the scope the REST transaction runs in and rewrites `api_name` to match. A trans
 names no scope runs in the account's current application (app picker) — seen live: picker on
 `sn_sow` → a plain create landed in `sn_sow`. So push names `?sysparm_transaction_scope=` on
 EVERY write (create: its target scope; update/delete: the record's scope, Global included;
-400/403 → one retry naming none). Naming Global is not yet verified live (spike
-`transaction-global`). So:
+400/403 → one retry naming none). Verified live: naming Global pins a create; an
+update of an `sn_sow` record run AS Global gets 403, run AS `sn_sow` succeeds. So:
 
 - updates keep the record's scope, and run as it;
 - a Global create that lands elsewhere is deleted and FAILED (schema: probed first instead);

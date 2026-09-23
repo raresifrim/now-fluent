@@ -63,9 +63,8 @@ echo "verify-push (global) exit=$?"
 
 if [ -n "$SCOPE" ]; then
   hr "PHASE 2 — Phase 0 spike, scope: $SCOPE"
-  note "EXPECTED (seen live): 'sys_scope on a write is honoured' NO — the body's sys_scope is ignored —"
-  note "but 'a create run AS $SCOPE' YES. Also read the UPDATED from Global / run AS and deleted-again"
-  note "lines: they say how push must write to records that live inside $SCOPE."
+  note "EXPECTED (seen live, dev410927 / sn_sow): body sys_scope NO (or ?? when $SCOPE is your app picker),"
+  note "create AS $SCOPE YES, UPDATED run AS Global NO (403), UPDATED run AS $SCOPE YES, deleted again YES."
   ( cd "$REPO" && npm run verify-push -- --auth "$AUTH" --scope "$SCOPE" )
   echo "verify-push (scope $SCOPE) exit=$?"
 else
@@ -320,7 +319,7 @@ if [ -n "$NEWID" ]; then
   $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --target-scope x_other
   echo "exit=$? (non-zero expected)"
 
-  note "push --dry-run --target-scope global — EXPECTED: 'would POST' (no transaction scope), nothing created"
+  note "push --dry-run --target-scope global — EXPECTED: 'would POST ...?sysparm_transaction_scope=global', nothing created"
   $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --target-scope global --dry-run
 
   note "push --target-scope global — EXPECTED: created, 'landed in GLOBAL', api_name global.$AUTHORED, 'Recorded as adopted'"
