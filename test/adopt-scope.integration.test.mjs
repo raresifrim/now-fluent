@@ -343,3 +343,26 @@ test('--no-adopt-scope skips the rewrite but never forgets where the record live
   const packaged = await packageIt()
   assert.notEqual(packaged.status, 0, 'update-set-package must still refuse to move it')
 })
+
+test('push messages name the project scope, not its sys_id', async () => {
+  // Live run printed "cannot put it in scope c2a58f10918d4d498939bef1c0b6ec64".
+  const newId = 'bb'.repeat(16)
+  mkdirSync(join(project, 'dist', 'app', 'update'), { recursive: true })
+  writeFileSync(join(project, 'dist', 'app', 'update', `sys_script_include_${newId}.xml`),
+    ['<record_update table="sys_script_include">',
+      '  <sys_script_include action="INSERT_OR_UPDATE">',
+      `    <sys_id>${newId}</sys_id>`,
+      `    <sys_scope display_value="x_push_demo">${PROJECT_SCOPE_ID}</sys_scope>`,
+      '    <api_name>x_push_demo.Authored</api_name>',
+      '    <name>Authored</name>',
+      '  </sys_script_include>',
+      '</record_update>'].join('\n'))
+
+  const refused = await cli('push', '--sys-id', newId)
+  assert.match(refused.output, /cannot put it in scope x_push_demo\./)
+  assert.ok(!refused.output.includes(PROJECT_SCOPE_ID), 'no raw sys_id where a name is known')
+
+  const created = await cli('push', '--sys-id', newId, '--target-scope', 'global')
+  assert.match(created.output, /the project has it in x_push_demo\)/)
+  assert.equal(adoptions()[newId].from.name, 'Global', 'same spelling as a pulled record')
+})

@@ -110,7 +110,9 @@ test('an UPDATE whose source scope disagrees with the instance is refused before
   assert.notEqual(result.status, 0, 'a scope mismatch must not pass as success')
   const output = result.stdout + result.stderr
   assert.match(output, /REFUSED before writing/)
-  assert.match(output, /scope e5d61884.*lives in global/s)
+  // No now.config.json in this project, so its scope has no name to show — the id is
+  // all there is. Global always reads as "Global".
+  assert.match(output, /scope e5d61884.*lives in Global/s)
   assert.deepEqual(instance.writes(), [], '--force does not override a scope mismatch')
   assert.equal(instance.store.get(`sys_script_include/${SYS_ID}`).api_name, 'global.NowFluentBrandNew')
 })

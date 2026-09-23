@@ -2913,6 +2913,15 @@ function projectScopeOf(project) {
   return scope && scopeId ? { scope, scopeId } : null
 }
 
+// A scope id as a person reads it: "Global", the project's own scope name, or — for a
+// scope the project knows nothing about — the sys_id with nothing better to offer.
+function scopeLabel(project, scopeId) {
+  if (!scopeId) return ''
+  if (scopeId === GLOBAL_SCOPE_ID) return 'Global'
+  const own = projectScopeOf(project)
+  return own && own.scopeId === scopeId ? own.scope : scopeId
+}
+
 // The scope name an api_name starts with ("global" in "global.PriceUtils").
 function apiPrefixOf(apiName) {
   const text = apiName ? String(apiName) : ''
@@ -3246,7 +3255,7 @@ async function pushRecord(target, label, context) {
   const targetScope = flags['target-scope']
   if (creating && artifactScope && artifactScope !== GLOBAL_SCOPE_ID && targetScope !== GLOBAL_SCOPE_ID) {
     console.error(`${label} REFUSED: this record does not exist yet, and a Table API create cannot put it `
-      + `in scope ${artifactScope}.\n`
+      + `in scope ${scopeLabel(project, artifactScope)}.\n`
       + '      sys_scope is inert on a REST write — the record would be created in GLOBAL and the platform\n'
       + '      would rewrite its api_name, leaving this project and the instance disagreeing.\n'
       + '      Either promote it with update-set-package (which sets the scope in the payload), or, if you\n'
@@ -3262,8 +3271,8 @@ async function pushRecord(target, label, context) {
   // .now-fluent/adopted.json, or a --via transform|move import.
   const liveScope = live ? scopeOf(live) : ''
   if (!creating && artifactScope && liveScope && artifactScope !== liveScope) {
-    console.error(`${label} REFUSED before writing: the source puts this record in scope ${artifactScope}, `
-      + `but on the instance it lives in ${liveScope}.\n`
+    console.error(`${label} REFUSED before writing: the source puts this record in scope `
+      + `${scopeLabel(project, artifactScope)}, but on the instance it lives in ${scopeLabel(project, liveScope)}.\n`
       + '      A Table API write cannot move a record between scopes, and sending the source as-is could\n'
       + '      rename its api_name out from under every caller.\n'
       + `      If you meant to edit it where it lives: pull it again (now-fluent pull --sys-id ${sysId}) — pull\n`
@@ -3316,16 +3325,17 @@ async function pushRecord(target, label, context) {
       const projectPrefix = apiPrefixOf(record.fields.api_name) || (projectScope ? projectScope.scope : '')
       setAdoption(project, sysId, {
         table,
-        from: { scopeId: GLOBAL_SCOPE_ID, name: 'global', apiPrefix: apiPrefixOf(written.api_name) },
+        from: { scopeId: GLOBAL_SCOPE_ID, name: 'Global', apiPrefix: apiPrefixOf(written.api_name) },
         to: { scopeId: artifactScope, name: projectScope ? projectScope.scope : projectPrefix, apiPrefix: projectPrefix },
         since: new Date().toISOString()
       })
       console.warn(`${label} landed in GLOBAL, as --target-scope global asked `
-        + `(the project has it in ${artifactScope}).${apiNameNote} Recorded as adopted, so later pushes go there too.`)
+        + `(the project has it in ${scopeLabel(project, artifactScope)}).${apiNameNote} Recorded as adopted, so later `
+        + 'pushes go there too.')
     } else {
       console.error(`${label} WROTE THE RECORD, BUT IT LANDED IN THE WRONG SCOPE.\n`
-        + `      the project says: ${artifactScope}\n`
-        + `      the instance says: ${landedScope}${apiNameNote}\n`
+        + `      the project says: ${scopeLabel(project, artifactScope)}\n`
+        + `      the instance says: ${scopeLabel(project, landedScope)}${apiNameNote}\n`
         + '      sys_scope is inert on a Table API write. Fix this on the instance, and promote scoped\n'
         + '      records with update-set-package instead of push.')
       return 'failed'
