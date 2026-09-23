@@ -1,0 +1,215 @@
+// Scenario 5: push a NEW record authored in the project's own scope (x_push_demo), with
+// no install. The body's sys_scope is inert (verified live), so the create runs AS the
+// application — ?sysparm_transaction_scope=<app sys_id>, the mechanism the SDK itself
+// uses for flow activation.
+//
+// A wrong create cannot be safely undone (a delete does not undo what the insert
+// triggered), so whether the instance honours the parameter is established FIRST, once
+// per run, with a throwaway probe record — no record of the user's is created on a
+// guess. The real create is still verified, and rolled back as a last resort.
+import { test, beforeEach } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+
+import { startMockInstance } from './helpers/mock-instance.mjs'
+
+const CLI = resolve(import.meta.dirname, '..', 'bin', 'now-fluent.mjs')
+const FAKE_SDK = resolve(import.meta.dirname, 'helpers', 'fake-sdk.mjs')
+const PROJECT_SCOPE_ID = 'e5d61884beaf441ebd67932b798cb00b'
+const NEW_ID = 'ee55cd34ef56ab12cd34ef56ab12cd34'
+const run = promisify(execFile)
+
+let project
+
+beforeEach(() => {
+  project = mkdtempSync(join(tmpdir(), 'now-fluent-own-scope-'))
+  writeConfig({ scope: 'x_push_demo', scopeId: PROJECT_SCOPE_ID, name: 'Push Demo' })
+  writeArtifact('sys_script_include', NEW_ID, 'first')
+})
+
+function writeConfig(config) {
+  writeFileSync(join(project, 'now.config.json'), JSON.stringify(config))
+}
+
+function writeArtifact(table, id, description, scopeId = PROJECT_SCOPE_ID) {
+  mkdirSync(join(project, 'dist', 'app', 'update'), { recursive: true })
+  const api = table === 'sys_script_include' ? `<api_name>x_push_demo.A${id.slice(0, 4)}</api_name>` : ''
+  writeFileSync(join(project, 'dist', 'app', 'update', `${table}_${id}.xml`),
+    `<record_update table="${table}"><${table} action="INSERT_OR_UPDATE" apply_defaults="true">`
+    + `<sys_id>${id}</sys_id><sys_scope display_value="x_push_demo">${scopeId}</sys_scope>${api}`
+    + `<description>${description}</description><name>A${id.slice(0, 4)}</name></${table}></record_update>`)
+}
+
+async function push(instance, ...args) {
+  try {
+    const { stdout, stderr } = await run(process.execPath,
+      [CLI, 'push', '--project', project, '--auth', 'test', ...args], {
+        encoding: 'utf8',
+        env: { ...process.env, NOW_FLUENT_SDK: `${process.execPath} ${FAKE_SDK}`, FAKE_SDK_HOST: instance.origin }
+      })
+    return { status: 0, output: stdout + stderr }
+  } catch (error) {
+    return { status: error.code ?? 1, output: (error.stdout ?? '') + (error.stderr ?? '') }
+  }
+}
+
+// The project's application exists on the instance unless a test says otherwise.
+async function withInstance(options, body, { appExists = true } = {}) {
+  const instance = await startMockInstance(options)
+  if (appExists) {
+    instance.store.set(`sys_scope/${PROJECT_SCOPE_ID}`, { sys_id: PROJECT_SCOPE_ID, scope: 'x_push_demo', name: 'Push Demo' })
+  }
+  try { await body(instance) } finally { await instance.stop() }
+}
+
+// The writes made for records OTHER than the throwaway probe.
+const realWrites = (instance) => instance.writes().filter((w) => !(w.body && /ScopeProbe/.test(w.body.name || ''))
+  && !(w.method === 'DELETE' && w.sysId && !instance.log.some((e) => e.method === 'POST' && e.body && e.body.sys_id === w.sysId
+    && !/ScopeProbe/.test(e.body.name || '')) ))
+
+test('an instance that honours it: probe first, then the record is CREATED IN x_push_demo', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.equal(result.status, 0, result.output)
+    assert.match(result.output, /Checking once whether this instance creates records AS x_push_demo/)
+    assert.match(result.output, /created in x_push_demo \(run as that application\)/)
+
+    const methods = instance.writes().map((w) => `${w.method} ${w.body ? (w.body.name || '') : ''}`.trim())
+    assert.match(methods[0], /^POST NowFluentScopeProbe/, 'the probe goes first')
+    assert.equal(methods[1], 'DELETE', 'and is deleted before anything else')
+    const realPost = instance.writes()[2]
+    assert.equal(realPost.body.sys_id, NEW_ID)
+    assert.equal(realPost.params.sysparm_transaction_scope, PROJECT_SCOPE_ID)
+
+    assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).sys_scope, PROJECT_SCOPE_ID)
+    assert.ok(![...instance.store.keys()].some((k) => k !== `sys_script_include/${NEW_ID}` && k.startsWith('sys_script_include/')),
+      'the probe record is gone')
+    assert.ok(!existsSync(join(project, '.now-fluent', 'adopted.json')), 'it lives in its own scope: nothing adopted')
+  }))
+
+test('...and later pushes of it are ordinary updates, with no probe', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', NEW_ID)).status, 0)
+    writeArtifact('sys_script_include', NEW_ID, 'edited')
+    instance.log.length = 0
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.equal(result.status, 0, result.output)
+    assert.ok(!/Checking once/.test(result.output))
+    const writes = instance.writes()
+    assert.equal(writes.length, 1)
+    assert.equal(writes[0].method, 'PUT')
+    assert.deepEqual(Object.keys(writes[0].body), ['description'])
+  }))
+
+test('an instance that ignores it: the probe finds out, and NO record of yours is created', () =>
+  withInstance({ honoursTransactionScope: false }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /this instance does not create records AS x_push_demo/)
+    assert.match(result.output, /probe record run as that application landed in Global/)
+    assert.match(result.output, /No record of yours was created/)
+    assert.ok(!instance.writes().some((w) => w.body && w.body.sys_id === NEW_ID), 'the real record was never sent')
+    assert.ok(!instance.store.has(`sys_script_include/${NEW_ID}`))
+    assert.ok(![...instance.store.keys()].some((k) => k.startsWith('sys_script_include/')), 'probe cleaned up')
+  }))
+
+test('the probe runs once per push, however many new records there are', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const second = 'ff66cd34ef56ab12cd34ef56ab12cd34'
+    writeArtifact('sys_script_include', second, 'second')
+    const result = await push(instance, '--sys-id', `${NEW_ID},${second}`)
+    assert.equal(result.status, 0, result.output)
+    assert.equal(result.output.match(/Checking once/g).length, 1)
+    assert.ok(instance.store.has(`sys_script_include/${NEW_ID}`))
+    assert.ok(instance.store.has(`sys_script_include/${second}`))
+  }))
+
+test('a table the instance treats differently is caught after the write and rolled back — honestly', () =>
+  // The probe (a script include) lands correctly, but a business rule does not.
+  withInstance({ honoursTransactionScope: ['sys_script_include'] }, async (instance) => {
+    const brId = 'aa77cd34ef56ab12cd34ef56ab12cd34'
+    writeArtifact('sys_script', brId, 'rule')
+    const result = await push(instance, '--sys-id', brId)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /although a probe record landed in x_push_demo, this sys_script record was created in Global/)
+    assert.match(result.output, /Anything its insert triggered \(business rules\) is NOT undone/)
+    assert.ok(!instance.store.has(`sys_script/${brId}`), 'rolled back')
+  }))
+
+test('a create whose scope cannot be read back is reported UNVERIFIED, and not deleted', () =>
+  withInstance({ honoursTransactionScope: true, noScopeTables: ['u_widget'] }, async (instance) => {
+    const id = 'bb88cd34ef56ab12cd34ef56ab12cd34'
+    writeArtifact('u_widget', id, 'widget')
+    const result = await push(instance, '--sys-id', id)
+    assert.notEqual(result.status, 0, 'unverified is not success')
+    assert.match(result.output, /could not be read back, so it is UNVERIFIED/)
+    assert.ok(instance.store.has(`u_widget/${id}`), 'never delete what might be right')
+  }))
+
+test('tables and columns are never created this way', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const id = 'cc99cd34ef56ab12cd34ef56ab12cd34'
+    writeArtifact('sys_db_object', id, 'a table')
+    const result = await push(instance, '--sys-id', id)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /push does not create sys_db_object records/)
+    assert.deepEqual(instance.writes(), [], 'not even a probe')
+  }))
+
+test('--dry-run writes nothing — not even the probe — and says a real run checks first', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID, '--dry-run')
+    assert.equal(result.status, 0, result.output)
+    assert.match(result.output, new RegExp(`would POST .*sysparm_transaction_scope=${PROJECT_SCOPE_ID}`))
+    assert.match(result.output, /a real run first checks, with a throwaway probe record/)
+    assert.deepEqual(instance.writes(), [])
+  }))
+
+test('--target-scope x_push_demo is accepted, and means the same as no flag', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID, '--target-scope', 'x_push_demo')
+    assert.equal(result.status, 0, result.output)
+    assert.match(result.output, /created in x_push_demo/)
+  }))
+
+test('--target-scope global still creates in Global, with no probe and no transaction scope', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID, '--target-scope', 'global')
+    assert.equal(result.status, 0, result.output)
+    assert.ok(!/Checking once/.test(result.output))
+    const post = instance.writes().find((w) => w.method === 'POST')
+    assert.equal(post.params.sysparm_transaction_scope, undefined)
+    assert.equal(instance.store.get(`sys_script_include/${NEW_ID}`).sys_scope, 'global')
+  }))
+
+test('a Global-bound project creates Global records exactly as before', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    writeConfig({ scope: 'global', scopeId: 'global', name: 'Global stuff' })
+    writeArtifact('sys_script_include', NEW_ID, 'global one', 'global')
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.equal(result.status, 0, result.output)
+    assert.ok(!/Checking once/.test(result.output), 'no probe, no app lookup')
+    assert.deepEqual(instance.writes().map((w) => w.method), ['POST'])
+    assert.equal(instance.writes()[0].params.sysparm_transaction_scope, undefined)
+  }))
+
+test('a new record in a THIRD scope is still refused', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    writeArtifact('sys_script_include', NEW_ID, 'third', 'dd00cd34ef56ab12cd34ef56ab12cd34')
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /neither Global nor this project's own/)
+    assert.deepEqual(instance.writes(), [])
+  }))
+
+test('if the project\'s application does not exist on the instance, say so — do not try', () =>
+  withInstance({ honoursTransactionScope: true }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /the application x_push_demo .* does not exist on this instance/)
+    assert.deepEqual(instance.writes(), [], 'no probe either')
+  }, { appExists: false }))

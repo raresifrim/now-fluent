@@ -143,9 +143,10 @@ So push cannot put a record in a scope of your choosing. What it does instead:
 | case | behaviour |
 | --- | --- |
 | updating an existing record | unaffected — its scope is already set, and the field is ignored |
-| **creating** a record whose artifact is scoped | **refused** — it would land in Global and leave project and instance disagreeing |
+| **creating** a record in the project's own scope | run **as that application** (`?sysparm_transaction_scope=`). **Probe first:** once per run a throwaway inactive script include is created as the app, its scope read back, and it is always deleted; your record is created only if the probe landed in the app — otherwise the create is refused and nothing of yours was written. Your record's scope is verified too (landed elsewhere → deleted and reported FAILED). The app must exist on the instance; `sys_db_object`/`sys_dictionary` creates are refused (a DELETE cannot un-make a table or column). Not yet verified live — the spike's `transaction-scope` line answers it. |
+| **creating** a record in any other scope | **refused** |
 | `--target-scope global` | creates it in Global on purpose, and reports the scope and `api_name` it actually got |
-| `--target-scope <other scope>` | refused before any request — this transport cannot do it |
+| `--target-scope <other scope>` (not global, not the project's own) | refused before any request — this transport cannot do it |
 
 Every write reads `sys_scope` back afterwards and fails the record if it landed somewhere else. That check is the whole point: before it existed, a scoped create reported `created (13 field(s))` while silently producing a Global record with a rewritten `api_name`.
 

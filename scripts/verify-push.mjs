@@ -41,9 +41,10 @@ const created = [] // { table, sysId }
 //                 answer, not a failure: it says what push can do on this instance.
 // Treating a capability "no" as a failure made every run exit 1 on facts push already
 // handles, which teaches you to ignore the exit code — as bad as a false green.
+// A capability answer can also be null: "could not determine" — never to be read as no.
 function record(id, question, ok, detail, kind = 'required') {
   results.push({ id, question, ok, detail, kind })
-  const tag = kind === 'capability' ? (ok ? 'YES ' : 'NO  ') : (ok ? 'PASS' : 'FAIL')
+  const tag = kind === 'capability' ? (ok === null ? '??  ' : ok ? 'YES ' : 'NO  ') : (ok ? 'PASS' : 'FAIL')
   console.log(`  ${tag}  ${question}`)
   if (detail) console.log(`        ${detail}`)
 }
@@ -113,6 +114,36 @@ async function exercise(instance, label, scope) {
         : `ignored: asked for ${scope.scope}, got "${landed}", api_name became `
           + `"${afterInsert ? afterInsert.api_name : '?'}".`,
       'capability')
+  }
+
+  // Can a create be run AS an application? The body's sys_scope is ignored (above); the
+  // SDK itself sets a REST transaction's scope with ?sysparm_transaction_scope=<app>.
+  // If the Table API honours that, push can create records in a project's own scope.
+  if (scope) {
+    const scopedId = sysId()
+    const scopedName = `NowFluentTxScope${suffix}`
+    const viaTx = await probe(() => snRequest(instance, 'POST', '/api/now/table/sys_script_include', {
+      ...THROW,
+      body: { sys_id: scopedId, name: scopedName, script: `var ${scopedName} = Class.create();`,
+        description: 'now-fluent push spike — safe to delete', active: 'false' },
+      params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: scope.sys_id }
+    }))
+    if (!viaTx.ok) {
+      record(`${label}/transaction-scope`, `[${label}] a create run AS ${scope.scope} (sysparm_transaction_scope) lands in it`,
+        false, `the create itself was refused: ${reason(viaTx.error)}`, 'capability')
+    } else {
+      created.push({ table: 'sys_script_include', sysId: scopedId })
+      const landedTx = await snGetRecord(instance, 'sys_script_include', scopedId, undefined, THROW)
+      const scopeTx = landedTx ? landedTx.sys_scope : ''
+      record(`${label}/transaction-scope`, `[${label}] a create run AS ${scope.scope} (sysparm_transaction_scope) lands in it`,
+        !scopeTx ? null : scopeTx === scope.sys_id,
+        !scopeTx
+          ? 'could not determine: the probe record could not be read back.'
+          : scopeTx === scope.sys_id
+            ? `sys_scope: ${scopeTx}, api_name: ${landedTx.api_name}`
+            : `ignored: landed in "${scopeTx}", api_name "${landedTx.api_name}".`,
+        'capability')
+    }
   }
 
   // Q2 — does PUT MERGE (leave unspecified fields alone) rather than replace?
@@ -271,12 +302,25 @@ if (keep) {
 // --- verdict ---------------------------------------------------------------
 // What push does about each capability being absent. Keyed by the id's last segment.
 const ADAPTATION = {
-  scope: 'push REFUSES scoped creates (they would land in Global). Use --target-scope global to create in\n'
-    + '            Global on purpose, or update-set-package --scope <scope> to place records in a scope.',
+  // Depends on the transaction-scope answer for the same scope, so the two lines agree.
+  scope: (item) => {
+    const tx = results.find((r) => r.id === item.id.replace(/\/scope$/, '/transaction-scope'))
+    if (tx && tx.ok === true) {
+      return 'the body\'s sys_scope is ignored, but running the create AS the application works (below): push creates\n'
+        + '            records in a project\'s own scope that way. Global creates: --target-scope global.'
+    }
+    if (tx && tx.ok === false) {
+      return 'and running the create AS the application does not help either (below): push cannot create records in\n'
+        + '            a project\'s own scope on this instance. Use install or update-set-package; push still UPDATES them.'
+    }
+    return 'the body\'s sys_scope is ignored; see the transaction-scope line for whether push can create in a scope.'
+  },
   'capture-steering': '--update-set cannot choose the set; it REPORTS where each write landed and fails\n'
     + '            on a mismatch. Use update-set-package when changes must be in a specific set.',
   capture: 'push produces no update set here; promote with update-set-package.',
   write: 'push gets a 403 per record in this scope, reports it with a hint, and carries on.',
+  'transaction-scope': 'push cannot create records in a project\'s own scope here: it tries, sees the record land in\n'
+    + '            Global, and deletes it again. Create them with install or update-set-package; push still UPDATES them.',
   'update-set': 'the probe itself failed — check capture by hand.'
 }
 
@@ -291,9 +335,11 @@ for (const item of brokenRequired) console.log(`  FAILED: ${item.question}`)
 if (capabilities.length) {
   console.log('\nCAPABILITIES — platform facts push adapts to (a "no" is an answer, not a failure):')
   for (const item of capabilities) {
-    console.log(`  ${item.ok ? 'yes' : 'NO '}  ${item.question}`)
+    console.log(`  ${item.ok === null ? '?  ' : item.ok ? 'yes' : 'NO '}  ${item.question}`)
     const key = item.id.split('/').pop()
-    if (!item.ok && ADAPTATION[key]) console.log(`       -> ${ADAPTATION[key]}`)
+    const adaptation = typeof ADAPTATION[key] === 'function' ? ADAPTATION[key](item) : ADAPTATION[key]
+    if (item.ok === false && adaptation) console.log(`       -> ${adaptation}`)
+    if (item.ok === null) console.log(`       -> ${item.detail}`)
   }
 }
 

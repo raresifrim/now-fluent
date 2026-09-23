@@ -14,8 +14,16 @@ import { createServer } from 'node:http'
 // putReplaces:true models the one platform behaviour that would make push UNSAFE — a
 // PUT that replaces the record rather than merging into it — so the spike can be shown
 // to catch it.
+// honoursTransactionScope:true models an instance that runs a REST write as the
+// application named by ?sysparm_transaction_scope=<app sys_id> — the create then lands
+// in that scope. Default false: the param is ignored like the body's sys_scope, and the
+// create lands in Global. An ARRAY of table names honours it for those tables only (a
+// table-specific difference, which push's post-create check must still catch).
+// noScopeTables: tables whose rows are stored without a sys_scope, so a read-back
+// cannot tell where a record landed.
 export async function startMockInstance({
-  records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false
+  records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
+  honoursTransactionScope = false, noScopeTables = []
 } = {}) {
   const store = new Map(Object.entries(records))
   const log = []
@@ -35,7 +43,7 @@ export async function startMockInstance({
     let raw = ''
     for await (const chunk of req) raw += chunk
     const parsed = raw ? JSON.parse(raw) : undefined
-    log.push({ method: req.method, table, sysId, body: parsed })
+    log.push({ method: req.method, table, sysId, body: parsed, params: Object.fromEntries(url.searchParams) })
 
     const send = (status, payload) => {
       res.writeHead(status, { 'Content-Type': 'application/json' })
@@ -70,10 +78,19 @@ export async function startMockInstance({
       // reproduces that by default; honoursScope:true models the world we wrongly
       // assumed, so a test can prove push behaves correctly in both.
       const row = { ...parsed, sys_id: id, sys_updated_on: stamp(), sys_mod_count: '0' }
-      if (!honoursScope && row.sys_scope && row.sys_scope !== 'global') {
+      const transactionScope = url.searchParams.get('sysparm_transaction_scope')
+      const honoured = Array.isArray(honoursTransactionScope)
+        ? honoursTransactionScope.includes(table) : honoursTransactionScope
+      if (honoured && transactionScope) {
+        row.sys_scope = transactionScope
+      } else if (!honoursScope && row.sys_scope && row.sys_scope !== 'global') {
         row.sys_scope = 'global'
         if (row.api_name) row.api_name = String(row.api_name).replace(/^[^.]+\./, 'global.')
       }
+      // Like the platform: a record created without a scope gets the transaction's —
+      // Global, unless the create ran as an application.
+      if (!row.sys_scope) row.sys_scope = (honoured && transactionScope) || 'global'
+      if (noScopeTables.includes(table)) delete row.sys_scope
       store.set(`${table}/${id}`, row)
       noteCapture(table, id)
       return send(201, { result: { sys_id: id } })

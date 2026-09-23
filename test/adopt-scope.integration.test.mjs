@@ -358,9 +358,12 @@ test('push messages name the project scope, not its sys_id', async () => {
       '  </sys_script_include>',
       '</record_update>'].join('\n'))
 
+  // This mock ignores sysparm_transaction_scope, so the own-scope create is refused by
+  // the probe — and every message must speak in scope names.
+  instance.store.set(`sys_scope/${PROJECT_SCOPE_ID}`, { sys_id: PROJECT_SCOPE_ID, scope: 'x_push_demo' })
   const refused = await cli('push', '--sys-id', newId)
-  assert.match(refused.output, /cannot put it in scope x_push_demo\./)
-  assert.ok(!refused.output.includes(PROJECT_SCOPE_ID), 'no raw sys_id where a name is known')
+  assert.match(refused.output, /does not create records AS x_push_demo/)
+  assert.ok(!refused.output.includes(PROJECT_SCOPE_ID), 'no raw sys_id anywhere, where a name is known')
 
   const created = await cli('push', '--sys-id', newId, '--target-scope', 'global')
   assert.match(created.output, /the project has it in x_push_demo\)/)

@@ -200,66 +200,101 @@ console.log('deleted update set $US_ID')" || echo "could not delete update set $
 cleanup_target
 
 # ---------------------------------------------------------------------------
-hr "PHASE 4c — a record AUTHORED in the scoped project, pushed to Global (also covers 4a: a create)"
-# A throwaway script include written directly as Fluent source in x_push_demo — the
-# "push objects from my scoped project into Global" case for records you author rather
-# than pull. active:false, so it can never run.
-RAND=$(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")
-AUTHORED="NowFluentAuthored$RAND"
-SRC="src/fluent/nf-authored-$RAND.now.ts"
-cat > "$SRC" <<EOF
+# Author a throwaway (active:false) script include as Fluent source in the scoped project,
+# build, and find the sys_id Now.ID gave it. Sets SRC, AUTHORED, NEWID (NEWID empty on failure).
+author_record() {
+  RAND=$(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")
+  AUTHORED="NowFluent$1$RAND"
+  SRC="src/fluent/nf-$1-$RAND.now.ts"
+  cat > "$SRC" <<EOF
 import { ScriptInclude } from '@servicenow/sdk/core'
 
 ScriptInclude({
-    \$id: Now.ID['nf-authored-$RAND'],
+    \$id: Now.ID['nf-$1-$RAND'],
     name: '$AUTHORED',
     active: false,
-    description: 'now-fluent live-validate 4c — safe to delete',
+    description: 'now-fluent live-validate — safe to delete',
     script: 'var $AUTHORED = Class.create();\n$AUTHORED.prototype = { type: "$AUTHORED" };',
 })
 EOF
-echo "wrote $SRC"
-BUILD_OUT=$(now-sdk build 2>&1)
-ART=$(grep -l "<name>$AUTHORED</name>" dist/app/update/*.xml 2>/dev/null | head -1)
-NEWID=$(basename "$ART" .xml 2>/dev/null | sed 's/.*_\([0-9a-f]\{32\}\)$/\1/')
-if [ -z "$ART" ] || [ -z "$NEWID" ]; then
-  echo "PHASE 4c STOPPED: the build produced no artifact for $AUTHORED. Build output:"
-  echo "$BUILD_OUT" | tail -20
+  BUILD_OUT=$(now-sdk build 2>&1)
+  local art
+  art=$(grep -l "<name>$AUTHORED</name>" dist/app/update/*.xml 2>/dev/null | head -1)
+  NEWID=$(basename "$art" .xml 2>/dev/null | sed 's/.*_\([0-9a-f]\{32\}\)$/\1/')
+  if [ -z "$art" ] || [ -z "$NEWID" ]; then
+    echo "could not author a record: the build produced no artifact for $AUTHORED. Build output:"
+    echo "$BUILD_OUT" | tail -20
+    rm -f "$SRC"; NEWID=""
+  else
+    echo "wrote $SRC — Now.ID gave it sys_id $NEWID (api_name in source: x_push_demo.$AUTHORED)"
+  fi
+}
+
+delete_record() {
+  node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+await snRequest(resolveInstance('$AUTH'), 'DELETE', '/api/now/table/sys_script_include/$1', { allow404: true, throwOnError: true })
+console.log('deleted sys_script_include $1')" || echo "could not delete $1 — remove it in the UI"
+}
+
+# ---------------------------------------------------------------------------
+hr "PHASE 4c — a NEW record in the project's OWN scope (x_push_demo), no install"
+PROJECT_SCOPE_ID=$(node -e "console.log(require('./now.config.json').scopeId || '')")
+APP_EXISTS=$(node --input-type=module -e "
+import { resolveInstance, snGetRecord } from '$REPO/bin/now-fluent.mjs'
+const row = await snGetRecord(resolveInstance('$AUTH'), 'sys_scope', '$PROJECT_SCOPE_ID', 'sys_id', { throwOnError: true })
+console.log(row ? 'yes' : 'no')" 2>/dev/null)
+echo "does the x_push_demo application ($PROJECT_SCOPE_ID) exist on the instance? $APP_EXISTS"
+author_record Own
+if [ -n "$NEWID" ]; then
+  if [ "$APP_EXISTS" != "yes" ]; then
+    note "the app is NOT on the instance (this project was only init-ed locally), so push must refuse up front."
+    note "EXPECTED: 'the application x_push_demo ... does not exist on this instance', nothing written"
+    $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
+    echo "exit=$? (non-zero expected)"
+    note "Whether the PLATFORM supports creating in an app's scope is answered by the spike's"
+    note "'a create run AS <scope> (sysparm_transaction_scope) lands in it' line in phase 2."
+  else
+    note "push, no flag — EXPECTED one of:"
+    note "  'created in x_push_demo (run as that application)'  — the instance honours sysparm_transaction_scope"
+    note "  'ignored sysparm_transaction_scope ... deleted again' — it does not; nothing is left behind"
+    $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --dry-run
+    $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
+    echo "push exit=$?"
+    note "on the instance — EXPECTED: sys_scope $PROJECT_SCOPE_ID and api_name x_push_demo.$AUTHORED, or no record at all"
+    now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$NEWID" -f sys_id,api_name,sys_scope,description
+    note "edit and push again — EXPECTED (only if it was created): a plain update, 'updated (1 field(s))'"
+    sed -i.bak "s/now-fluent live-validate — safe to delete/EDITED IN OWN SCOPE/" "$SRC" && rm -f "$SRC.bak"
+    $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
+    echo "push exit=$?"
+    delete_record "$NEWID"
+  fi
   rm -f "$SRC"
-else
-  echo "Now.ID gave it sys_id: $NEWID (api_name in source: x_push_demo.$AUTHORED)"
+fi
 
-  note "push, no flag — EXPECTED: REFUSED ('cannot put it in scope'), naming --target-scope global"
-  $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
-  echo "exit=$? (non-zero expected)"
-
+# ---------------------------------------------------------------------------
+hr "PHASE 4d — a record AUTHORED in the scoped project, pushed to GLOBAL on purpose"
+author_record Global
+if [ -n "$NEWID" ]; then
   note "push --target-scope x_other — EXPECTED: refused before any request, pointing at update-set-package"
   $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --target-scope x_other
   echo "exit=$? (non-zero expected)"
 
-  note "push --dry-run --target-scope global — EXPECTED: 'would POST', nothing created"
+  note "push --dry-run --target-scope global — EXPECTED: 'would POST' (no transaction scope), nothing created"
   $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --target-scope global --dry-run
 
-  note "push --target-scope global FOR REAL — EXPECTED: created, 'landed in GLOBAL', api_name global.$AUTHORED,"
-  note "and 'Recorded as adopted' so the next push goes there too"
+  note "push --target-scope global — EXPECTED: created, 'landed in GLOBAL', api_name global.$AUTHORED, 'Recorded as adopted'"
   $NF push --project . --auth "$AUTH" --sys-id "$NEWID" --target-scope global
   echo "push exit=$?"
+  now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$NEWID" -f sys_id,api_name,sys_scope
 
-  note "verify ON THE INSTANCE — EXPECTED: sys_id $NEWID (Now.ID kept), sys_scope global, api_name global.$AUTHORED"
-  now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$NEWID" -f sys_id,name,api_name,sys_scope,description
-
-  note "edit it and push AGAIN, no flag — EXPECTED: 'pushing it back there', 'updated (1 field(s))'"
-  note "(before the fix, every push after a --target-scope create was refused by the scope guard)"
-  sed -i.bak "s/now-fluent live-validate 4c — safe to delete/EDITED AFTER CREATE/" "$SRC" && rm -f "$SRC.bak"
+  note "edit and push AGAIN, no flag — EXPECTED: 'pushing it back there', 'updated (1 field(s))', still Global"
+  sed -i.bak "s/now-fluent live-validate — safe to delete/EDITED AFTER CREATE/" "$SRC" && rm -f "$SRC.bak"
   $NF push --project . --auth "$AUTH" --sys-id "$NEWID"
   echo "push exit=$?"
   now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$NEWID" -f api_name,sys_scope,description
 
-  # Clean up: the record on the instance, and the throwaway source.
-  node --input-type=module -e "
-import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
-await snRequest(resolveInstance('$AUTH'), 'DELETE', '/api/now/table/sys_script_include/$NEWID', { allow404: true, throwOnError: true })
-console.log('deleted authored sys_script_include $NEWID')" || echo "could not delete $NEWID — remove it in the UI"
+  delete_record "$NEWID"
   rm -f "$SRC"
 fi
 

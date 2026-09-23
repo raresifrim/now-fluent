@@ -40,7 +40,10 @@ test('an instance like the live one passes, reporting its capabilities as answer
   assert.equal(status, 0, 'capability "no"s must not fail the run')
   assert.match(output, /LOAD-BEARING — push is unsafe if any fail: (\d+)\/\1 hold/)
   assert.match(output, /NO {3}\[scope:sn_sow\] sys_scope on a write is honoured/)
-  assert.match(output, /push REFUSES scoped creates/, 'each "no" should say what push does about it')
+  // Like the live instance: the body's sys_scope AND the transaction scope are ignored —
+  // and the scope line must not contradict the transaction-scope line.
+  assert.match(output, /running the create AS the application does not help either/,
+    'each "no" should say what push does about it, consistently')
   assert.match(output, /NO {3}the session update set preference steers capture/)
   assert.match(output, /push is safe against this instance/)
 })
@@ -65,4 +68,18 @@ test('the spike cleans up every record it created', async () => {
   const leftovers = [...instance.store.keys()].filter((key) =>
     key.startsWith('sys_script_include/') || key.startsWith('sys_update_set/'))
   assert.deepEqual(leftovers, [], 'throwaway records must be deleted')
+})
+
+test('the spike reports whether a create can run AS the scope, and cleans that record up', async () => {
+  const honoured = await spike({ honoursTransactionScope: true }, '--scope', 'sn_sow')
+  assert.equal(honoured.status, 0)
+  assert.match(honoured.output, /yes {2}\[scope:sn_sow\] a create run AS sn_sow \(sysparm_transaction_scope\) lands in it/)
+  assert.match(honoured.output, /running the create AS the application works/, 'and the scope line agrees')
+
+  const ignored = await spike({}, '--scope', 'sn_sow')
+  assert.equal(ignored.status, 0, 'a capability "no", not a failure')
+  assert.match(ignored.output, /NO {3}\[scope:sn_sow\] a create run AS sn_sow/)
+  assert.match(ignored.output, /push cannot create records in a project's own scope here/)
+  const leftovers = [...ignored.instance.store.keys()].filter((key) => key.startsWith('sys_script_include/'))
+  assert.deepEqual(leftovers, [], 'the probe record is deleted too')
 })

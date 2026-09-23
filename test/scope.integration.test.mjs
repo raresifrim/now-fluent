@@ -60,11 +60,12 @@ async function push(...args) {
   }
 }
 
-test('refuses to CREATE a scoped record, instead of silently making it Global', async () => {
+test('refuses to CREATE a record in a scope that is neither Global nor the project\'s own', async () => {
+  // This project has no now.config.json, so its artifact's scope is not "its own".
   const result = await push('--sys-id', SYS_ID)
   assert.notEqual(result.status, 0)
   const output = result.stdout + result.stderr
-  assert.match(output, /cannot put it in scope/)
+  assert.match(output, /neither Global nor this project's own/)
   assert.match(output, /--target-scope global/, 'should name the explicit opt-in')
   assert.deepEqual(instance.writes(), [], 'nothing may be written')
 })

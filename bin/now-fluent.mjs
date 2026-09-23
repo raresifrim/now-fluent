@@ -197,13 +197,21 @@ Enhanced commands (handled by now-fluent):
       do pass is validated against it. --all pushes every built record, selected with
       the same --include/--exclude substring tokens as update-set-package.
       SCOPE (verified live): sys_scope is INERT on a Table API write. The platform
-      puts the record in the scope the REST transaction runs in — Global — and
-      rewrites api_name to match. push therefore cannot choose a destination scope:
+      puts the record in the scope the REST transaction runs in — Global unless
+      push runs it as an application — and rewrites api_name to match. So:
         - updating an existing record is unaffected (its scope is already set);
-        - CREATING a record whose artifact is scoped is REFUSED, because it would
-          land in Global and leave the project and the instance disagreeing;
+        - CREATING a record in the PROJECT's own scope runs the create AS that
+          application (?sysparm_transaction_scope=<app>, as the SDK itself does)
+          — but only after checking, once per run, that this instance honours
+          that: a throwaway inactive script include is created as the app, read
+          back and deleted. If it did not land in the app, no record of yours is
+          created. The real create is verified too. The app must exist on the
+          instance, and tables/columns (sys_db_object, sys_dictionary) are never
+          created this way;
+        - CREATING a record in any OTHER scope is refused;
         - --target-scope global says "yes, I want it in Global anyway" and creates
           it, reporting the scope and api_name it actually got;
+        - --target-scope <project's own scope> is the same as the default above;
         - --target-scope <anything else> is refused: this transport cannot do it.
           Use update-set-package, whose payload carries sys_scope.
       Every write reads the scope back and FAILS the record if it landed elsewhere.
@@ -3249,6 +3257,41 @@ async function findPreferenceId(instance, userId) {
   return Array.isArray(rows) && rows.length ? rows[0].sys_id : ''
 }
 
+// Tables whose INSERT builds physical schema. push will not create these in a project's
+// scope: if the create landed in the wrong scope, deleting the record would drop the
+// table or column it just built.
+const SCHEMA_TABLES = new Set(['sys_db_object', 'sys_dictionary'])
+
+// Does this instance create a record AS an application when asked? Answered with a
+// throwaway, inactive script include — created as the app, read back, always deleted —
+// so no record of the user's is ever created on a guess.
+async function probeOwnScopeCreate(instance, project, scopeId) {
+  const probeId = randomUUID().replace(/-/g, '')
+  const name = `NowFluentScopeProbe${probeId.slice(0, 8)}`
+  console.log(`Checking once whether this instance creates records AS ${scopeLabel(project, scopeId)}: a throwaway, `
+    + 'inactive script include is created, read back and deleted.')
+  await snRequest(instance, 'POST', '/api/now/table/sys_script_include', {
+    body: { sys_id: probeId, name, script: `var ${name} = Class.create();`, active: 'false',
+      description: 'now-fluent scope probe — safe to delete' },
+    params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: scopeId },
+    throwOnError: true
+  })
+  let landed = ''
+  try {
+    const row = await snGetRecord(instance, 'sys_script_include', probeId, 'sys_id,sys_scope', { throwOnError: true })
+    landed = row ? scopeOf(row) : ''
+  } finally {
+    try {
+      await snRequest(instance, 'DELETE', `/api/now/table/sys_script_include/${probeId}`, { allow404: true, throwOnError: true })
+    } catch (error) {
+      throw new Error(`could not delete the scope probe record sys_script_include ${probeId} — delete it by hand `
+        + `(${error && error.message ? error.message : error})`)
+    }
+  }
+  console.log(`  -> ${landed === scopeId ? 'yes' : `no (it landed in ${scopeLabel(project, landed) || 'an unreadable scope'})`}`)
+  return { works: Boolean(landed) && landed === scopeId, landed }
+}
+
 // Push ONE built record. Returns the bucket it belongs in; throws on a transport
 // error so the caller can record the failure and carry on with the next record.
 //
@@ -3370,18 +3413,69 @@ async function pushRecord(target, label, context) {
   const method = creating ? 'POST' : 'PUT'
   const path = creating ? `/api/now/table/${table}` : `/api/now/table/${table}/${sysId}`
 
-  // ---- a create cannot choose its scope, so do not let it choose wrongly ---
+  // ---- a create in the PROJECT's own scope runs AS that application ------------
+  // sys_scope in the body is inert (verified live), but a REST transaction can run AS
+  // an application: ?sysparm_transaction_scope=<app sys_id> is how the SDK itself does it
+  // (flow activation). Whether the Table API honours it is instance-dependent, and a
+  // wrong create is NOT safely undoable — deleting a record does not undo what its insert
+  // triggered. So the question is answered BEFORE any record of yours is created: once
+  // per run, a throwaway inactive script include is created as the app, read back and
+  // deleted. Only if it landed in the app is the real create sent (and still verified).
   const artifactScope = scopeOf(fields)
-  const targetScope = flags['target-scope']
-  if (creating && artifactScope && artifactScope !== GLOBAL_SCOPE_ID && targetScope !== GLOBAL_SCOPE_ID) {
-    console.error(`${label} REFUSED: this record does not exist yet, and a Table API create cannot put it `
-      + `in scope ${scopeLabel(project, artifactScope)}.\n`
-      + '      sys_scope is inert on a REST write — the record would be created in GLOBAL and the platform\n'
-      + '      would rewrite its api_name, leaving this project and the instance disagreeing.\n'
-      + '      Either promote it with update-set-package (which sets the scope in the payload), or, if you\n'
+  // commandPush accepts --target-scope global or this project's own scope, which is
+  // the default for a project-scoped create anyway.
+  const targetScope = flags['target-scope'] === GLOBAL_SCOPE_ID ? GLOBAL_SCOPE_ID : undefined
+  const ownScope = projectScopeOf(project)
+  const createInOwnScope = Boolean(creating && artifactScope && ownScope && ownScope.scopeId !== GLOBAL_SCOPE_ID
+    && artifactScope === ownScope.scopeId && targetScope !== GLOBAL_SCOPE_ID)
+  if (creating && artifactScope && artifactScope !== GLOBAL_SCOPE_ID && targetScope !== GLOBAL_SCOPE_ID
+    && !createInOwnScope) {
+    console.error(`${label} REFUSED: this record does not exist yet, and it is in scope `
+      + `${scopeLabel(project, artifactScope)}, which is neither Global nor this project's own.\n`
+      + "      push creates records only in the project's scope (run as that application) or in Global.\n"
+      + '      Promote it with update-set-package (which sets the scope in the payload), or, if you\n'
       + '      really do want it in Global, say so: --target-scope global')
     return 'failed'
   }
+  if (createInOwnScope && SCHEMA_TABLES.has(table)) {
+    console.error(`${label} REFUSED: push does not create ${table} records. Their insert builds physical schema\n`
+      + '      (a table or a column), which could not be cleanly undone if the create landed in the wrong scope.\n'
+      + '      Create it with now-fluent install or update-set-package; push can UPDATE it afterwards.')
+    return 'failed'
+  }
+  if (createInOwnScope) {
+    // A record can only live in the project's scope if that APPLICATION exists there.
+    // Cached only once answered: a failed lookup must not condemn every later record.
+    if (context.ownAppExists === undefined) {
+      context.ownAppExists = Boolean(await snGetRecord(instance, 'sys_scope', artifactScope, 'sys_id,scope', { throwOnError: true }))
+    }
+    if (!context.ownAppExists) {
+      console.error(`${label} REFUSED: the application ${scopeLabel(project, artifactScope)} (sys_id ${artifactScope}, from `
+        + 'now.config.json) does not exist on this instance, so nothing can be created in it.\n'
+        + "      Create the application there first — or, if it exists under another sys_id, fix now.config.json's\n"
+        + '      scopeId. push creates records INSIDE an existing app; it does not create the app.')
+      return 'failed'
+    }
+    if (!dryRun) {
+      if (context.ownScopeProbe === undefined) {
+        context.ownScopeProbe = await probeOwnScopeCreate(instance, project, artifactScope)
+      }
+      const probe = context.ownScopeProbe
+      if (!probe.works) {
+        console.error(`${label} REFUSED: this instance does not create records AS ${scopeLabel(project, artifactScope)}.\n`
+          + (probe.landed
+            ? `      A throwaway probe record run as that application landed in ${scopeLabel(project, probe.landed)} — `
+              + 'sysparm_transaction_scope is ignored here.\n'
+            : '      The probe record could not be read back, so this could not be verified.\n')
+          + '      No record of yours was created. Create new records in your own scope with now-fluent install or\n'
+          + '      update-set-package; push can still UPDATE them once they exist.')
+        return 'failed'
+      }
+    }
+  }
+  const writeParams = createInOwnScope
+    ? { sysparm_fields: 'sys_id', sysparm_transaction_scope: artifactScope }
+    : { sysparm_fields: 'sys_id' }
 
   // ---- an update cannot change scope, so a mismatch means the SOURCE is wrong ----
   // Checked BEFORE the write. Afterwards is too late: the body carries the source's
@@ -3403,12 +3497,16 @@ async function pushRecord(target, label, context) {
   }
 
   if (dryRun) {
-    console.log(`${label} would ${method} ${instance.origin}${path}  (${Object.keys(body).length} field(s))\n`
+    const scoped = createInOwnScope
+      ? `?sysparm_transaction_scope=${artifactScope}  — run as ${scopeLabel(project, artifactScope)} (a real run first `
+        + 'checks, with a throwaway probe record, that this instance honours that)'
+      : ''
+    console.log(`${label} would ${method} ${instance.origin}${path}${scoped}  (${Object.keys(body).length} field(s))\n`
       + previewPayload(body))
     return creating ? 'created' : 'updated'
   }
 
-  await snRequest(instance, method, path, { body, params: { sysparm_fields: 'sys_id' }, throwOnError: true })
+  await snRequest(instance, method, path, { body, params: writeParams, throwOnError: true })
 
   // Refresh the baseline from what the instance now holds, so the next push diffs
   // against reality (business rules may have changed fields on the way in). The WRITE
@@ -3435,6 +3533,39 @@ async function pushRecord(target, label, context) {
   // Never trust the write: read the scope back. After the pre-write guards this only
   // fires on a create, or on an instance that does something unexpected.
   const landedScope = written ? scopeOf(written) : ''
+
+  let createdNote = ''
+  if (createInOwnScope) {
+    if (!landedScope) {
+      // Nothing to judge by: do not delete what might be right, and do not call it done.
+      console.error(`${label} CREATED, but its scope could not be read back, so it is UNVERIFIED. Check that sys_id `
+        + `${sysId} is in ${scopeLabel(project, artifactScope)} before relying on it.`)
+      return 'failed'
+    }
+    if (landedScope !== artifactScope) {
+      // The probe said this works, yet this record landed elsewhere (a table-specific
+      // difference). Undo our own create — but honestly: a delete does not undo what the
+      // insert triggered.
+      let undone = false
+      try {
+        await snRequest(instance, 'DELETE', `/api/now/table/${table}/${sysId}`, { allow404: true, throwOnError: true })
+        undone = true
+      } catch (error) {
+        console.error(`${label} COULD NOT roll back: ${error && error.message ? error.message : error}`)
+      }
+      removeBaseline(project, table, sysId)
+      console.error(`${label} REFUSED by the instance: although a probe record landed in ${scopeLabel(project, artifactScope)}, `
+        + `this ${table} record was created in ${scopeLabel(project, landedScope)}.\n`
+        + (undone
+          ? '      It was deleted again. Anything its insert triggered (business rules) is NOT undone, and the\n'
+            + '      insert and the delete may both appear in your current update set.\n'
+          : `      It is STILL THERE in ${scopeLabel(project, landedScope)} — delete sys_id ${sysId} by hand.\n`)
+        + `      Create ${table} records in your own scope with now-fluent install or update-set-package.`)
+      return 'failed'
+    }
+    createdNote = ` in ${scopeLabel(project, artifactScope)} (run as that application)`
+  }
+
   if (artifactScope && landedScope && landedScope !== artifactScope) {
     const apiNameNote = written.api_name ? ` Its api_name is now "${written.api_name}".` : ''
     if (targetScope === GLOBAL_SCOPE_ID && landedScope === GLOBAL_SCOPE_ID) {
@@ -3462,7 +3593,7 @@ async function pushRecord(target, label, context) {
     }
   }
 
-  console.log(`${label} ${creating ? 'created' : 'updated'} (${Object.keys(body).length} field(s))`)
+  console.log(`${label} ${creating ? 'created' : 'updated'}${createdNote} (${Object.keys(body).length} field(s))`)
   if (writtenRecords) writtenRecords.push({ table, sysId })
   return creating ? 'created' : 'updated'
 }
@@ -3548,14 +3679,18 @@ async function commandPush(flags, config, positional) {
   // Only Global is reachable: the Table API runs the write in its own scope, so
   // "put it in x_other" is not something this transport can be asked for.
   const targetScope = flags['target-scope']
-  if (targetScope && targetScope !== GLOBAL_SCOPE_ID) {
-    fail(`--target-scope ${targetScope} is not possible through the Table API: a REST write always lands in `
-      + 'Global, and sys_scope is ignored.\n'
+  const ownForTarget = projectScopeOf(project)
+  const targetIsOwn = Boolean(targetScope && ownForTarget
+    && (targetScope === ownForTarget.scope || targetScope === ownForTarget.scopeId))
+  if (targetScope && targetScope !== GLOBAL_SCOPE_ID && !targetIsOwn) {
+    const own = ownForTarget && ownForTarget.scopeId !== GLOBAL_SCOPE_ID ? ` or this project's own scope (${ownForTarget.scope})` : ''
+    fail(`--target-scope ${targetScope} is not possible through the Table API: the body's sys_scope is ignored, and `
+      + "push can run a create only as THIS project's application.\n"
       + `  To put records in ${targetScope}, build an update set for it — that payload carries the scope and `
       + 'import/preview/commit honours it:\n'
       + `    now-fluent update-set-package --project <p> --update-set-name "<name>" --scope ${targetScope} `
       + '--scope-id <sys_id> --build-local\n'
-      + '  --target-scope global is the only value this transport can actually deliver.')
+      + `  --target-scope accepts global${own}.`)
   }
 
   // Even a dry run reads the instance: it is "everything except the write".
