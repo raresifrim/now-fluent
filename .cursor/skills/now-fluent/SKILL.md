@@ -25,7 +25,7 @@ Use **`now-fluent`** instead of raw **`now-sdk`** unless the user explicitly ask
 5. **Artifacts:** `dist/app/update/*.xml` are build artifacts, NOT an update set. Only `update-set-*.xml` from `update-set-package` is a real importable update set.
 6. Never ask the user to paste passwords, tokens, or secrets — use `now-fluent auth --add <url>` and let them complete SDK auth.
 7. **`push` writes records to the instance.** Treat it like `install`: never run it without explicit approval. `push --dry-run` is safe — use it to show exactly what would be written, then ask.
-8. Before the first real `push` against an instance, run `npm run verify-push -- --auth <alias> [--scope <scope>]` from the now-fluent repo.
+8. Before the first real `push` against an instance, run `now-fluent verify-push --auth <alias> [--scope <scope>]` (it writes and deletes throwaway records).
 
 ## Discovery
 

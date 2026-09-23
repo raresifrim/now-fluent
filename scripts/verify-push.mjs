@@ -6,7 +6,8 @@
 // exact transport push uses (now-sdk's stored credential -> /api/now/table), creates
 // throwaway sys_script_include records, checks each assumption, and deletes them again.
 //
-//   node scripts/verify-push.mjs --auth <alias> [--scope <scope|sys_id>] [--keep]
+//   now-fluent verify-push --auth <alias> [--scope <scope|sys_id>] [--keep]
+//   (or, inside this repo: node scripts/verify-push.mjs ...)
 //
 //   --auth    credential alias, as stored by "now-fluent auth --add"
 //   --scope   also run the whole thing inside this application scope (name like
@@ -27,7 +28,7 @@ const has = (name) => argv.includes(`--${name}`)
 
 const auth = flag('auth')
 if (!auth) {
-  console.error('Usage: node scripts/verify-push.mjs --auth <alias> [--scope <scope|sys_id>] [--keep]')
+  console.error('Usage: now-fluent verify-push --auth <alias> [--scope <scope|sys_id>] [--keep]')
   process.exit(2)
 }
 const scopeRef = flag('scope')

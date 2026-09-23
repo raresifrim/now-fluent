@@ -20,7 +20,7 @@ The official ServiceNow SDK plugin/skills may also be installed. Use those for S
 6. Distinguish the artifacts: the raw `dist/app/update/*.xml` files are SDK `<record_update>` build artifacts and are NOT an update set; only the `update-set-*.xml` produced by `update-set-package` is a real, importable ServiceNow update set.
 7. Use `update-set-package` when the user wants an importable update set / manual governance path instead of an SDK install. It only writes files locally — import, preview, and commit stay manual steps in ServiceNow.
 8. `push` is the ONLY command that writes records to an instance. Treat it like `install`: do not run it without explicit user approval. `push --dry-run` only READS the instance and is always safe; it needs no approval.
-9. Before relying on `push` against an instance for the first time, run `npm run verify-push -- --auth <alias> [--scope <scope>]`. It checks, live: that a Table API PUT merges rather than replaces (confirmed), that an insert honours a supplied sys_id (confirmed), whether `sys_scope` is honoured (on the instance tested: NO — creates land in Global), the account's current application (a write naming no scope runs there), whether a create run AS Global / AS the app lands there and can be updated and deleted again (with `--scope`; on the instance tested: AS Global and AS the app both land — YES; updating an app's record AS Global — NO, 403), and whether update-set capture can be steered by the session preference (on the instance tested: NO).
+9. Before relying on `push` against an instance for the first time, run `now-fluent verify-push --auth <alias> [--scope <scope>]` (it writes and deletes throwaway records, so ask first). It checks, live: that a Table API PUT merges rather than replaces (confirmed), that an insert honours a supplied sys_id (confirmed), whether `sys_scope` is honoured (on the instance tested: NO — creates land in Global), the account's current application (a write naming no scope runs there), whether a create run AS Global / AS the app lands there and can be updated and deleted again (with `--scope`; on the instance tested: AS Global and AS the app both land — YES; updating an app's record AS Global — NO, 403), and whether update-set capture can be steered by the session preference (on the instance tested: NO).
 
 ## Forwarded now-sdk commands
 
@@ -43,6 +43,8 @@ The SDK executable defaults to `now-sdk`; override with `NOW_FLUENT_SDK` (e.g. `
 ```bash
 now-fluent doctor          # now-fluent + node + now-sdk versions, whether now-sdk has `query`,
                            # and whether push/pull can resolve instance credentials
+now-fluent verify-push --auth <alias> [--scope <scope>]
+                           # live check of what push relies on (writes + deletes throwaway records)
 now-fluent help            # now-fluent's own help
 now-fluent move --help     # forwarded to now-sdk for exact syntax
 now-fluent transform --help
