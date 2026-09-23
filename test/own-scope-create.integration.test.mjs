@@ -213,3 +213,46 @@ test('if the project\'s application does not exist on the instance, say so — d
     assert.match(result.output, /the application x_push_demo .* does not exist on this instance/)
     assert.deepEqual(instance.writes(), [], 'no probe either')
   }, { appExists: false }))
+
+// Seen live (sn_sow): a record inside an application refused a DELETE run from Global.
+test('an app that refuses deletes from Global: the probe is deleted AS the application', () =>
+  withInstance({ honoursTransactionScope: true, protectedFromGlobal: true }, async (instance) => {
+    const result = await push(instance, '--sys-id', NEW_ID)
+    assert.equal(result.status, 0, result.output)
+    const del = instance.writes().find((w) => w.method === 'DELETE')
+    assert.equal(del.params.sysparm_transaction_scope, PROJECT_SCOPE_ID)
+    assert.ok(![...instance.store.keys()].some((k) => k !== `sys_script_include/${NEW_ID}` && k.startsWith('sys_script_include/')),
+      'the probe record is gone')
+  }))
+
+test('a probe that cannot be deleted is named, and NOT retried for every record', () =>
+  withInstance({ honoursTransactionScope: true, undeletableScopes: [PROJECT_SCOPE_ID] }, async (instance) => {
+    const second = 'ff66cd34ef56ab12cd34ef56ab12cd34'
+    writeArtifact('sys_script_include', second, 'second')
+    const result = await push(instance, '--sys-id', `${NEW_ID},${second}`)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /could not delete the scope probe record sys_script_include [0-9a-f]{32} — delete it by hand/)
+    const probes = instance.writes().filter((w) => w.method === 'POST' && /ScopeProbe/.test(w.body.name || ''))
+    assert.equal(probes.length, 1, 'one probe per run, even when it fails')
+    assert.ok(!instance.store.has(`sys_script_include/${NEW_ID}`) && !instance.store.has(`sys_script_include/${second}`),
+      'no record of yours was created')
+  }))
+
+test('--allow-delete of a record in the project\'s app runs the delete AS the application', () =>
+  withInstance({ protectedFromGlobal: true }, async (instance) => {
+    mkdirSync(join(project, 'dist', 'app', 'update'), { recursive: true })
+    writeFileSync(join(project, 'dist', 'app', 'update', `sys_script_include_${NEW_ID}.xml`),
+      `<record_update table="sys_script_include"><sys_script_include action="DELETE">`
+      + `<sys_id>${NEW_ID}</sys_id><sys_scope>${PROJECT_SCOPE_ID}</sys_scope></sys_script_include></record_update>`)
+    instance.store.set(`sys_script_include/${NEW_ID}`, { sys_id: NEW_ID, sys_scope: PROJECT_SCOPE_ID, name: 'Aee55',
+      sys_updated_on: '2026-01-01 00:00:00', sys_mod_count: '0' })
+    mkdirSync(join(project, '.now-fluent', 'state'), { recursive: true })
+    writeFileSync(join(project, '.now-fluent', 'state', `sys_script_include_${NEW_ID}.json`), JSON.stringify({
+      table: 'sys_script_include', sys_id: NEW_ID, instance: instance.origin,
+      sys_updated_on: '2026-01-01 00:00:00', sys_mod_count: '0', fields: { sys_id: NEW_ID, sys_scope: PROJECT_SCOPE_ID }
+    }))
+    const result = await push(instance, '--sys-id', NEW_ID, '--allow-delete', '--no-build')
+    assert.equal(result.status, 0, result.output)
+    assert.match(result.output, /deleted/)
+    assert.ok(!instance.store.has(`sys_script_include/${NEW_ID}`))
+  }))

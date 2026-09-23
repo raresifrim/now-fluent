@@ -16,7 +16,7 @@
 // Exit code is 0 only if every assumption holds.
 
 import { randomBytes } from 'node:crypto'
-import { resolveInstance, snRequest, snGetRecord, RAW_READ_PARAMS } from '../bin/now-fluent.mjs'
+import { resolveInstance, snRequest, snGetRecord, snDeleteRecord, RAW_READ_PARAMS } from '../bin/now-fluent.mjs'
 
 const argv = process.argv.slice(2)
 const flag = (name) => {
@@ -132,7 +132,8 @@ async function exercise(instance, label, scope) {
       record(`${label}/transaction-scope`, `[${label}] a create run AS ${scope.scope} (sysparm_transaction_scope) lands in it`,
         false, `the create itself was refused: ${reason(viaTx.error)}`, 'capability')
     } else {
-      created.push({ table: 'sys_script_include', sysId: scopedId })
+      const tracked = { table: 'sys_script_include', sysId: scopedId, scope: scope.sys_id }
+      created.push(tracked)
       const landedTx = await snGetRecord(instance, 'sys_script_include', scopedId, undefined, THROW)
       const scopeTx = landedTx ? landedTx.sys_scope : ''
       record(`${label}/transaction-scope`, `[${label}] a create run AS ${scope.scope} (sysparm_transaction_scope) lands in it`,
@@ -143,6 +144,19 @@ async function exercise(instance, label, scope) {
             ? `sys_scope: ${scopeTx}, api_name: ${landedTx.api_name}`
             : `ignored: landed in "${scopeTx}", api_name "${landedTx.api_name}".`,
         'capability')
+      // push deletes its scope probe again, so that delete must work too. A record inside an
+      // application can refuse a delete run from Global (seen live: HTTP 403 in sn_sow).
+      if (scopeTx) tracked.scope = scopeTx
+      if (scopeTx && scopeTx !== 'global') {
+        const removed = await probe(() => snDeleteRecord(instance, 'sys_script_include', scopedId, scopeTx))
+        if (removed.ok) created.splice(created.indexOf(tracked), 1)
+        record(`${label}/delete-as-app`, `[${label}] a record created AS ${scope.scope} can be deleted again`,
+          removed.ok,
+          removed.ok
+            ? (removed.value === 'as-app' ? 'deleted, run as the application' : 'deleted from Global')
+            : `refused both as the application and from Global: ${reason(removed.error)}`,
+          'capability')
+      }
     }
   }
 
@@ -294,7 +308,7 @@ if (keep) {
 } else if (created.length) {
   console.log('\n--- cleanup ---')
   for (const item of [...created].reverse()) {
-    const removed = await probe(() => snRequest(instance, 'DELETE', `/api/now/table/${item.table}/${item.sysId}`, { ...THROW, allow404: true }))
+    const removed = await probe(() => snDeleteRecord(instance, item.table, item.sysId, item.scope))
     console.log(`  ${removed.ok ? 'deleted' : `COULD NOT DELETE (${reason(removed.error)})`} ${item.table} ${item.sysId}`)
   }
 }
@@ -319,8 +333,10 @@ const ADAPTATION = {
     + '            on a mismatch. Use update-set-package when changes must be in a specific set.',
   capture: 'push produces no update set here; promote with update-set-package.',
   write: 'push gets a 403 per record in this scope, reports it with a hint, and carries on.',
-  'transaction-scope': 'push cannot create records in a project\'s own scope here: it tries, sees the record land in\n'
-    + '            Global, and deletes it again. Create them with install or update-set-package; push still UPDATES them.',
+  'transaction-scope': 'push cannot create records in a project\'s own scope here: its once-per-run probe finds that\n'
+    + '            out and refuses, creating none of yours. Use install or update-set-package; push still UPDATES them.',
+  'delete-as-app': 'push could not clean up its own scope probe here, so it refuses own-scope creates after the first\n'
+    + '            attempt (and names the probe record to delete by hand). Use install or update-set-package.',
   'update-set': 'the probe itself failed — check capture by hand.'
 }
 

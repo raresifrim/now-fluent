@@ -601,6 +601,30 @@ function resolveInstance(auth) {
   return instance
 }
 
+// Delete one record. A record that lives in an application can refuse a delete run from
+// Global (verified live: HTTP 403 on a record created in sn_sow), so a record in a non-Global
+// scope is deleted AS that application first, and from Global only if that fails. Returns
+// how it went ('as-app' | 'global'); throws, naming both attempts, if neither worked.
+async function snDeleteRecord(instance, table, sysId, scopeId) {
+  const path = `/api/now/table/${table}/${sysId}`
+  if (!scopeId || scopeId === 'global') {
+    await snRequest(instance, 'DELETE', path, { allow404: true, throwOnError: true })
+    return 'global'
+  }
+  try {
+    await snRequest(instance, 'DELETE', path, { params: { sysparm_transaction_scope: scopeId }, allow404: true, throwOnError: true })
+    return 'as-app'
+  } catch (asApp) {
+    try {
+      await snRequest(instance, 'DELETE', path, { allow404: true, throwOnError: true })
+      return 'global'
+    } catch (fromGlobal) {
+      throw new Error(`as its application: ${asApp && asApp.message ? asApp.message : asApp}; `
+        + `from Global: ${fromGlobal && fromGlobal.message ? fromGlobal.message : fromGlobal}`)
+    }
+  }
+}
+
 // One Table API call. Returns the `result` payload, or null for an allowed 404.
 // An HTTP failure normally ends the run (`fail`); pass throwOnError to get an Error
 // instead, so a caller can keep going — push does that per record, and the Phase 0
@@ -3282,7 +3306,7 @@ async function probeOwnScopeCreate(instance, project, scopeId) {
     landed = row ? scopeOf(row) : ''
   } finally {
     try {
-      await snRequest(instance, 'DELETE', `/api/now/table/sys_script_include/${probeId}`, { allow404: true, throwOnError: true })
+      await snDeleteRecord(instance, 'sys_script_include', probeId, landed || scopeId)
     } catch (error) {
       throw new Error(`could not delete the scope probe record sys_script_include ${probeId} — delete it by hand `
         + `(${error && error.message ? error.message : error})`)
@@ -3379,7 +3403,7 @@ async function pushRecord(target, label, context) {
       console.log(`${label} would DELETE ${instance.origin}/api/now/table/${table}/${sysId}`)
       return 'deleted'
     }
-    await snRequest(instance, 'DELETE', `/api/now/table/${table}/${sysId}`, { allow404: true, throwOnError: true })
+    await snDeleteRecord(instance, table, sysId, scopeOf(live))
     removeBaseline(project, table, sysId)
     setAdoption(project, sysId, null)
     console.log(`${label} deleted`)
@@ -3458,12 +3482,20 @@ async function pushRecord(target, label, context) {
     }
     if (!dryRun) {
       if (context.ownScopeProbe === undefined) {
-        context.ownScopeProbe = await probeOwnScopeCreate(instance, project, artifactScope)
+        // Asked once per run whatever the outcome: a probe that failed (e.g. could not be
+        // deleted again) must not be retried per record, leaving one more behind each time.
+        try {
+          context.ownScopeProbe = await probeOwnScopeCreate(instance, project, artifactScope)
+        } catch (error) {
+          context.ownScopeProbe = { works: false, landed: '', error: error && error.message ? error.message : String(error) }
+        }
       }
       const probe = context.ownScopeProbe
       if (!probe.works) {
-        console.error(`${label} REFUSED: this instance does not create records AS ${scopeLabel(project, artifactScope)}.\n`
-          + (probe.landed
+        console.error(`${label} REFUSED: ${probe.error
+          ? `the check whether this instance creates records AS ${scopeLabel(project, artifactScope)} failed: ${probe.error}`
+          : `this instance does not create records AS ${scopeLabel(project, artifactScope)}.`}\n`
+          + (probe.error ? '' : probe.landed
             ? `      A throwaway probe record run as that application landed in ${scopeLabel(project, probe.landed)} — `
               + 'sysparm_transaction_scope is ignored here.\n'
             : '      The probe record could not be read back, so this could not be verified.\n')
@@ -3548,7 +3580,7 @@ async function pushRecord(target, label, context) {
       // insert triggered.
       let undone = false
       try {
-        await snRequest(instance, 'DELETE', `/api/now/table/${table}/${sysId}`, { allow404: true, throwOnError: true })
+        await snDeleteRecord(instance, table, sysId, landedScope)
         undone = true
       } catch (error) {
         console.error(`${label} COULD NOT roll back: ${error && error.message ? error.message : error}`)
@@ -3903,5 +3935,5 @@ export {
   maskCdata, unmaskCdata, parseFieldElements, parseRecordUpdateRecords, recordFieldsToPayload,
   recordJsonToXml, parseAuthHosts, parseHeaderLines, decodeXmlEntities, PUSH_READONLY_FIELDS,
   // used by scripts/verify-push.mjs so the spike exercises push's REAL transport
-  resolveInstance, snRequest, snGetRecord, RAW_READ_PARAMS
+  resolveInstance, snRequest, snGetRecord, snDeleteRecord, RAW_READ_PARAMS
 }

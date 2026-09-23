@@ -21,9 +21,13 @@ import { createServer } from 'node:http'
 // table-specific difference, which push's post-create check must still catch).
 // noScopeTables: tables whose rows are stored without a sys_scope, so a read-back
 // cannot tell where a record landed.
+// protectedFromGlobal:true models what was seen live in sn_sow: a record inside an
+// application refuses a DELETE run from any other scope (HTTP 403) and accepts one run
+// AS that application (?sysparm_transaction_scope). undeletableScopes: rows in these
+// scopes refuse every DELETE.
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
-  honoursTransactionScope = false, noScopeTables = []
+  honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = []
 } = {}) {
   const store = new Map(Object.entries(records))
   const log = []
@@ -106,6 +110,13 @@ export async function startMockInstance({
       return send(200, { result: { sys_id: sysId } })
     }
     if (req.method === 'DELETE') {
+      const row = store.get(key)
+      const rowScope = row && row.sys_scope
+      const runAs = url.searchParams.get('sysparm_transaction_scope') || 'global'
+      if (rowScope && (undeletableScopes.includes(rowScope)
+        || (protectedFromGlobal && rowScope !== 'global' && rowScope !== runAs))) {
+        return send(403, { error: { message: 'Operation Failed', detail: 'delete not permitted from this scope' } })
+      }
       store.delete(key)
       return send(204, {})
     }

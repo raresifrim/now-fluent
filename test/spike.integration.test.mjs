@@ -83,3 +83,21 @@ test('the spike reports whether a create can run AS the scope, and cleans that r
   const leftovers = [...ignored.instance.store.keys()].filter((key) => key.startsWith('sys_script_include/'))
   assert.deepEqual(leftovers, [], 'the probe record is deleted too')
 })
+
+test('an app that refuses deletes from Global (seen live in sn_sow): the record is deleted AS the app', async () => {
+  const { status, output, instance } = await spike({ honoursTransactionScope: true, protectedFromGlobal: true }, '--scope', 'sn_sow')
+  assert.equal(status, 0, output)
+  assert.match(output, /yes {2}\[scope:sn_sow\] a record created AS sn_sow can be deleted again/)
+  assert.doesNotMatch(output, /COULD NOT DELETE/)
+  const leftovers = [...instance.store.keys()].filter((key) => key.startsWith('sys_script_include/'))
+  assert.deepEqual(leftovers, [])
+})
+
+test('a record created AS the app that cannot be deleted at all is reported, with what push does about it', async () => {
+  const { status, output } = await spike({ honoursTransactionScope: true, undeletableScopes: ['5ca1bcb3733320103e366238edf6a706'] },
+    '--scope', 'sn_sow')
+  assert.equal(status, 0, 'a capability "no", not a failure')
+  assert.match(output, /NO {3}\[scope:sn_sow\] a record created AS sn_sow can be deleted again/)
+  assert.match(output, /push could not clean up its own scope probe here/)
+  assert.match(output, /COULD NOT DELETE [\s\S]*? sys_script_include [0-9a-f]{32}/, 'and cleanup names the leftover')
+})

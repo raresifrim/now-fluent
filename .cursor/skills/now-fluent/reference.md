@@ -59,7 +59,8 @@ the scope the REST transaction runs in (Global) and rewrites `api_name` to match
   only after a once-per-run throwaway probe record (always deleted) proves the instance
   honours that — otherwise it is refused and nothing is written; the real record is still
   verified (deleted + FAILED if it lands elsewhere); the app must exist; `sys_db_object` /
-  `sys_dictionary` creates are refused; not yet verified live (spike `transaction-scope`);
+  `sys_dictionary` creates are refused; verified live on one dev instance (spike
+  `transaction-scope` checks yours); deletes of in-app records run AS the app (Global gets 403);
 - a CREATE in any other scope is REFUSED;
 - `--target-scope global` is the explicit opt-in, and reports what it actually got;
 - `--target-scope <other>` (not global or the project's own) is refused — use `update-set-package --scope <scope>`;
