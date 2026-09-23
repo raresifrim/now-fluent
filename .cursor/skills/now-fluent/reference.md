@@ -88,7 +88,7 @@ One refused record does not abandon the rest of the run.
 **Not an update set commit.** A push runs business rules like a form edit; a commit does
 not. Use `update-set-package` to promote anything you do not own.
 
-**Verify first:** `npm run verify-push -- --auth <alias> [--scope <scope>]` proves, on a
+**Verify first:** `now-fluent verify-push --auth <alias> [--scope <scope>]` proves, on a
 real instance, that a Table API `PUT` merges rather than replaces, that an insert honours
 a supplied `sys_id`, and whether writes into the target scope are permitted at all.
 

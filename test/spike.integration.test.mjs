@@ -122,3 +122,29 @@ test('with the app picker on the tested scope (seen live), the spike says so and
   const leftovers = [...instance.store.keys()].filter((key) => key.startsWith('sys_script_include/'))
   assert.deepEqual(leftovers, [])
 })
+
+test('now-fluent verify-push runs the same check from ANY directory, exit code included', async () => {
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const cli = resolve(import.meta.dirname, '..', 'bin', 'now-fluent.mjs')
+  const elsewhere = mkdtempSync(join(tmpdir(), 'now-fluent-project-'))
+  const env = (instance) => ({ ...process.env, NOW_FLUENT_SDK: `${process.execPath} ${FAKE_SDK}`, FAKE_SDK_HOST: instance.origin })
+
+  const good = await startMockInstance({})
+  try {
+    const { stdout } = await run(process.execPath, [cli, 'verify-push', '--auth', 'test'], { cwd: elsewhere, encoding: 'utf8', env: env(good) })
+    assert.match(stdout, /push is safe against this instance/)
+  } finally {
+    await good.stop()
+  }
+
+  const broken = await startMockInstance({ putReplaces: true })
+  try {
+    await assert.rejects(
+      run(process.execPath, [cli, 'verify-push', '--auth', 'test'], { cwd: elsewhere, encoding: 'utf8', env: env(broken) }),
+      (error) => error.code === 1 && /push is NOT safe/.test(error.stdout))
+  } finally {
+    await broken.stop()
+  }
+})

@@ -51,6 +51,24 @@ Or run without linking:
 node ./bin/now-fluent.mjs help
 ```
 
+## Using it from Claude Code in your Fluent projects
+
+Claude Code reads a `CLAUDE.md` in the project root at the start of every session. This repo's `CLAUDE.md` is the full guide to now-fluent; to give a Fluent project the same knowledge, copy [`templates/fluent-project/CLAUDE.md`](templates/fluent-project/CLAUDE.md) into that project's root and fill it in:
+
+```markdown
+@/Users/you/src/now-fluent/CLAUDE.md      <- your clone; imports the full guide
+
+## This project
+- Instance alias: `dev`
+- Scope: `sn_hamp` (scopeId `...`), a ServiceNow scope this project is bound to
+- Promotion path: update sets only
+```
+
+- The `@` line **imports** now-fluent's `CLAUDE.md` rather than copying it, so every project picks up changes with a `git pull` here. The template adds a short section for what is specific to the project: instance alias, bound scope, and how changes get promoted.
+- A **cloud** session (claude.ai/code) only sees the project's repository, so a path on your laptop will not resolve there. Replace the `@` line with a copy of this repo's `CLAUDE.md`.
+- `now-fluent` must be on your `PATH` (`npm link`, above). Every command in the guide — `verify-push` included — then works from any directory.
+- The full guide is about 40 KB and is loaded into every session of that project.
+
 ## Drop-in for now-sdk
 
 Any command that isn't a now-fluent enhanced command is passed straight through to now-sdk with your exact arguments:
@@ -192,8 +210,8 @@ Use `update-set-package` to promote anything you do not own.
 Two platform behaviours `push` depends on — that a Table API `PUT` **merges** rather than replaces, and that an insert honours a supplied `sys_id` — plus whether your instance lets you write into a given application scope at all, are instance- and version-dependent. Prove them on a dev instance first:
 
 ```bash
-npm run verify-push -- --auth dev                 # Global only
-npm run verify-push -- --auth dev --scope sn_hamp # ...and inside an application scope
+now-fluent verify-push --auth dev                 # Global only
+now-fluent verify-push --auth dev --scope sn_hamp # ...and inside an application scope
 ```
 
 It creates throwaway `sys_script_include` records, checks each assumption, deletes them again, and exits non-zero if any assumption fails. `--keep` leaves the records behind for inspection.
@@ -426,7 +444,7 @@ ServiceNow-owned scopes (e.g. HAM, `sn_hamp`) should be treated differently from
 - Bind the project to the scope (its `now.config.json` `scope`/`scopeId`) so builds keep the correct `apiName`.
 - Prefer **`update-set-package`** to land customer changes through ServiceNow's import/preview/commit flow, rather than installing an SDK package into a vendor scope.
 - Do not `install` into a ServiceNow-owned scope unless your organization explicitly owns and governs that application/version.
-- `push` is *technically* not scope-gated (it is the plain Table API), but "the API allows it" is not "your governance allows it". Verify with `npm run verify-push -- --auth dev --scope <scope>` on a dev instance, and keep vendor-scope changes on the update-set path unless your process says otherwise.
+- `push` is *technically* not scope-gated (it is the plain Table API), but "the API allows it" is not "your governance allows it". Verify with `now-fluent verify-push --auth dev --scope <scope>` on a dev instance, and keep vendor-scope changes on the update-set path unless your process says otherwise.
 
 ## Working with the official ServiceNow SDK plugin/skills
 
@@ -436,7 +454,7 @@ Use the official ServiceNow SDK plugin/skills for knowledge and code authoring (
 
 ```bash
 npm test                              # parser unit tests + push/pull end-to-end tests
-npm run verify-push -- --auth dev     # the live spike against a real instance
+now-fluent verify-push --auth dev     # the live spike against a real instance (npm run verify-push works too)
 ```
 
 `npm test` needs no instance and no SDK: a fake `now-sdk` and an in-process mock Table API stand in for both. The mock encodes the two platform behaviours `push` relies on (PUT merges, POST honours a supplied `sys_id`), so the tests prove the *client* is correct **given** those semantics — `verify-push` is what proves the platform provides them.

@@ -16,7 +16,7 @@ const SDK_BIN = process.env.NOW_FLUENT_SDK || 'now-sdk'
 // Commands handled by now-fluent itself. EVERY other command (and its exact
 // arguments) is forwarded verbatim to now-sdk, so any current or future now-sdk
 // command works unchanged.
-const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package', 'pull', 'push'])
+const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'verify-push', 'import', 'import-update-set', 'export-xml', 'update-set-package', 'pull', 'push'])
 
 const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force', 'no-related',
   'move-adopted', 'keep-payload-scope',
@@ -51,6 +51,14 @@ Enhanced commands (handled by now-fluent):
 
   doctor
       Report now-fluent, Node, and now-sdk versions.
+
+  verify-push --auth <alias> [--scope <scope|sys_id>] [--keep]
+      Check, live, what push relies on before its first real use against an
+      instance: PUT merges, an insert keeps the supplied sys_id, your account's
+      current application, whether a create run AS Global / AS the scope lands
+      there and can be updated and deleted again, and update-set capture. WRITES
+      throwaway, inactive script includes and deletes them again (--keep leaves
+      them). Exits non-zero only if a load-bearing assumption fails.
 
   import [--project <path>] --auth <alias> [--no-adopt-scope]
          [--sys-id <32hex>[,<32hex>...] | --query <encoded query> --table <table>]
@@ -3929,6 +3937,14 @@ async function main() {
   if (command == null || command === 'help' || command === '--help' || command === '-h') {
     printHelp()
     return
+  }
+
+  if (command === 'verify-push') {
+    // The live check ships as its own script (it drives push's transport directly).
+    // Resolved next to this file, so it works from any project, not just this repo.
+    const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'verify-push.mjs')
+    const result = spawnSync(process.execPath, [script, ...argv.slice(1)], { stdio: 'inherit' })
+    process.exit(result.status ?? 1)
   }
 
   if (!ENHANCED.has(command)) {

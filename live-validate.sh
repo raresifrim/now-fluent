@@ -58,14 +58,14 @@ $NF doctor
 
 hr "PHASE 1 — Phase 0 spike, Global scope"
 note "PUT merge / POST honours sys_id / sys_scope honoured? / can capture be steered?"
-( cd "$REPO" && npm run verify-push -- --auth "$AUTH" )
+$NF verify-push --auth "$AUTH"
 echo "verify-push (global) exit=$?"
 
 if [ -n "$SCOPE" ]; then
   hr "PHASE 2 — Phase 0 spike, scope: $SCOPE"
   note "EXPECTED (seen live, dev410927 / sn_sow): body sys_scope NO (or ?? when $SCOPE is your app picker),"
   note "create AS $SCOPE YES, UPDATED run AS Global NO (403), UPDATED run AS $SCOPE YES, deleted again YES."
-  ( cd "$REPO" && npm run verify-push -- --auth "$AUTH" --scope "$SCOPE" )
+  $NF verify-push --auth "$AUTH" --scope "$SCOPE"
   echo "verify-push (scope $SCOPE) exit=$?"
 else
   hr "PHASE 2 — SKIPPED (no --scope given)"
