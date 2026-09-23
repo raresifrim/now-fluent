@@ -100,7 +100,35 @@ now-fluent push --project ./work --auth dev --sys-id 0123456789abcdef0123456789a
 | record exists but was never pulled | **refused** — there is no baseline to tell your edits from someone else's |
 | artifact is a `DELETE` (you removed the Fluent code) | skipped unless `--allow-delete` — and then still subject to every guard above |
 
-The snapshot lives in `<project>/.now-fluent/state/<table>_<sysid>.json`. It is what makes the diff and the drift check possible; add it to `.gitignore` if you do not want it committed. A snapshot taken against one instance is never used as the diff reference for another — push notices and refuses.
+The snapshot lives in `<project>/.now-fluent/state/<table>_<sysid>.json`. It is what makes the diff and the drift check possible, and it is disposable — add `.now-fluent/state/` to `.gitignore`. **Commit `.now-fluent/adopted.json`**, though: it records which sources were adopted from another scope (below), and it belongs with the source it describes. A snapshot taken against one instance is never used as the diff reference for another — push notices and refuses.
+
+### Cross-scope: pull adopts, push returns
+
+A Fluent project is bound to one scope, and the SDK enforces it at build time — a script include pulled from Global carries `apiName: 'global.X'`, which a project bound to `x_my_app` refuses to compile (`error TS11: apiName must begin with 'x_my_app.'`).
+
+So **pull adopts** a record from another scope: it rewrites `sys_scope` and the `api_name` prefix into the project's scope before the offline transform, and the source compiles as if the record had always been the project's. The baseline records the origin, and **push returns it there** — translating the fields back and updating the original record: same `sys_id`, same record, still in Global.
+
+```bash
+# project bound to x_my_app; the record lives in Global
+now-fluent pull --project ./work --auth dev --sys-id <global script include>
+#   pull ADOPTS them ... global -> x_my_app (push returns it to global)
+#   apiName in the source: x_my_app.PriceUtils
+now-fluent push --project ./work --auth dev --sys-id <same>
+#   adopted from global: pushing it back there (api_name x_my_app.PriceUtils -> global.PriceUtils)
+#   updated (1 field(s))
+```
+
+Only your edits are sent; the scope and `api_name` translate back and diff out.
+
+**`update-set-package` respects adoption too.** Packaging an adopted record into an update set for the project's scope would *move* it into that scope on commit and rename its `api_name` — so it refuses, and offers the choices:
+
+| you want to | run |
+| --- | --- |
+| edit it in place, governed | `update-set-package --scope global --scope-id global --include <sys_id>` — the payload is translated back to Global |
+| edit it in place, quickly | `push` |
+| move it into your project's scope | `update-set-package --move-adopted` — says which `api_name`s will change |
+
+Adoption happens on the query path (pull's default), because only that path's rebuilt XML is ours to rewrite and record. `--no-adopt-scope` skips the *rewrite* only — the record's origin is still recorded, because the SDK build stamps the project's scope onto every artifact whether or not the source was rewritten, and forgetting the origin would let `update-set-package` package it as a move. (Without the rewrite, a record carrying an `apiName` will fail the build with TS11.)
 
 ### Scope: push cannot choose one
 
@@ -123,7 +151,11 @@ Every write reads `sys_scope` back afterwards and fails the record if it landed 
 now-fluent update-set-package --project ./work --update-set-name "To Global"   --scope global --scope-id global --build-local
 ```
 
-One local constraint to know: a scope-bound project will not compile `apiName: 'global.Thing'` (TS11 — it must start with the project's scope). So for tables that carry an `apiName` (script includes, script actions), "author in a scoped project, push to Global" does not work even with `--target-scope global`; use a Global-bound project or `update-set-package`. Tables without an `apiName` (business rules, UI policies) build fine.
+`--target-scope global` is for records you **author** in a scoped project and want created in Global. A record you **pulled** from Global needs none of this — adoption returns it automatically (above).
+
+For an **authored** record, write its `apiName` in the project's scope (`x_my_app.Thing`) — the build still rejects `apiName: 'global.Thing'` in a scoped project (TS11). With `--target-scope global` the platform creates it in Global and rewrites the `api_name` to `global.Thing` itself; push reports what it got.
+
+push also refuses, **before writing**, any update whose source puts the record in a different scope from where it lives on the instance — sending it could rename the record's `api_name` out from under its callers. The usual cause is a record pulled without adoption; pulling it again fixes it.
 
 ### Update set capture: reported, not controlled
 
@@ -164,7 +196,7 @@ It creates throwaway `sys_script_include` records, checks each assumption, delet
 
 | flag | effect |
 | --- | --- |
-| `--dry-run` | build, then print the method, URL and body for each record; send nothing |
+| `--dry-run` | build, read the live records and run every guard, then print the exact verb, URL and (diffed) body — writes nothing |
 | `--all` | push every built record (`--include`/`--exclude` select, same tokens as `update-set-package`) |
 | `--full` | send every modelled field, not just the changed ones |
 | `--force` | push anyway when the record drifted |

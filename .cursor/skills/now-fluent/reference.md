@@ -42,6 +42,15 @@ values and its `sys_updated_on` / `sys_mod_count`. `--no-state` skips the baseli
 Never written: `sys_created_*`, `sys_updated_*`, `sys_mod_count`, `sys_update_name`,
 `sys_package`, `sys_policy`, `sys_class_name`.
 
+**Cross-scope: pull adopts, push returns.** A record from another scope (e.g. Global,
+pulled into a project bound to `x_my_app`) is rewritten into the project's scope before
+the offline transform, so it compiles (no TS11 on `apiName: 'global.X'`). The baseline's
+`.now-fluent/adopted.json` (durable — commit it) records the origin; push translates back and updates the original record,
+which stays in Global. `update-set-package` refuses to package an adopted record for the
+project's scope (it would move + rename it); use `--scope global --scope-id global` for an
+in-place edit, or `--move-adopted` to move it on purpose. push refuses, before writing, an
+update whose source scope differs from the live record's.
+
 **Scope (verified live): `sys_scope` is INERT on a Table API write.** The platform uses
 the scope the REST transaction runs in (Global) and rewrites `api_name` to match. So:
 
@@ -51,15 +60,16 @@ the scope the REST transaction runs in (Global) and rewrites `api_name` to match
 - `--target-scope <other>` is refused — use `update-set-package --scope <scope>`;
 - every write reads the scope back and FAILS the record if it landed elsewhere;
 - `--no-scope` only trims the body; it changes nothing on the instance.
-- A scoped project cannot compile `apiName: 'global.X'` (TS11), so scoped-project →
-  Global does not work for tables carrying an apiName even with `--target-scope`.
+- `--target-scope global` is for records AUTHORED in the scoped project; pulled ones
+  are returned to their origin automatically. Authored records still need a project-scoped
+  `apiName` (TS11); the platform rewrites it to `global.X` on create.
 
 **Update set capture (verified live): `--update-set` cannot steer it.** A REST
 transaction resolves its own update set; a write made while the session pointed at a
 named set was captured into `Default`. The flag sets the preference, restores it after,
 and — the actual value — reports where each write really landed, failing on a mismatch.
 
-Flags: `--dry-run` (builds, then prints requests and sends nothing), `--all` +
+Flags: `--dry-run` (builds, reads, runs every guard, writes nothing), `--all` +
 `--include`/`--exclude`, `--full`, `--no-build`, `--no-drift-check`.
 One refused record does not abandon the rest of the run.
 

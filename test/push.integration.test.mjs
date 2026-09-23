@@ -165,12 +165,15 @@ test('refuses an existing record that was never pulled', async () => {
   assert.deepEqual(instance.writes(), [])
 })
 
-test('--dry-run sends nothing and prints the request', async () => {
+test('--dry-run reads but never writes, and names the real verb', async () => {
+  // A dry run is "everything except the write": it reads the live record so its preview
+  // shows the verb, body and refusals the real run would produce.
   const result = await push('--sys-id', SYS_ID, '--dry-run')
   assert.equal(result.status, 0, result.stderr)
-  assert.deepEqual(instance.log, [], 'a dry run must not contact the instance at all')
-  assert.match(result.stdout, /POST|PUT/)
+  assert.deepEqual(instance.writes(), [], 'a dry run must never write')
+  assert.match(result.stdout, /would POST .*sys_script_include/, 'the record does not exist, so: POST')
   assert.match(result.stdout, /MyInclude/)
+  assert.ok(!instance.store.has(`sys_script_include/${SYS_ID}`))
 })
 
 test('--no-scope omits sys_scope from the write', async () => {

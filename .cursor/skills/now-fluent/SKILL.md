@@ -65,6 +65,8 @@ in vendor scopes. `--table` is optional for both.
   changed fields (`PUT`, or `POST` with the `sys_id` when the record does not exist).
 - Refuses a record that drifted on the instance, or that exists but was never pulled
   (`--force` overrides). Never writes `sys_*` bookkeeping.
+- **Cross-scope:** pull ADOPTS a record from another scope (rewrites it into the project's
+  scope so it compiles) and push RETURNS it — same sys_id, still in its origin scope.
 - **Scope, verified live: `sys_scope` is IGNORED on a Table API write** — the record
   lands in Global and `api_name` is rewritten. So a CREATE from a scoped artifact is
   refused; `--target-scope global` is the explicit opt-in; any other target scope is

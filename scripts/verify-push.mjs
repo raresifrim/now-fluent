@@ -35,9 +35,16 @@ const keep = has('keep')
 
 const results = []
 const created = [] // { table, sysId }
-function record(id, question, ok, detail) {
-  results.push({ id, question, ok, detail })
-  console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${question}`)
+// Two different kinds of question, and conflating them is a FALSE RED:
+//   required    — push is built on it; if it fails, push is unsafe here. Exit 1.
+//   capability  — a platform fact push ADAPTS to (refuses, or reports). "No" is an
+//                 answer, not a failure: it says what push can do on this instance.
+// Treating a capability "no" as a failure made every run exit 1 on facts push already
+// handles, which teaches you to ignore the exit code — as bad as a false green.
+function record(id, question, ok, detail, kind = 'required') {
+  results.push({ id, question, ok, detail, kind })
+  const tag = kind === 'capability' ? (ok ? 'YES ' : 'NO  ') : (ok ? 'PASS' : 'FAIL')
+  console.log(`  ${tag}  ${question}`)
   if (detail) console.log(`        ${detail}`)
 }
 
@@ -84,11 +91,12 @@ async function exercise(instance, label, scope) {
   const insert = await probe(() => snRequest(instance, 'POST', '/api/now/table/sys_script_include',
     { ...THROW, body, params: { sysparm_fields: 'sys_id' } }))
   if (!insert.ok) {
-    record(`${label}/write`, `[${label}] Table API write is permitted`, false, reason(insert.error))
+    record(`${label}/write`, `[${label}] Table API write is permitted`, false, reason(insert.error),
+      scope ? 'capability' : 'required')
     return null
   }
   created.push({ table: 'sys_script_include', sysId: id })
-  record(`${label}/write`, `[${label}] Table API write is permitted`, true)
+  record(`${label}/write`, `[${label}] Table API write is permitted`, true, '', scope ? 'capability' : 'required')
 
   const afterInsert = await snGetRecord(instance, 'sys_script_include', id, undefined, THROW)
   record(`${label}/sysid`, `[${label}] insert honours the supplied sys_id (Now.ID identity survives)`,
@@ -98,13 +106,13 @@ async function exercise(instance, label, scope) {
   if (scope) {
     // The one that decides whether push can create anything outside Global.
     const landed = afterInsert ? afterInsert.sys_scope : ''
-    record(`${label}/scope`, `[${label}] sys_scope on the write is HONOURED (record landed in ${scope.scope})`,
+    record(`${label}/scope`, `[${label}] sys_scope on a write is honoured (record lands in ${scope.scope})`,
       landed === scope.sys_id,
       landed === scope.sys_id
         ? `sys_scope: ${landed}`
-        : `sys_scope was IGNORED: asked for ${scope.sys_id} (${scope.scope}), got "${landed}". `
-          + `api_name is now "${afterInsert ? afterInsert.api_name : '?'}". push cannot create records outside `
-          + 'Global — promote scoped records with update-set-package instead.')
+        : `ignored: asked for ${scope.scope}, got "${landed}", api_name became `
+          + `"${afterInsert ? afterInsert.api_name : '?'}".`,
+      'capability')
   }
 
   // Q2 — does PUT MERGE (leave unspecified fields alone) rather than replace?
@@ -142,11 +150,12 @@ async function checkUpdateSetCapture(instance, ids) {
     }
   })
   const captured = Array.isArray(rows) ? rows : []
-  record('capture', 'Table API writes are captured into SOME update set',
+  record('capture', 'Table API writes are captured into an update set',
     captured.length > 0,
     captured.length
       ? `${captured.length} sys_update_xml row(s)`
-      : 'no sys_update_xml rows — push produces no update set at all; promote with update-set-package')
+      : 'no sys_update_xml rows for these writes',
+    'capability')
   if (!captured.length) return
 
   const setIds = [...new Set(captured.map((r) => r.update_set).filter(Boolean))]
@@ -161,14 +170,14 @@ async function checkUpdateSetCapture(instance, ids) {
 
   // The real question --update-set rests on: can the session STEER the destination?
   const steered = await probe(() => steerAndCheck(instance, captured))
-  record('capture-steering', '--update-set can steer WHERE the writes are captured',
+  record('capture-steering', 'the session update set preference steers capture',
     steered.ok && steered.value === true,
     steered.ok
       ? (steered.value === true
         ? 'the sys_update_set preference decided the destination'
-        : `the platform chose the update set itself (writes landed in: ${where}). `
-          + '--update-set cannot deliver a named set — push reports the mismatch instead of claiming success')
-      : reason(steered.error))
+        : `ignored: the platform chose the update set itself (landed in: ${where}).`)
+      : `could not determine — the probe itself failed: ${reason(steered.error)}`,
+    'capability')
 }
 
 // Point the session at a fresh update set, write once more, and see where it lands.
@@ -240,7 +249,7 @@ try {
 
   if (ids.length) {
     const capture = await probe(() => checkUpdateSetCapture(instance, ids))
-    if (!capture.ok) record('update-set', 'Table API writes are captured into the session update set', false, reason(capture.error))
+    if (!capture.ok) record('update-set', 'the update set capture probe ran', false, reason(capture.error), 'capability')
   }
 } catch (error) {
   console.error(`\nSpike aborted: ${reason(error)}`)
@@ -260,11 +269,35 @@ if (keep) {
 }
 
 // --- verdict ---------------------------------------------------------------
-const failed = results.filter((r) => !r.ok)
+// What push does about each capability being absent. Keyed by the id's last segment.
+const ADAPTATION = {
+  scope: 'push REFUSES scoped creates (they would land in Global). Use --target-scope global to create in\n'
+    + '            Global on purpose, or update-set-package --scope <scope> to place records in a scope.',
+  'capture-steering': '--update-set cannot choose the set; it REPORTS where each write landed and fails\n'
+    + '            on a mismatch. Use update-set-package when changes must be in a specific set.',
+  capture: 'push produces no update set here; promote with update-set-package.',
+  write: 'push gets a 403 per record in this scope, reports it with a hint, and carries on.',
+  'update-set': 'the probe itself failed — check capture by hand.'
+}
+
+const required = results.filter((r) => r.kind !== 'capability')
+const brokenRequired = required.filter((r) => !r.ok)
+const capabilities = results.filter((r) => r.kind === 'capability')
+
 console.log(`\n${'='.repeat(70)}`)
-console.log(`${results.length - failed.length}/${results.length} assumptions hold.`)
-for (const item of failed) console.log(`  FAILED: ${item.question}`)
-console.log(failed.length
-  ? '\npush is NOT safe to use for the cases above — see each FAIL line for what the instance refused.'
-  : '\nAll good: push/pull are safe to use against this instance.')
-process.exit(failed.length ? 1 : 0)
+console.log(`LOAD-BEARING — push is unsafe if any fail: ${required.length - brokenRequired.length}/${required.length} hold`)
+for (const item of brokenRequired) console.log(`  FAILED: ${item.question}`)
+
+if (capabilities.length) {
+  console.log('\nCAPABILITIES — platform facts push adapts to (a "no" is an answer, not a failure):')
+  for (const item of capabilities) {
+    console.log(`  ${item.ok ? 'yes' : 'NO '}  ${item.question}`)
+    const key = item.id.split('/').pop()
+    if (!item.ok && ADAPTATION[key]) console.log(`       -> ${ADAPTATION[key]}`)
+  }
+}
+
+console.log(brokenRequired.length
+  ? '\npush is NOT safe against this instance — a load-bearing assumption failed (see FAILED above).'
+  : '\npush is safe against this instance, within the capabilities listed above.')
+process.exit(brokenRequired.length ? 1 : 0)

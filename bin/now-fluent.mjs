@@ -19,8 +19,9 @@ const SDK_BIN = process.env.NOW_FLUENT_SDK || 'now-sdk'
 const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', 'import', 'import-update-set', 'export-xml', 'update-set-package', 'pull', 'push'])
 
 const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force', 'no-related',
+  'move-adopted', 'keep-payload-scope',
   // push/pull
-  'no-build', 'full', 'allow-delete', 'no-drift-check', 'no-scope', 'all', 'no-state'])
+  'no-build', 'full', 'allow-delete', 'no-drift-check', 'no-scope', 'all', 'no-state', 'no-adopt-scope'])
 
 // ---------------------------------------------------------------------------
 // Help
@@ -152,7 +153,8 @@ Enhanced commands (handled by now-fluent):
       --exclude sys_documentation,sys_translated,sys_ui_message,sys_atf_test,sys_atf_step
 
   pull --project <path> --auth <alias> --sys-id <32hex>[,<32hex>...]
-       [--table <table>] [--via query|transform|move|auto] [--no-state] [--dry-run]
+       [--table <table>] [--via query|transform|move|auto] [--no-adopt-scope]
+       [--no-state] [--dry-run]
       Import records into the project AND record a baseline snapshot of each one as
       the instance holds it right now (.now-fluent/state/<table>_<sysid>.json).
       The import itself is exactly "import --via query --force", so pull works in
@@ -162,6 +164,17 @@ Enhanced commands (handled by now-fluent):
       actually edited, and whether somebody else changed the record meanwhile.
       --table is optional (resolved from sys_metadata.sys_class_name); --no-state
       imports without recording a baseline (push then has no drift detection).
+      CROSS-SCOPE: a record from another scope (say Global, pulled into a project
+      bound to x_my_app) is ADOPTED — its sys_scope and api_name prefix are
+      rewritten into the project's scope before the offline transform, so the
+      Fluent source compiles (the SDK otherwise rejects apiName 'global.X' in a
+      scoped project with TS11). The origin is recorded in .now-fluent/adopted.json
+      (durable — commit it with the source), and push sends the record back there:
+      same sys_id, same record, still in Global. To MOVE a record into the
+      project's scope instead: pull it, then update-set-package --move-adopted.
+      Adoption happens on the query path. --no-adopt-scope skips only the
+      rewrite (apiName-bearing records then fail TS11); the origin is still
+      recorded, since the build stamps the project's scope on every artifact.
 
   push --project <path> --auth <alias>
        (--sys-id <32hex>[,<32hex>...] | --all [--include <substr>...] [--exclude <substr>...])
@@ -203,8 +216,9 @@ Enhanced commands (handled by now-fluent):
       live: a REST transaction resolves its own update set and may ignore the
       preference, so the check is the point — a mismatch is reported per record
       and fails the run rather than being claimed as success.
-      --dry-run builds (locally, as always) and prints the method, URL and body for
-      each record, sending nothing.
+      --dry-run is "everything except the write": it builds, READS the live records,
+      runs every guard, and prints the exact verb, URL and diffed body — or the
+      refusal — the real run would produce. It never writes.
 
   export-xml --project <path> [--out <path>] [--build-local] [--zip]
              [--include <substr>...] [--exclude <substr>...]
@@ -238,6 +252,12 @@ Enhanced commands (handled by now-fluent):
       exact record; a table name selects a type. The SDK emits sys_module records
       for bom.json/package.json — exclude them (e.g. --exclude sys_module) unless
       wanted.
+
+      Adopted records (pulled from another scope — see pull) are never silently
+      moved: packaging one for the project's scope is REFUSED, because committing
+      it would move the record and rename its api_name. Package it for its origin
+      scope (--scope global --scope-id global) to edit it in place — the payload is
+      translated back — or pass --move-adopted to move it deliberately.
 
       Output goes to exports/<update-set-name>/ (named after --update-set-name),
       so re-running with the same name overwrites it in place. Use --out for an
@@ -777,7 +797,12 @@ function discoverTables(sysIds, auth) {
       const id = fieldValue(row.sys_id)
       const table = fieldValue(row.sys_class_name)
       if (id && table) {
-        found.set(id, { table, name: fieldValue(row.sys_name), scope: fieldParts(row.sys_scope).display || fieldValue(row.sys_scope) })
+        found.set(id, {
+          table,
+          name: fieldValue(row.sys_name),
+          scope: fieldParts(row.sys_scope).display || fieldValue(row.sys_scope),
+          scopeId: fieldValue(row.sys_scope)
+        })
       }
     }
   }
@@ -1100,7 +1125,10 @@ function transformFromUnit({ path, label, project, extra = [], dryRun, healer, i
 //              the path, so it works where the other two are refused
 const IMPORT_STRATEGIES = ['auto', 'move', 'transform', 'query']
 
-function commandImport(flags, config, positional) {
+// `internal` carries state from a calling command (pull). It is deliberately NOT merged
+// into `flags`: anything in flags can also be typed on the command line, and a string
+// arriving where a scope object or Map is expected would crash or corrupt the rebuild.
+function commandImport(flags, config, positional, internal = {}) {
   const project = projectPath(flags, config)
   const auth = flags.auth || config.auth
   if (!auth) fail('Missing required --auth for import')
@@ -1270,6 +1298,9 @@ function commandImport(flags, config, positional) {
     }
     if (targets.length) {
       const result = importViaQuery({
+        projectScope: internal.projectScope,
+        rewriteScope: internal.rewriteScope,
+        collect: internal.collect,
         targets, auth, project, extra, related, keepFailed, prefetched,
         outDir: flags.out, keep: Boolean(flags.keep)
       })
@@ -1297,7 +1328,7 @@ function commandImport(flags, config, positional) {
 // the children that embed into its Fluent DSL, and the folder is transformed in a
 // single `transform --from` call — the same family batching import-update-set does,
 // so now-sdk cannot define a child twice.
-function importViaQuery({ targets, auth, project, extra, related, keepFailed, prefetched, outDir, keep }) {
+function importViaQuery({ targets, auth, project, extra, related, keepFailed, prefetched, outDir, keep, projectScope, rewriteScope, collect }) {
   const workDir = outDir ? resolve(outDir) : join(tmpdir(), `now-fluent-query-${randomUUID()}`)
   mkdirSync(workDir, { recursive: true })
 
@@ -1331,15 +1362,31 @@ function importViaQuery({ targets, auth, project, extra, related, keepFailed, pr
     }
     const dir = join(workDir, `${t.table}_${t.sysId}`)
     mkdirSync(dir, { recursive: true })
-    writeFileSync(join(dir, `${t.table}_${t.sysId}.xml`), recordJsonToXml(t.table, row))
+    // Every record written into this unit, with what (if anything) was adopted — so the
+    // adoption can be recorded exactly for the records that really import, and cleared
+    // for any that re-import in their own scope.
+    const written = []
+    const own = adoptRowScope(row, projectScope, { rewrite: rewriteScope })
+    if (own.rewritten) {
+      const api = own.adopted.fromPrefix ? ` (api_name ${own.adopted.apiName} -> ${fieldValue(own.row.api_name)})` : ''
+      console.log(`  adopting ${t.table} ${t.sysId} from ${own.adopted.originName} into ${projectScope.scope}${api}`)
+    } else if (own.adopted) {
+      console.log(`  ${t.table} ${t.sysId} lives in ${own.adopted.originName} (not rewritten: --no-adopt-scope)`)
+    }
+    writeFileSync(join(dir, `${t.table}_${t.sysId}.xml`), recordJsonToXml(t.table, own.row))
+    written.push({ table: t.table, sysId: t.sysId, adopted: own.adopted })
     let children = 0
     if (related) {
+      // Children come along in the parent's scope, so they are adopted with it.
       for (const child of relatedChildRows(t.table, t.sysId, auth, row)) {
-        writeFileSync(join(dir, `${child.table}_${fieldValue(child.row.sys_id)}.xml`), recordJsonToXml(child.table, child.row))
+        const childId = fieldValue(child.row.sys_id)
+        const adoptedChild = adoptRowScope(child.row, projectScope, { rewrite: rewriteScope })
+        writeFileSync(join(dir, `${child.table}_${childId}.xml`), recordJsonToXml(child.table, adoptedChild.row))
+        written.push({ table: child.table, sysId: childId, adopted: adoptedChild.adopted })
         children++
       }
     }
-    units.push({ sysId: t.sysId, dir, label: `${t.table} ${t.sysId}${children ? ` (+${children} child record(s))` : ''}` })
+    units.push({ sysId: t.sysId, dir, written, label: `${t.table} ${t.sysId}${children ? ` (+${children} child record(s))` : ''}` })
   }
 
   console.log(`\nTransforming ${units.length} rebuilt record(s) offline via now-sdk transform --from...`)
@@ -1367,6 +1414,27 @@ function importViaQuery({ targets, auth, project, extra, related, keepFailed, pr
         failed.push(imported[at])
         imported.splice(at, 1)
       }
+    }
+  }
+
+  // Only now — after the verification build may have demoted some — record adoptions,
+  // and only for units that really landed. An adoption for a record whose source never
+  // made it would make update-set-package and push translate a file that is not there.
+  for (const unit of units) {
+    if (!imported.includes(unit.sysId)) continue
+    // No project scope known (plain `import`): nothing to compare against, so leave any
+    // existing entries alone rather than guess.
+    if (!projectScope) continue
+    for (const record of unit.written) {
+      // Set when the record lives outside the project's scope; clear ONLY when it now
+      // lives inside it. Never clear merely because this run did not rewrite.
+      setAdoption(project, record.sysId, record.adopted ? {
+        table: record.table,
+        from: { scopeId: record.adopted.originScopeId, name: record.adopted.originName, apiPrefix: record.adopted.fromPrefix },
+        to: { scopeId: projectScope.scopeId, name: projectScope.scope, apiPrefix: projectScope.scope },
+        since: new Date().toISOString()
+      } : null)
+      if (collect) collect.push({ table: record.table, sysId: record.sysId, adopted: Boolean(record.adopted) })
     }
   }
 
@@ -2193,6 +2261,49 @@ function commandUpdateSetPackage(flags, config) {
       return { ...parseRecordUpdate(rawXml, file), rawXml, file }
     })
     if (sdkFixes) console.log(`Fixed ${sdkFixes} known now-sdk serialization defect(s) (sys_hub_flow_snapshot.outputs "[object Object]", missing parent_ui_id on top-level flow steps)`)
+
+    // ADOPTED records (pulled from another scope, written in this project's scope so they
+    // compile) must not ride into this update set as-is: committing it would MOVE each one
+    // into ${scope} and rename its api_name, breaking every caller of the original. The
+    // update set's target scope decides what happens:
+    //   target == the records' origin  -> edit them IN PLACE (payload translated back);
+    //   --move-adopted                  -> move them on purpose, as built;
+    //   anything else                   -> refuse, and say what the options are.
+    const adoptedRecords = records
+      .map((record) => ({ record, adopted: adoptionForPayload(project, record.rawXml) }))
+      .filter((entry) => entry.adopted)
+    // Records whose origin IS this update set's scope are not moving anywhere — they are
+    // always translated back, --move-adopted or not. Skipping that for them would carry
+    // the project-scoped api_name into their own scope and rename them in place.
+    const staying = adoptedRecords.filter(({ adopted }) => adopted.from.scopeId === scopeId)
+    const elsewhere = adoptedRecords.filter(({ adopted }) => adopted.from.scopeId !== scopeId)
+    if (elsewhere.length && flags['move-adopted']) {
+      console.warn(`--move-adopted: ${elsewhere.length} record(s) pulled from another scope will be MOVED into `
+        + `${scope} on commit, and their api_name renamed:`)
+      for (const { record, adopted } of elsewhere) {
+        console.warn(`  ${record.targetName}  ${adopted.from.name} -> ${scope}`)
+      }
+      console.warn('  Anything calling them by their old api_name will break.')
+    } else if (elsewhere.length) {
+      const origins = [...new Set(elsewhere.map(({ adopted }) => `${adopted.from.name} (--scope-id ${adopted.from.scopeId})`))]
+      fail(`${elsewhere.length} selected record(s) were pulled from another scope and ADOPTED into this project:\n`
+        + elsewhere.map(({ record, adopted }) => `  ${record.targetName}  lives in ${adopted.from.name}`).join('\n')
+        + `\nPackaging them into an update set for ${scope} would MOVE them into ${scope} on commit and rename\n`
+        + 'their api_name, breaking every caller. Choose one:\n'
+        + '  - edit them in place: package them for their own scope, e.g.\n'
+        + `      update-set-package ... --scope ${elsewhere[0].adopted.from.apiPrefix || '<scope>'} `
+        + `--scope-id ${elsewhere[0].adopted.from.scopeId} --include <their sys_ids>\n`
+        + `    (origins: ${origins.join(', ')})\n`
+        + '  - or just push them: push returns adopted records to where they live\n'
+        + `  - move them into ${scope} deliberately: --move-adopted\n`
+        + '  - leave them out: --exclude <their sys_ids>')
+    }
+    for (const entry of staying) entry.record.rawXml = translateAdoptedPayload(entry.record.rawXml, entry.adopted)
+    if (staying.length) {
+      console.log(`${staying.length} adopted record(s) packaged as IN-PLACE edits in their origin scope `
+        + '(sys_scope and api_name translated back).')
+    }
+
     const keepPayloadScope = Boolean(flags['keep-payload-scope'])
     const xml = buildUpdateSetXml({
       name, description, scope, scopeId, appName,
@@ -2596,18 +2707,39 @@ async function commandPull(flags, config, positional) {
   }
 
   // pull defaults to the query strategy: it is the one that survives ServiceNow-owned
-  // scopes. --via transform|move|auto still works for a project that can use them.
-  const importFlags = { ...flags, via: flags.via || config.via || 'query', force: true }
-  commandImport(importFlags, config, positional)
+  // scopes, and the only one whose rebuilt XML we control — which scope adoption needs.
+  const via = String(flags.via || config.via || 'query').toLowerCase()
+  const projectScope = projectScopeOf(project)
+  // Adoption is decided per record by the query import itself (it sees each row's
+  // scope) and recorded in .now-fluent/adopted.json for every record that lands outside
+  // the project's scope — on any path that reaches it, including --via auto's fallback.
+  // --no-adopt-scope only skips the REWRITE that makes apiName-bearing records compile.
+  const rewriteScope = !flags['no-adopt-scope']
+  if (projectScope && flags['no-adopt-scope']) {
+    console.warn(`Note: --no-adopt-scope. A record from outside ${projectScope.scope} that carries an apiName will fail `
+      + 'the build with TS11 (its origin is still recorded).\n')
+  } else if (projectScope && (via === 'move' || via === 'transform')) {
+    console.warn(`Note: --via ${via} does not adopt — only the query path's rebuilt XML is ours to rewrite and record.\n`)
+  }
+
+  const collect = []
+  commandImport({ ...flags, via, force: true }, config, positional, { projectScope, rewriteScope, collect })
   if (dryRun) return
+
+  const adopted = collect.filter((record) => record.adopted)
+  if (adopted.length) {
+    console.log(`\n${adopted.length} record(s) came from outside ${projectScope.scope} and were ADOPTED: the project builds`)
+    console.log(`them in ${projectScope.scope}'s terms, and push sends them back to the scope they live in — same`)
+    console.log('sys_id, same record. Recorded in .now-fluent/adopted.json (commit it with the source).')
+    console.log('To MOVE one into this scope instead: update-set-package --move-adopted.')
+  }
 
   if (flags['no-state']) {
     // Be precise: this skips WRITING a baseline. Any baseline an earlier pull left on
     // disk is still there, and push will still use it for the drift check and the diff
     // — which, against a record just re-pulled, will look like drift.
-    const stale = sysIds.filter((id) => existsSync(statePath(project, flags.table || config.table || '', id))
-      || findBaselineFor(project, id))
-    console.log('\n--no-state: not recording a baseline for these records.')
+    const stale = sysIds.filter((id) => findBaselineFor(project, id))
+    console.log('\n--no-state: not recording a baseline for these records (push will refuse them until pulled).')
     if (stale.length) {
       console.warn(`  Warning: ${stale.length} of them still have a baseline from an earlier pull. push will `
         + 'keep using it, so a record you just re-pulled may be refused as drifted. Delete '
@@ -2616,32 +2748,29 @@ async function commandPull(flags, config, positional) {
     return
   }
 
-  // The import also brings in family children (a UI policy's actions, an ACL's roles).
-  // Those are real records somebody may push, so they need baselines too — otherwise
-  // pushing one is refused for "no usable pull baseline". Anything newly registered in
-  // keys.ts by this import counts.
-  const nowLocal = loadProjectRecordIds(project)
-  const discovered = [...nowLocal].filter((id) => !alreadyLocal.has(id) && !sysIds.includes(id))
-  const imported = [...sysIds, ...discovered]
-  // The ids the USER named deserve a warning when they get no baseline. The ones the
-  // import happened to register do not: keys.ts also carries the SDK's own scaffolding
-  // (the sys_module rows for bom.json/package.json), which are build bookkeeping and
-  // have no instance record at all — warning about those is pure noise.
-  const namedByUser = new Set(sysIds)
-
-  // The baseline needs each record's table. --table covers the ids the user named;
-  // resolve the rest the same way import does.
+  // Baseline every record this pull wrote: the named ones AND the family children the
+  // query path brought with them — including children that already existed locally,
+  // whose old baselines are now stale. The non-query paths do not report what they
+  // wrote, so for those fall back to whatever keys.ts newly registered.
   const tableFor = new Map()
   const table = flags.table || config.table
   if (table) for (const id of sysIds) tableFor.set(id, table)
-  const unknown = imported.filter((id) => !tableFor.has(id))
+  for (const record of collect) if (!tableFor.has(record.sysId)) tableFor.set(record.sysId, record.table)
+  const nowLocal = loadProjectRecordIds(project)
+  const discovered = [...nowLocal].filter((id) => !alreadyLocal.has(id) && !tableFor.has(id))
+  const baselined = [...new Set([...sysIds, ...collect.map((record) => record.sysId), ...discovered])]
+  // The ids the USER named deserve a warning when they get no baseline. The rest do not:
+  // keys.ts also carries the SDK's own scaffolding (the sys_module rows for
+  // bom.json/package.json) — build bookkeeping with no instance record at all.
+  const namedByUser = new Set(sysIds)
+  const unknown = baselined.filter((id) => !tableFor.has(id))
   if (unknown.length) for (const [id, info] of discoverTables(unknown, auth)) tableFor.set(id, info.table)
 
   const instance = resolveInstance(auth)
   console.log('\nRecording pull baselines...')
   let written = 0
   const skipped = []
-  for (const sysId of imported) {
+  for (const sysId of baselined) {
     const recordTable = tableFor.get(sysId)
     if (!recordTable) {
       if (namedByUser.has(sysId)) {
@@ -2650,8 +2779,6 @@ async function commandPull(flags, config, positional) {
       }
       continue
     }
-    // Local build bookkeeping the SDK registers for bom.json/package.json — not a
-    // record on the instance, so there is nothing to snapshot.
     if (recordTable === 'sys_module' && !namedByUser.has(sysId)) continue
     // One unreadable record must not cost every later record its baseline.
     try {
@@ -2662,7 +2789,9 @@ async function commandPull(flags, config, positional) {
         continue
       }
       writeBaseline(project, recordTable, sysId, instance, row)
-      console.log(`  ${recordTable} ${sysId} baseline recorded (${Object.keys(row).length} fields)`)
+      const adoptedFrom = adoptionFor(project, sysId)
+      console.log(`  ${recordTable} ${sysId} baseline recorded (${Object.keys(row).length} fields)`
+        + `${adoptedFrom ? `, adopted from ${adoptedFrom.from.name}` : ''}`)
       written++
     } catch (error) {
       console.warn(`  ! ${recordTable} ${sysId}: ${error && error.message ? error.message : error}`)
@@ -2723,6 +2852,144 @@ const GLOBAL_SCOPE_ID = 'global'
 function scopeOf(fields) {
   const value = fields.sys_scope
   return value ? String(value) : ''
+}
+
+// ---------------------------------------------------------------------------
+// Scope ADOPTION: pull a record from another scope, push it back where it came from
+// ---------------------------------------------------------------------------
+// A Fluent project is bound to one scope, and the SDK enforces it at build time: a
+// script include pulled from Global carries apiName 'global.X', and a project bound to
+// x_my_app refuses to compile it ("error TS11: apiName must begin with 'x_my_app.'").
+//
+// So pull ADOPTS such a record: it rewrites sys_scope and the api_name prefix into the
+// project's scope in the rebuilt XML, BEFORE the offline transform, and the Fluent
+// source compiles as if the record had always been the project's. The baseline keeps
+// the ORIGIN (scope id + api_name prefix), and push translates those fields back and
+// updates the original record — same sys_id, in the scope it lives in. That is also
+// the only thing a Table API write could do: sys_scope is inert, so an existing Global
+// record stays Global whatever the body says.
+//
+// To actually MOVE a record into the project's scope, use update-set-package: its
+// payload carries the project's sys_scope and the commit honours it.
+
+// Adoption is a durable fact about the SOURCE ("this file is written in x_my_app's
+// terms, but the record lives in Global"), so it lives in its own file — never in a
+// pull baseline. Baselines are disposable snapshots: they are deleted when a read-back
+// fails, skipped by --no-state, absent in a fresh clone. When the adoption went with
+// them, update-set-package silently packaged the record as a MOVE into the project's
+// scope, renaming its api_name and breaking every caller. Commit this file with the
+// source it describes.
+function adoptionsPath(project) {
+  return join(project, '.now-fluent', 'adopted.json')
+}
+
+function readAdoptions(project) {
+  try { return JSON.parse(readFileSync(adoptionsPath(project), 'utf8')) } catch { return {} }
+}
+
+function adoptionFor(project, sysId) {
+  const entry = readAdoptions(project)[sysId]
+  return entry && entry.from && entry.to ? entry : null
+}
+
+// Record (entry) or forget (null) one record's adoption. Writes only on a change.
+function setAdoption(project, sysId, entry) {
+  const all = readAdoptions(project)
+  if (entry) all[sysId] = entry
+  else if (sysId in all) delete all[sysId]
+  else return
+  mkdirSync(dirname(adoptionsPath(project)), { recursive: true })
+  writeFileSync(adoptionsPath(project), `${JSON.stringify(all, null, 2)}\n`)
+}
+
+// Deliberately now.config.json ONLY, not the wrapper's .now-fluent.json: adoption exists
+// to satisfy the SDK's build-time check (TS11), and the SDK compiles against
+// now.config.json. The wrapper config's scope is update-set-package's packaging
+// DEFAULT, which may legitimately name some other scope.
+function projectScopeOf(project) {
+  const config = readProjectConfig(project)
+  const scope = config.scope ? String(config.scope) : ''
+  const scopeId = config.scopeId ? String(config.scopeId) : (scope === GLOBAL_SCOPE_ID ? GLOBAL_SCOPE_ID : '')
+  return scope && scopeId ? { scope, scopeId } : null
+}
+
+// The scope name an api_name starts with ("global" in "global.PriceUtils").
+function apiPrefixOf(apiName) {
+  const text = apiName ? String(apiName) : ''
+  const dot = text.indexOf('.')
+  return dot > 0 ? text.slice(0, dot) : ''
+}
+
+// Classify one queried row (Table API JSON, display values included) against the
+// project's scope, and — when `rewrite` — rewrite it into that scope.
+//
+// The two are separate on purpose. Whether a record is ADOPTED is a fact about where it
+// lives: the SDK build stamps the PROJECT's sys_scope onto every artifact regardless of
+// the source, so any record living elsewhere comes out of the build looking like the
+// project's — rewritten or not. Rewriting is only what makes an apiName-bearing record
+// compile (TS11). So --no-adopt-scope skips the rewrite, but the origin is still known
+// and still recorded; forgetting it would let update-set-package package the record as
+// a MOVE into the project's scope.
+function adoptRowScope(row, projectScope, { rewrite = true } = {}) {
+  const originScopeId = fieldValue(row.sys_scope)
+  if (!projectScope || !originScopeId || originScopeId === projectScope.scopeId) {
+    return { row, adopted: null, rewritten: false }
+  }
+  const apiName = fieldValue(row.api_name)
+  const fromPrefix = apiPrefixOf(apiName)
+  const adopted = { originScopeId, originName: fieldParts(row.sys_scope).display || originScopeId, apiName, fromPrefix }
+  if (!rewrite) return { row, adopted, rewritten: false }
+  const next = { ...row, sys_scope: { value: projectScope.scopeId, display_value: projectScope.scope } }
+  if (fromPrefix) {
+    next.api_name = { value: `${projectScope.scope}.${apiName.slice(fromPrefix.length + 1)}`, display_value: '' }
+  }
+  return { row: next, adopted, rewritten: true }
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// The adoption recorded for any record a built payload defines (a family payload can
+// define several; they were adopted together, so the first one found speaks for all).
+function adoptionForPayload(project, xml) {
+  for (const record of parseRecordUpdateRecords(xml)) {
+    const adopted = record.sysId ? adoptionFor(project, record.sysId) : null
+    if (adopted) return adopted
+  }
+  return null
+}
+
+// The payload-level inverse of adoption: put sys_scope and the api_name prefix back to
+// the origin, so an update set edits the record IN PLACE instead of moving it. sys_scope
+// goes through rewriteSysScope, the one place that already handles every form the
+// element takes (self-closing, attributes) — a second regex would drift from it.
+function translateAdoptedPayload(xml, adoptedScope) {
+  const { from, to } = adoptedScope
+  let out = rewriteSysScope(String(xml), from.name || from.scopeId, from.scopeId)
+  if (from.apiPrefix && to.apiPrefix) {
+    out = out.replace(new RegExp(`<api_name>${escapeRegExp(to.apiPrefix)}\\.`, 'g'), `<api_name>${from.apiPrefix}.`)
+  }
+  return out
+}
+
+// The inverse, for push: turn the built artifact's project-scoped fields back into the
+// origin's. Only fields that still carry the project's values are touched, so a record
+// whose source was edited to name some other scope is left for the scope guard to judge.
+function translateAdoptedScope(fields, adoptedScope) {
+  if (!adoptedScope || !adoptedScope.from || !adoptedScope.to) return { fields, translated: false }
+  const { from, to } = adoptedScope
+  const out = { ...fields }
+  let translated = false
+  if (out.sys_scope === to.scopeId) {
+    out.sys_scope = from.scopeId
+    translated = true
+  }
+  if (from.apiPrefix && to.apiPrefix && out.api_name && out.api_name.startsWith(`${to.apiPrefix}.`)) {
+    out.api_name = `${from.apiPrefix}.${out.api_name.slice(to.apiPrefix.length + 1)}`
+    translated = true
+  }
+  return { fields: out, translated }
 }
 
 // EXPERIMENTAL: point the calling user's session at an update set before writing, so
@@ -2855,6 +3122,10 @@ async function findPreferenceId(instance, userId) {
 
 // Push ONE built record. Returns the bucket it belongs in; throws on a transport
 // error so the caller can record the failure and carry on with the next record.
+//
+// A dry run goes through EVERY step here — the reads, the diff, every guard — and stops
+// only where a write would be sent. That is what makes its preview trustworthy: it shows
+// the real verb, the real (diffed) body, and the refusals the real run would hit.
 async function pushRecord(target, label, context) {
   const { project, instance, flags, auth, dryRun, force, writtenRecords } = context
   const { table, sysId, action } = target.record
@@ -2874,18 +3145,31 @@ async function pushRecord(target, label, context) {
     return 'unchanged'
   }
 
-  const payload = recordFieldsToPayload(record.fields, { keepScope: !flags['no-scope'] })
-  const live = dryRun ? null : await snGetRecord(instance, table, sysId, 'sys_id,sys_updated_on,sys_mod_count', { throwOnError: true })
-
+  // ---- the baseline, if it is one for THIS instance ------------------------
   // A baseline pulled from a DIFFERENT instance describes a different record, so it is
   // no basis for a diff (and would be overwritten with this instance's values). Drop it
   // and let the "no baseline" guard below refuse the push.
   const stored = readBaseline(project, table, sysId)
-  const foreign = Boolean(stored && !dryRun && stored.instance && stored.instance !== instance.origin)
+  const foreign = Boolean(stored && stored.instance && stored.instance !== instance.origin)
   if (foreign) {
     console.warn(`${label} the stored baseline was pulled from ${stored.instance}, not ${instance.origin} — ignoring it.`)
   }
   const baseline = foreign ? null : stored
+
+  // ---- an ADOPTED record goes back to where it lives -----------------------
+  // Its source was written in the project's scope so it would compile. Put it back in
+  // its origin's terms before anything else looks at it: the payload, the diff and the
+  // scope guards must all see the record as it really is on the instance.
+  const adoptedScope = adoptionFor(project, sysId)
+  const { fields, translated } = translateAdoptedScope(record.fields, adoptedScope)
+  if (translated) {
+    const api = fields.api_name && fields.api_name !== record.fields.api_name
+      ? ` (api_name ${record.fields.api_name} -> ${fields.api_name})` : ''
+    console.log(`${label} adopted from ${adoptedScope.from.name}: pushing it back there${api}`)
+  }
+  const payload = recordFieldsToPayload(fields, { keepScope: !flags['no-scope'] })
+
+  const live = await snGetRecord(instance, table, sysId, 'sys_id,sys_updated_on,sys_mod_count,sys_scope', { throwOnError: true })
 
   // ---- has somebody else changed it since the pull? ------------------------
   const drifted = Boolean(live && baseline
@@ -2909,20 +3193,23 @@ async function pushRecord(target, label, context) {
   }
 
   // ---- DELETE, now that the guards above have had their say ----------------
-  // Destroying a record deserves at least the checks an update gets: the drift and
-  // baseline guards ran above and already returned 'failed' if they were not satisfied.
+  // Destroying a record deserves at least the checks an update gets.
   if (deleting) {
-    if (!dryRun && !live) {
+    if (!live) {
       console.log(`${label} already absent`)
-      removeBaseline(project, table, sysId)
+      if (!dryRun) {
+        removeBaseline(project, table, sysId)
+        setAdoption(project, sysId, null)
+      }
       return 'unchanged'
     }
     if (dryRun) {
-      console.log(`${label}\n      DELETE ${instance.origin}/api/now/table/${table}/${sysId}`)
+      console.log(`${label} would DELETE ${instance.origin}/api/now/table/${table}/${sysId}`)
       return 'deleted'
     }
     await snRequest(instance, 'DELETE', `/api/now/table/${table}/${sysId}`, { allow404: true, throwOnError: true })
     removeBaseline(project, table, sysId)
+    setAdoption(project, sysId, null)
     console.log(`${label} deleted`)
     return 'deleted'
   }
@@ -2947,18 +3234,6 @@ async function pushRecord(target, label, context) {
     }
   }
 
-  // A dry run deliberately contacts nothing, so it cannot know whether the record
-  // exists — say so rather than guessing a verb, and show the FULL payload, which is
-  // the most a real run could send (a real run diffs it down to what changed).
-  if (dryRun) {
-    console.log(`${label}\n`
-      + `      PUT  ${instance.origin}/api/now/table/${table}/${sysId}   (if it exists)\n`
-      + `      POST ${instance.origin}/api/now/table/${table}   (if it does not, with sys_id: ${sysId})\n`
-      + `      ${Object.keys(body).length} field(s) at most; a real push sends only what differs from the baseline\n`
-      + previewPayload(body))
-    return 'updated'
-  }
-
   // A Table API insert honours a supplied sys_id, which is what keeps the record's
   // identity equal to the sys_id the SDK's Now.ID generated for it.
   const creating = !live
@@ -2967,7 +3242,7 @@ async function pushRecord(target, label, context) {
   const path = creating ? `/api/now/table/${table}` : `/api/now/table/${table}/${sysId}`
 
   // ---- a create cannot choose its scope, so do not let it choose wrongly ---
-  const artifactScope = scopeOf(record.fields)
+  const artifactScope = scopeOf(fields)
   const targetScope = flags['target-scope']
   if (creating && artifactScope && artifactScope !== GLOBAL_SCOPE_ID && targetScope !== GLOBAL_SCOPE_ID) {
     console.error(`${label} REFUSED: this record does not exist yet, and a Table API create cannot put it `
@@ -2977,6 +3252,31 @@ async function pushRecord(target, label, context) {
       + '      Either promote it with update-set-package (which sets the scope in the payload), or, if you\n'
       + '      really do want it in Global, say so: --target-scope global')
     return 'failed'
+  }
+
+  // ---- an update cannot change scope, so a mismatch means the SOURCE is wrong ----
+  // Checked BEFORE the write. Afterwards is too late: the body carries the source's
+  // api_name, and if the platform honours that on a PUT, a Global record gets renamed to
+  // x_my_app.X and every caller of global.X breaks before any check could notice.
+  // Typical cause: nothing records where the record really lives — a clone without
+  // .now-fluent/adopted.json, or a --via transform|move import.
+  const liveScope = live ? scopeOf(live) : ''
+  if (!creating && artifactScope && liveScope && artifactScope !== liveScope) {
+    console.error(`${label} REFUSED before writing: the source puts this record in scope ${artifactScope}, `
+      + `but on the instance it lives in ${liveScope}.\n`
+      + '      A Table API write cannot move a record between scopes, and sending the source as-is could\n'
+      + '      rename its api_name out from under every caller.\n'
+      + `      If you meant to edit it where it lives: pull it again (now-fluent pull --sys-id ${sysId}) — pull\n`
+      + '      ADOPTS records from other scopes and push then returns them to their origin.\n'
+      + "      If you meant to MOVE it into your project's scope: that is an update set, not a push —\n"
+      + '      update-set-package --move-adopted.')
+    return 'failed'
+  }
+
+  if (dryRun) {
+    console.log(`${label} would ${method} ${instance.origin}${path}  (${Object.keys(body).length} field(s))\n`
+      + previewPayload(body))
+    return creating ? 'created' : 'updated'
   }
 
   await snRequest(instance, method, path, { body, params: { sysparm_fields: 'sys_id' }, throwOnError: true })
@@ -3003,14 +3303,25 @@ async function pushRecord(target, label, context) {
   }
 
   // ---- where did it ACTUALLY land? ----------------------------------------
-  // Never trust the write: read the scope back. This is the only thing standing
-  // between a scoped project and a silently mis-scoped instance record.
+  // Never trust the write: read the scope back. After the pre-write guards this only
+  // fires on a create, or on an instance that does something unexpected.
   const landedScope = written ? scopeOf(written) : ''
   if (artifactScope && landedScope && landedScope !== artifactScope) {
     const apiNameNote = written.api_name ? ` Its api_name is now "${written.api_name}".` : ''
     if (targetScope === GLOBAL_SCOPE_ID && landedScope === GLOBAL_SCOPE_ID) {
+      // The source still says the project's scope; the record lives in Global. That is
+      // exactly an adoption, so record it — otherwise every later push of this record
+      // is refused by the pre-write scope guard above.
+      const projectScope = projectScopeOf(project)
+      const projectPrefix = apiPrefixOf(record.fields.api_name) || (projectScope ? projectScope.scope : '')
+      setAdoption(project, sysId, {
+        table,
+        from: { scopeId: GLOBAL_SCOPE_ID, name: 'global', apiPrefix: apiPrefixOf(written.api_name) },
+        to: { scopeId: artifactScope, name: projectScope ? projectScope.scope : projectPrefix, apiPrefix: projectPrefix },
+        since: new Date().toISOString()
+      })
       console.warn(`${label} landed in GLOBAL, as --target-scope global asked `
-        + `(the project has it in ${artifactScope}).${apiNameNote}`)
+        + `(the project has it in ${artifactScope}).${apiNameNote} Recorded as adopted, so later pushes go there too.`)
     } else {
       console.error(`${label} WROTE THE RECORD, BUT IT LANDED IN THE WRONG SCOPE.\n`
         + `      the project says: ${artifactScope}\n`
@@ -3117,7 +3428,8 @@ async function commandPush(flags, config, positional) {
       + '  --target-scope global is the only value this transport can actually deliver.')
   }
 
-  const instance = dryRun ? { alias: auth, origin: 'https://<instance>', headers: {} } : resolveInstance(auth)
+  // Even a dry run reads the instance: it is "everything except the write".
+  const instance = resolveInstance(auth)
   let updateSetSession = null
   if (flags['update-set']) {
     if (dryRun) console.log(`[dry-run] would set the session update set to: ${flags['update-set']}`)
@@ -3125,7 +3437,7 @@ async function commandPush(flags, config, positional) {
   }
 
   console.log(dryRun
-    ? `\n[dry-run] ${targets.length} record(s) would be pushed to the instance behind alias "${auth}". Nothing is sent.`
+    ? `\n[dry-run] ${targets.length} record(s) checked against ${instance.origin} — reads only, nothing is written.`
     : `\nPushing ${targets.length} record(s) to ${instance.origin}...`)
   const results = { created: [], updated: [], deleted: [], unchanged: [], failed: [...unresolved] }
   const writtenRecords = []

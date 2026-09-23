@@ -11,8 +11,11 @@ import { createServer } from 'node:http'
 // Default 'default-set', deliberately NOT whatever the sys_update_set preference says —
 // that is the live-verified behaviour --update-set has to cope with. Set
 // captureFollowsPreference:true to model an instance where the preference IS honoured.
+// putReplaces:true models the one platform behaviour that would make push UNSAFE — a
+// PUT that replaces the record rather than merging into it — so the spike can be shown
+// to catch it.
 export async function startMockInstance({
-  records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false
+  records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false
 } = {}) {
   const store = new Map(Object.entries(records))
   const log = []
@@ -59,14 +62,14 @@ export async function startMockInstance({
       return send(200, { result: rows.slice(0, limit).map(project) })
     }
     if (req.method === 'POST') {
-      const id = parsed && parsed.sys_id
-      if (!id) return send(400, { error: { message: 'insert without sys_id' } })
+      // Like the platform: honour a supplied sys_id, generate one otherwise.
+      const id = (parsed && parsed.sys_id) || `gen${String(++clock).padStart(29, '0')}`
       if (store.has(`${table}/${id}`)) return send(403, { error: { message: 'already exists' } })
       // VERIFIED LIVE: the Table API IGNORES sys_scope and puts the record in the scope
       // the REST transaction runs in — Global — rewriting api_name to match. The mock
       // reproduces that by default; honoursScope:true models the world we wrongly
       // assumed, so a test can prove push behaves correctly in both.
-      const row = { ...parsed, sys_updated_on: stamp(), sys_mod_count: '0' }
+      const row = { ...parsed, sys_id: id, sys_updated_on: stamp(), sys_mod_count: '0' }
       if (!honoursScope && row.sys_scope && row.sys_scope !== 'global') {
         row.sys_scope = 'global'
         if (row.api_name) row.api_name = String(row.api_name).replace(/^[^.]+\./, 'global.')
@@ -78,7 +81,8 @@ export async function startMockInstance({
     if (req.method === 'PUT') {
       const row = store.get(key)
       if (!row) return send(404, { error: { message: 'No record found' } })
-      const next = { ...row, ...parsed, sys_updated_on: stamp(), sys_mod_count: String(Number(row.sys_mod_count || 0) + 1) }
+      const base = putReplaces ? { sys_id: row.sys_id, sys_scope: row.sys_scope } : row
+      const next = { ...base, ...parsed, sys_updated_on: stamp(), sys_mod_count: String(Number(row.sys_mod_count || 0) + 1) }
       if (!honoursScope) next.sys_scope = row.sys_scope // inert on update too
       store.set(key, next)
       noteCapture(table, sysId)

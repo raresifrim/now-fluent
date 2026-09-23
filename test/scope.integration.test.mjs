@@ -98,8 +98,9 @@ test('a Global-scoped artifact creates normally, with no ceremony', async () => 
   assert.ok(!/WRONG SCOPE|landed in GLOBAL/.test(result.stdout + result.stderr))
 })
 
-test('an UPDATE whose scope the instance silently changes is reported as failed', async () => {
-  // The record already exists in Global; the project still believes it is scoped.
+test('an UPDATE whose source scope disagrees with the instance is refused before writing', async () => {
+  // The record exists in Global; the project still believes it is scoped. Even --force
+  // must not send it: the body would carry a project-scoped api_name to a Global record.
   instance.store.set(`sys_script_include/${SYS_ID}`, {
     sys_id: SYS_ID, name: 'NowFluentBrandNew', api_name: 'global.NowFluentBrandNew',
     script: 'var NowFluentBrandNew = Class.create();', active: 'true',
@@ -108,9 +109,10 @@ test('an UPDATE whose scope the instance silently changes is reported as failed'
   const result = await push('--sys-id', SYS_ID, '--force')
   assert.notEqual(result.status, 0, 'a scope mismatch must not pass as success')
   const output = result.stdout + result.stderr
-  assert.match(output, /LANDED IN THE WRONG SCOPE/)
-  assert.match(output, /the project says: e5d61884/)
-  assert.match(output, /the instance says: global/)
+  assert.match(output, /REFUSED before writing/)
+  assert.match(output, /scope e5d61884.*lives in global/s)
+  assert.deepEqual(instance.writes(), [], '--force does not override a scope mismatch')
+  assert.equal(instance.store.get(`sys_script_include/${SYS_ID}`).api_name, 'global.NowFluentBrandNew')
 })
 
 test('when the platform DOES honour sys_scope, push just works', async () => {
@@ -128,4 +130,31 @@ test('when the platform DOES honour sys_scope, push just works', async () => {
   } finally {
     await honouring.stop()
   }
+})
+
+
+test('after a --target-scope global create, later pushes of that record still work', async () => {
+  // The create lands in Global while the source still says x_push_demo. Without an
+  // adoption recorded, the pre-write scope guard would refuse every later update.
+  assert.equal((await push('--sys-id', SYS_ID, '--target-scope', 'global')).status, 0)
+  writeFileSync(join(project, 'dist', 'app', 'update', `sys_script_include_${SYS_ID}.xml`),
+    ['<record_update table="sys_script_include">',
+      '  <sys_script_include action="INSERT_OR_UPDATE" apply_defaults="true">',
+      '    <active>true</active>',
+      '    <api_name>x_push_demo.NowFluentBrandNew</api_name>',
+      '    <name>NowFluentBrandNew</name>',
+      '    <script><![CDATA[var NowFluentBrandNew = Class.create(); // v2]]></script>',
+      `    <sys_id>${SYS_ID}</sys_id>`,
+      `    <sys_scope display_value="x_push_demo">${APP_SCOPE}</sys_scope>`,
+      '  </sys_script_include>'].join('\n') + '\n</record_update>')
+  instance.log.length = 0
+
+  const second = await push('--sys-id', SYS_ID)
+  assert.equal(second.status, 0, second.stdout + second.stderr)
+  assert.match(second.stdout, /pushing it back there/)
+  const writes = instance.writes()
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].method, 'PUT')
+  assert.deepEqual(Object.keys(writes[0].body), ['script'])
+  assert.equal(instance.store.get(`sys_script_include/${SYS_ID}`).api_name, 'global.NowFluentBrandNew')
 })

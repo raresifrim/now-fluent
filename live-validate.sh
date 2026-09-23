@@ -76,7 +76,7 @@ fi
 
 # ---------------------------------------------------------------------------
 WORK="$REPO/../push-demo-live"
-hr "PHASE 3 — real round trip (project: $WORK)"
+hr "PHASE 3 — cross-scope round trip: a GLOBAL record, edited in a SCOPED project (x_push_demo)"
 if [ ! -d "$WORK" ]; then
   mkdir -p "$WORK" && cd "$WORK"
   now-sdk init --appName "Push Demo" --packageName push-demo \
@@ -102,25 +102,102 @@ console.log(id)
 ")
 echo "target sys_id: $TARGET"
 
-note "pull"
-$NF pull --project . --auth "$AUTH" --sys-id "$TARGET"
+# Delete the throwaway through push's own transport (now-sdk has no write command).
+cleanup_target() {
+  node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+await snRequest(resolveInstance('$AUTH'), 'DELETE', '/api/now/table/sys_script_include/$TARGET', { allow404: true, throwOnError: true })
+console.log('deleted throwaway sys_script_include $TARGET')
+" || echo "could not delete $TARGET — remove it in the UI"
+}
 
-note "baseline recorded at:"
-ls -l .now-fluent/state/ 2>/dev/null
+note "pull — EXPECTED: 'pull ADOPTS them', and the record imports (no TS11)"
+if ! $NF pull --project . --auth "$AUTH" --sys-id "$TARGET"; then
+  # Everything below depends on the pull. Cascading into three more errors would hide
+  # which one is real.
+  echo "PHASE 3 STOPPED: pull failed, so there is nothing to push. See the error above."
+  cleanup_target
+  exit 1
+fi
+
+note "adoption — EXPECTED: .now-fluent/adopted.json has an entry for it, from global to x_push_demo"
+node -e "const a = require('./.now-fluent/adopted.json'); console.log(JSON.stringify(a['$TARGET'] || 'NOT RECORDED', null, 2))" 2>/dev/null \
+  || echo "NOT RECORDED: .now-fluent/adopted.json missing"
+note "baseline — EXPECTED: the LIVE record, still global / global.NowFluentRoundTrip..."
+node -e "const fs=require('fs'); const f=fs.readdirSync('.now-fluent/state').find(n=>n.includes('$TARGET')); const b=JSON.parse(fs.readFileSync('.now-fluent/state/'+f,'utf8')); console.log(JSON.stringify({ sys_scope: b.fields.sys_scope, api_name: b.fields.api_name }))" 2>/dev/null
 
 note "edit ONLY the description in the generated Fluent source"
 GEN=$(grep -rl "$TARGET" src/ 2>/dev/null | head -1)
 echo "generated file: $GEN"
+note "EXPECTED: its apiName starts with 'x_push_demo.' — that is what makes it compile"
+grep -n "apiName" "$GEN" 2>/dev/null
 [ -n "$GEN" ] && sed -i.bak "s/round-trip target — safe to delete/EDITED BY PUSH/" "$GEN" && grep -n "EDITED BY PUSH" "$GEN"
 
-note "push --dry-run (safe, shows exactly what would be written)"
+note "push --dry-run (reads only) — EXPECTED: 'would PUT ... (1 field(s))', only description"
 $NF push --project . --auth "$AUTH" --sys-id "$TARGET" --dry-run
 
-note "push FOR REAL"
+note "push FOR REAL — EXPECTED: 'adopted from global: pushing it back there', 'updated (1 field(s))'"
+$NF push --project . --auth "$AUTH" --sys-id "$TARGET"
+echo "push exit=$?"
+
+note "verify ON THE INSTANCE — EXPECTED: description='EDITED BY PUSH', script still 'marker: ORIGINAL BODY',"
+note "sys_scope STILL 'global', api_name STILL 'global.NowFluentRoundTrip...' (NOT x_push_demo.)"
+now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$TARGET" -f name,api_name,description,script,sys_scope,sys_mod_count
+
+note "push again with no edit — EXPECTED: unchanged, nothing sent"
 $NF push --project . --auth "$AUTH" --sys-id "$TARGET"
 
-note "verify: ONLY description changed — script must still say 'marker: ORIGINAL BODY'"
-now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$TARGET" -f name,description,script,sys_scope,sys_mod_count
+# ---------------------------------------------------------------------------
+hr "PHASE 3b — update-set-package and an ADOPTED record (local only, writes nothing)"
+note "packaging it for the PROJECT scope — EXPECTED: REFUSED ('would MOVE them into x_push_demo')"
+$NF update-set-package --project . --update-set-name "nf adopted check" --include "$TARGET"
+echo "exit=$? (non-zero expected)"
+note "packaging it for its ORIGIN — EXPECTED: 'IN-PLACE edits in their origin scope'"
+$NF update-set-package --project . --update-set-name "nf adopted check" --include "$TARGET" \
+  --scope global --scope-id global
+note "EXPECTED: the payload says global.NowFluentRoundTrip..., never x_push_demo."
+grep -o "global\.NowFluentRoundTrip[0-9a-f]*\|x_push_demo\.NowFluentRoundTrip[0-9a-f]*" \
+  exports/nf-adopted-check/update-set-*.xml 2>/dev/null | sort | uniq -c
+
+# ---------------------------------------------------------------------------
+hr "PHASE 4b — --update-set on a real push (repoints the preference, then VERIFIES capture)"
+# Runs BEFORE cleanup: it needs the round-trip record to still exist.
+US_NAME="now-fluent 4b $(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")"
+US_ID=$(node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+const r = await snRequest(resolveInstance('$AUTH'), 'POST', '/api/now/table/sys_update_set', {
+  throwOnError: true, body: { name: '$US_NAME', description: 'now-fluent live-validate 4b — safe to delete' },
+  params: { sysparm_fields: 'sys_id' } })
+console.log(r.sys_id)")
+echo "created update set: $US_NAME ($US_ID)"
+
+pref_value() {
+  node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+const me = await snRequest(inst, 'GET', '/api/now/ui/user/current_user', { throwOnError: true })
+const rows = await snRequest(inst, 'GET', '/api/now/table/sys_user_preference', { throwOnError: true,
+  params: { sysparm_query: 'name=sys_update_set^user=' + (me.user_sys_id || me.sys_id), sysparm_fields: 'value', sysparm_limit: '1' } })
+console.log(rows.length ? rows[0].value : '(none)')"
+}
+BEFORE=$(pref_value)
+echo "your update set preference BEFORE: $BEFORE"
+
+[ -n "$GEN" ] && sed -i.bak "s/EDITED BY PUSH/EDITED AGAIN FOR 4b/" "$GEN"
+note "push --update-set — EXPECTED: 'did NOT land in \"$US_NAME\"', names where it went, exit non-zero"
+$NF push --project . --auth "$AUTH" --sys-id "$TARGET" --update-set "$US_ID"
+echo "push exit=$? (non-zero expected: capture cannot be steered on this instance)"
+
+AFTER=$(pref_value)
+echo "your update set preference AFTER:  $AFTER"
+if [ "$BEFORE" = "$AFTER" ]; then echo "OK: preference restored"; else echo "PROBLEM: preference NOT restored ($BEFORE -> $AFTER)"; fi
+
+node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+await snRequest(resolveInstance('$AUTH'), 'DELETE', '/api/now/table/sys_update_set/$US_ID', { allow404: true, throwOnError: true })
+console.log('deleted update set $US_ID')" || echo "could not delete update set $US_ID — remove it in the UI"
+
+cleanup_target
 
 # ---------------------------------------------------------------------------
 hr "PHASE 4a — push a record that does NOT exist yet (expect POST, sys_id preserved)"
@@ -132,16 +209,6 @@ echo "    $NF push --project . --auth $AUTH --sys-id $NEWID"
 echo "    now-sdk query sys_script_include --auth $AUTH -q sys_id=$NEWID -f sys_id,name"
 note "(left manual — it needs a hand-written Fluent source file)"
 
-hr "PHASE 4b — --update-set (repoints the preference, then VERIFIES where capture landed)"
-note "BEFORE: your current update set preference"
-now-sdk query sys_user_preference --auth "$AUTH" -q "name=sys_update_set" -f user,value --limit 5
-note "create an in-progress update set in the UI, then:"
-echo "    $NF push --project . --auth $AUTH --sys-id $TARGET --update-set '<name>'"
-note "EXPECTED: push reports the capture landed somewhere ELSE (e.g. Default) and FAILS"
-note "the run. That is correct — a REST transaction resolves its own update set, so the"
-note "flag can only report the truth, not steer it. Use update-set-package to promote."
-note "AFTER the push, re-run the query above — the value MUST be back to what it was."
-
 hr "PHASE 4c — --target-scope (scoped project -> Global)"
 note "From a SCOPED project, a create is refused unless you name the outcome:"
 echo "    $NF push --project . --auth $AUTH --sys-id <new sys_id>"
@@ -150,10 +217,7 @@ echo "    $NF push --project . --auth $AUTH --sys-id <new sys_id> --target-scope
 note "  EXPECTED: created, with a line saying it landed in GLOBAL and what api_name it got"
 echo "    $NF push --project . --auth $AUTH --sys-id <new sys_id> --target-scope x_other"
 note "  EXPECTED: refused before any request, pointing at update-set-package"
-note "NOTE: a scope-bound project cannot compile apiName: 'global.X' (TS11), so this"
-note "works for tables WITHOUT an apiName (business rules, UI policies). For script"
-note "includes use a Global-bound project or update-set-package."
+note "This is for records AUTHORED in the scoped project. A record PULLED from Global"
+note "needs none of this: pull adopts it and push returns it to Global (phase 3)."
 
 hr "DONE — transcript: $LOG"
-echo "throwaway record left behind for inspection: sys_script_include $TARGET"
-echo "delete it with: now-sdk query is read-only; remove it in the UI, or re-run verify-push style DELETE."
