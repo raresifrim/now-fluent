@@ -509,8 +509,10 @@ if (fs.existsSync(f)) { const a = JSON.parse(fs.readFileSync(f, 'utf8')); delete
 
 # ---------------------------------------------------------------------------
 # Flows: a Flow() builds into ONE artifact (flow + trigger + steps + delete_multiple
-# directives); push writes it as one unit, keeps a live flow's active/status, and then
-# activates it through api/now/wfa_fluent/activate_flows, as install does.
+# directives); push LOADS it as one unit through api/fluent/load/<scope> — the loader
+# install uses for a configuration project — and then activates it through
+# api/now/wfa_fluent/activate_flows, as install does. (Written record by record through the
+# Table API, every row landed but Flow Designer showed the flow EMPTY: seen live.)
 FRAND=$(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")
 FNAME="NowFluent Flow $FRAND"
 FMARK="NowFluentFlow$FRAND"
@@ -546,10 +548,16 @@ import { resolveInstance, snRequest, snGetRecord, RAW_READ_PARAMS } from '$REPO/
 const inst = resolveInstance('$AUTH')
 const f = await snGetRecord(inst, 'sys_hub_flow', '$1', 'name,active,status,sys_scope,latest_snapshot,master_snapshot', { throwOnError: true })
 if (!f) { console.log('  no sys_hub_flow $1 on the instance'); process.exit(0) }
-console.log('  flow: ' + f.name + '  active=' + f.active + '  status=' + f.status + '  sys_scope=' + f.sys_scope
-  + '  snapshot=' + (f.latest_snapshot || f.master_snapshot ? 'yes' : 'none'))
+console.log('  flow: ' + f.name + '  active=' + f.active + '  status=' + f.status + '  sys_scope=' + f.sys_scope)
 const list = (t, q, fields) => snRequest(inst, 'GET', '/api/now/table/' + t, { throwOnError: true,
   params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: fields, sysparm_limit: '100' } })
+const snaps = await list('sys_hub_flow_snapshot', 'parent_flow=$1', 'sys_id,master,status').catch(() => [])
+console.log('  latest_snapshot=' + (f.latest_snapshot || '(empty)') + '  master_snapshot=' + (f.master_snapshot || '(empty)')
+  + '  snapshots: ' + snaps.length)
+for (const id of [...new Set([f.latest_snapshot, f.master_snapshot].filter(Boolean))]) {
+  const [t, a] = [await list('sys_hub_trigger_instance_v2', 'flow=' + id, 'sys_id'), await list('sys_hub_action_instance_v2', 'flow=' + id, 'sys_id')]
+  console.log('    snapshot ' + id + ': ' + t.length + ' trigger(s), ' + a.length + ' step(s) attached')
+}
 const triggers = await list('sys_hub_trigger_instance_v2', 'flow=$1', 'sys_id,trigger_type')
 console.log('  triggers: ' + triggers.length + triggers.map((t) => ' [' + t.trigger_type + ']').join(''))
 const steps = await list('sys_hub_action_instance_v2', 'flow=$1^ORDERBYorder', 'sys_id,order,values')
@@ -569,8 +577,13 @@ const f = await snGetRecord(inst, 'sys_hub_flow', '$1', 'sys_id,sys_scope', { th
 if (!f) { console.log('flow $1 is already gone'); process.exit(0) }
 const scope = f.sys_scope
 let n = 0
-for (const [t, q] of [['sys_hub_action_instance_v2', 'flow=$1'], ['sys_hub_trigger_instance_v2', 'flow=$1'],
-  ['sys_hub_flow_logic_instance_v2', 'flow=$1'], ['sys_hub_sub_flow_instance_v2', 'flow=$1'], ['sys_hub_flow_snapshot', 'parent_flow=$1']]) {
+// A loaded or published flow also has snapshots, with their own copies of the graph.
+let snaps = []
+try { snaps = (await snRequest(inst, 'GET', '/api/now/table/sys_hub_flow_snapshot', { throwOnError: true,
+  params: { ...RAW_READ_PARAMS, sysparm_query: 'parent_flow=$1', sysparm_fields: 'sys_id', sysparm_limit: '50' } })).map((r) => r.sys_id) } catch {}
+const owners = ['$1', ...snaps].join(',')
+for (const [t, q] of [['sys_hub_action_instance_v2', 'flowIN' + owners], ['sys_hub_trigger_instance_v2', 'flowIN' + owners],
+  ['sys_hub_flow_logic_instance_v2', 'flowIN' + owners], ['sys_hub_sub_flow_instance_v2', 'flowIN' + owners], ['sys_hub_flow_snapshot', 'parent_flow=$1']]) {
   let rows = []
   try { rows = await snRequest(inst, 'GET', '/api/now/table/' + t, { throwOnError: true,
     params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: 'sys_id', sysparm_limit: '200' } }) } catch { continue }
@@ -591,9 +604,15 @@ const list = async (t, q, fields, limit = '1') => {
     params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: fields || '', sysparm_limit: limit } }) }
   catch (e) { return null }
 }
-const refTrigger = (await list('sys_hub_trigger_instance_v2', 'trigger_type=record_create^flow!=' + OURS + '^flow.type=flow^ORDERBYDESCsys_updated_on', 'sys_id,flow')) || []
-if (!refTrigger.length) { console.log('  no Flow Designer flow with a record-created trigger to compare against'); process.exit(0) }
-const REF = refTrigger[0].flow
+// The reference must be a real sys_hub_flow: a trigger's flow field can also point at a
+// snapshot (seen live — an id that read back as an empty sys_hub_flow).
+const candidates = (await list('sys_hub_flow', 'type=flow^active=true^sys_id!=' + OURS + '^ORDERBYDESCsys_updated_on', 'sys_id', '30')) || []
+let REF = '', refTrigger = []
+for (const c of candidates) {
+  const t = (await list('sys_hub_trigger_instance_v2', 'flow=' + c.sys_id + '^trigger_type=record_create', 'sys_id,flow')) || []
+  if (t.length) { REF = c.sys_id; refTrigger = t; break }
+}
+if (!REF) { console.log('  no active Flow Designer flow with a record-created trigger to compare against'); process.exit(0) }
 const SKIP = new Set(['sys_id','sys_created_by','sys_created_on','sys_updated_by','sys_updated_on','sys_mod_count','name','description','label_cache','sys_tags','internal_name','copied_from','copied_from_name'])
 const diff = (label, a, b) => {
   const keys = [...new Set([...Object.keys(a || {}), ...Object.keys(b || {})])].filter((k) => !SKIP.has(k)).sort()
@@ -613,19 +632,25 @@ diff('sys_hub_flow', await snGetRecord(inst, 'sys_hub_flow', OURS, undefined, { 
 const ourTrig = ((await list('sys_hub_trigger_instance_v2', 'flow=' + OURS)) || [])[0]
 diff('sys_hub_trigger_instance_v2', ourTrig && await snGetRecord(inst, 'sys_hub_trigger_instance_v2', ourTrig.sys_id, undefined, { throwOnError: true }),
   await snGetRecord(inst, 'sys_hub_trigger_instance_v2', refTrigger[0].sys_id, undefined, { throwOnError: true }))
-console.log('  records attached to each flow (ours / flow designer):')
+const ourFlow = await snGetRecord(inst, 'sys_hub_flow', OURS, 'latest_snapshot,master_snapshot', { throwOnError: true }) || {}
+const owners = (row, id) => [id, ...new Set([row.latest_snapshot, row.master_snapshot].filter((s) => s && s !== id))]
+const [oursIds, refIds] = [owners(ourFlow, OURS), owners(ref || {}, REF)]
+console.log('  snapshots: ours ' + (oursIds.length - 1) + ', flow designer ' + (refIds.length - 1))
+console.log('  records attached to each flow, then to its snapshot(s) (ours / flow designer):')
 for (const [t, f] of [['sys_hub_trigger_instance_v2','flow'],['sys_hub_trigger_instance','flow'],['sys_hub_action_instance_v2','flow'],
   ['sys_hub_action_instance','flow'],['sys_hub_flow_logic_instance_v2','flow'],['sys_hub_flow_snapshot','parent_flow'],
   ['sys_hub_flow_variable','model'],['sys_hub_flow_input','model'],['sys_hub_flow_output','model'],['sys_hub_flow_stage','flow'],
   ['sys_hub_alias_mapping','flow'],['sys_hub_flow_trigger_config','flow']]) {
-  const count = async (id) => { const rows = await list(t, f + '=' + id, 'sys_id', '101'); return rows === null ? 'n/a' : rows.length > 100 ? '100+ (field ignored?)' : String(rows.length) }
-  const [a, b] = [await count(OURS), await count(REF)]
-  console.log('    ' + (t + '.' + f).padEnd(40) + a.padStart(5) + ' / ' + b + (a !== b ? '   <--' : ''))
+  const count = async (ids) => { if (!ids.length) return '-'; const rows = await list(t, f + 'IN' + ids.join(','), 'sys_id', '101'); return rows === null ? 'n/a' : rows.length > 100 ? '100+ (field ignored?)' : String(rows.length) }
+  const [a, b] = [await count([OURS]), await count([REF])]
+  const [sa, sb] = [await count(oursIds.slice(1)), await count(refIds.slice(1))]
+  console.log('    ' + (t + '.' + f).padEnd(40) + a.padStart(5) + ' / ' + b.padEnd(6) + ' snapshot: ' + sa.padStart(4) + ' / ' + sb
+    + (a !== b || sa.replace('-', '0') !== sb.replace('-', '0') ? '   <--' : ''))
 }"
 }
 flow_artifact() { grep -l "<name>$FNAME</name>" dist/app/update/sys_hub_flow_*.xml 2>/dev/null | head -1; }
 
-hr "PHASE 7 — a NEW flow authored in Fluent, pushed to the instance, activated, and run"
+hr "PHASE 7 — a NEW flow authored in Fluent, pushed (loaded like install) to the instance, activated, and run"
 write_flow v1
 now-sdk build >/dev/null 2>&1
 FART=$(flow_artifact)
@@ -637,18 +662,20 @@ else
   echo "flow artifact: $FART"
   grep -o '<[a-z_0-9]* action="[A-Za-z_]*"' "$FART" | sed 's/^/  /'
 
-  note "push --dry-run — EXPECTED: 'pushed as one unit', would POST sys_hub_flow + trigger + step, 'then activate it'"
+  note "push --dry-run — EXPECTED: 'pushed as one unit', would create sys_hub_flow + trigger + step, 'by loading the whole artifact' (api/fluent/load), 'then activate it'"
   $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build --dry-run
   echo "exit=$?"
 
-  note "push — EXPECTED: 'created in $PSCOPE: 3 record(s) written, 0 removed, activated (active=true, status=published)'"
+  note "push — EXPECTED: 'created in $PSCOPE: 3 record(s) loaded, 0 removed, captured in update set ..., activated (active=true, status=published)'"
+  note "(REFUSED 'no XML load endpoint' means the instance lacks api/fluent/load — report it; nothing is written then)"
   $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
   echo "push exit=$?"
 
-  note "on the instance — EXPECTED: active=true status=published, a snapshot, 1 trigger [record_create], 1 step saying 'v1'"
+  note "on the instance — EXPECTED: active=true status=published, 1 trigger [record_create], 1 step saying 'v1', snapshot(s) with their own trigger/step"
+  note "and in Flow Designer: the flow shows its trigger and its log step (the Table API write showed it EMPTY)"
   flow_report "$FLOW"
 
-  note "DIAGNOSTIC (read-only): our flow next to a Flow Designer flow with the same kind of trigger"
+  note "DIAGNOSTIC (read-only): our flow next to an active Flow Designer flow with the same kind of trigger"
   note "fields one has and the other lacks, and records attached to each ('<--' marks a difference)"
   flow_compare "$FLOW"
 
@@ -680,7 +707,7 @@ fi
 
 hr "PHASE 8 — editing that EXISTING flow: change a step, add one, remove it, drift, pull it back"
 if [ -n "$FLOW" ]; then
-  note "edit: log message v1 -> v2, and ADD a second step; push — EXPECTED: 'updated', 1 new step POSTed, re-activated"
+  note "edit: log message v1 -> v2, and ADD a second step; push — EXPECTED: dry run 'would create' the new step, then 'updated ... 4 record(s) loaded', re-activated"
   write_flow v2 second
   now-sdk build >/dev/null 2>&1
   $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build --dry-run

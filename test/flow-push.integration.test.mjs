@@ -2,6 +2,9 @@
 // test/fixtures/real-sdk-build/flow): one artifact per flow holding the flow, its trigger
 // and step instances and delete_multiple directives, with active=false / status=draft —
 // install activates flows afterwards through api/now/wfa_fluent/activate_flows.
+// push writes the artifact the way install does for a configuration project: through the
+// SDK's loader (POST api/fluent/load/<scope>), never record by record — seen live, rows
+// written through the Table API leave a flow Flow Designer shows as empty.
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
@@ -57,18 +60,20 @@ async function withInstance(options, body) {
 
 const flowWrites = (instance) => instance.writes().filter((w) => w.table && w.table.startsWith('sys_hub_'))
 const activations = (instance) => instance.log.filter((e) => e.table === 'activate_flows')
+const loads = (instance) => instance.log.filter((e) => e.table === 'fluent_load')
 
-test('a new flow is created as ONE unit — flow, trigger and step — in the project scope, then activated', () =>
+test('a new flow is LOADED as one unit — the artifact as built, through api/fluent/load as the app — then activated', () =>
   withInstance({}, async (instance) => {
     const result = await push(instance, '--sys-id', FLOW)
     assert.equal(result.status, 0, result.output)
     assert.match(result.output, /flow "NowFluent Flow Demo": 3 record\(s\), 3 delete_multiple directive\(s\), pushed as one unit/)
-    assert.match(result.output, /created in x_push_demo: 3 record\(s\) written, 0 removed, activated \(active=true, status=published\)/)
+    assert.match(result.output, /created in x_push_demo: 3 record\(s\) loaded, 0 removed, captured in update set \(loadset0+1\), activated \(active=true, status=published\)/)
 
-    const posts = flowWrites(instance).filter((w) => w.method === 'POST')
-    assert.deepEqual(posts.map((w) => w.table), ['sys_hub_flow', 'sys_hub_trigger_instance_v2', 'sys_hub_action_instance_v2'],
-      'flow first, then its parts, in document order')
-    for (const w of posts) assert.equal(w.params.sysparm_transaction_scope, APP, `${w.table} runs as the app`)
+    assert.deepEqual(flowWrites(instance), [], 'no record is written through the Table API')
+    const [load] = loads(instance)
+    assert.equal(load.sysId, APP, 'loaded as the app, like install')
+    assert.ok(load.body.includes(readFileSync(join(FIXTURES, 'one-step.xml'), 'utf8').match(/<sys_hub_trigger_instance_v2[\s\S]*?<\/sys_hub_trigger_instance_v2>/)[0]),
+      'the artifact goes up as built')
     assert.equal(instance.store.get(`sys_hub_action_instance_v2/${STEP}`).flow, FLOW)
 
     const [activation] = activations(instance)
@@ -86,20 +91,22 @@ test('naming one of its steps, or --all, pushes the whole flow — once', () =>
     const result = await push(instance, '--all')
     assert.equal(result.status, 0, result.output)
     assert.equal(result.output.match(/pushed as one unit/g).length, 1, 'three records, one unit')
-    assert.equal(flowWrites(instance).filter((w) => w.method === 'POST').length, 3)
+    assert.equal(loads(instance).length, 1)
 
     const again = await push(instance, '--sys-id', STEP)
     assert.equal(again.status, 0, again.output)
     assert.match(again.output, /pushed as one unit/)
     assert.match(again.output, /unchanged/, 'nothing changed since the last push')
+    assert.equal(loads(instance).length, 1, 'an unchanged flow is not loaded again')
   }))
 
-test('--dry-run lists every write and the activation, and sends nothing', () =>
+test('--dry-run lists every change, the load and the activation, and sends nothing', () =>
   withInstance({}, async (instance) => {
     const result = await push(instance, '--sys-id', FLOW, '--dry-run')
     assert.equal(result.status, 0, result.output)
-    assert.match(result.output, /would POST sys_hub_flow 21d91be4/)
-    assert.match(result.output, /would POST sys_hub_action_instance_v2 a37ab71e/)
+    assert.match(result.output, /would create sys_hub_flow 21d91be4/)
+    assert.match(result.output, /would create sys_hub_action_instance_v2 a37ab71e/)
+    assert.match(result.output, new RegExp(`by loading the whole artifact as x_push_demo \\(POST .*/api/fluent/load/${APP}, as install does\\)`))
     assert.match(result.output, /then activate it \(POST .*\/api\/now\/wfa_fluent\/activate_flows\)/)
     assert.deepEqual(instance.writes(), [])
   }))
@@ -113,13 +120,8 @@ test('editing a live flow: a step added then removed — the removal goes throug
     const added = await push(instance, '--sys-id', FLOW)
     assert.equal(added.status, 0, added.output)
     assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`), 'the new step exists')
-    assert.ok(flowWrites(instance).some((w) => w.method === 'POST' && w.sysId === undefined && w.body.sys_id === STEP2))
-    const rootPut = flowWrites(instance).find((w) => w.method === 'PUT' && w.table === 'sys_hub_flow')
-    if (rootPut) {
-      assert.ok(!('active' in rootPut.body) && !('status' in rootPut.body),
-        "the build's active=false/status=draft is never sent to a live flow")
-    }
-    assert.equal(activations(instance).length, 1, 're-activated so the change takes effect')
+    assert.equal(loads(instance).length, 1)
+    assert.equal(activations(instance).length, 1, 're-activated so the change takes effect, like install')
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).active, 'true')
 
     build('one-step')
@@ -129,8 +131,9 @@ test('editing a live flow: a step added then removed — the removal goes throug
     assert.match(removed.output, /1 removed/)
     assert.ok(!instance.store.has(`sys_hub_action_instance_v2/${STEP2}`), 'the removed step is gone')
     assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP}`), 'the remaining step is untouched')
-    const del = instance.writes().find((w) => w.method === 'DELETE')
-    assert.equal(del.params.sysparm_transaction_scope, APP)
+    assert.ok(!existsSync(join(project, '.now-fluent', 'state', `sys_hub_action_instance_v2_${STEP2}.json`)),
+      'the removed step has no baseline left')
+    assert.deepEqual(flowWrites(instance), [], 'the loader removed it, not a Table API DELETE')
   }))
 
 test('a flow changed on the instance since the pull is refused before anything is written', () =>
@@ -172,7 +175,7 @@ test('an inactive flow stays inactive unless --activate', () =>
     instance.log.length = 0
     const kept = await push(instance, '--sys-id', FLOW)
     assert.equal(kept.status, 0, kept.output)
-    assert.match(kept.output, /inactive \(--activate to activate it\)/)
+    assert.match(kept.output, /saved as an inactive draft, as it was \(--activate to activate it\)/)
     assert.equal(activations(instance).length, 0)
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).active, 'false')
 
@@ -186,7 +189,7 @@ test('an instance without the activation endpoint: written, reported NOT activat
   withInstance({ flowActivation: 'missing' }, async (instance) => {
     const result = await push(instance, '--sys-id', FLOW)
     assert.notEqual(result.status, 0)
-    assert.match(result.output, /3 record\(s\) written and 0 removed, but NOT activated: this instance has no flow activation endpoint/)
+    assert.match(result.output, /3 record\(s\) loaded and 0 removed, .*but NOT activated: this instance has no flow activation endpoint/)
     assert.ok(instance.store.has(`sys_hub_flow/${FLOW}`))
   }))
 
@@ -242,7 +245,7 @@ test('the separate DELETE the build writes for a removed step is skipped; deleti
     assert.deepEqual(instance.writes(), [])
   }))
 
-test('a flow in a Global project is created as Global, with no probe', () =>
+test('a flow in a Global project is loaded as Global, with no probe', () =>
   withInstance({}, async (instance) => {
     writeFileSync(join(project, 'now.config.json'), JSON.stringify({ scope: 'global', scopeId: 'global', name: 'G' }))
     const file = join(project, 'dist', 'app', 'update', `sys_hub_flow_${FLOW}.xml`)
@@ -251,7 +254,7 @@ test('a flow in a Global project is created as Global, with no probe', () =>
     const result = await push(instance, '--sys-id', FLOW)
     assert.equal(result.status, 0, result.output)
     assert.ok(!/Checking once/.test(result.output), 'no probe')
-    assert.ok(flowWrites(instance).every((w) => w.params.sysparm_transaction_scope === 'global'))
+    assert.deepEqual(loads(instance).map((l) => l.sysId), ['global'])
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).sys_scope, 'global')
   }))
 
@@ -288,16 +291,13 @@ test('pull takes a flow through the online transform (the query path cannot rebu
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).active, 'true')
   }))
 
-test('compressed flow fields are sent exactly as built — the Table API stores them as-is (seen live)', () =>
+test('compressed flow fields go up exactly as built (gzip+base64, as a Flow Designer trigger stores them)', () =>
   withInstance({}, async (instance) => {
     const result = await push(instance, '--sys-id', FLOW)
     assert.equal(result.status, 0, result.output)
-    const trigger = flowWrites(instance).find((w) => w.table === 'sys_hub_trigger_instance_v2' && w.method === 'POST')
-    const step = flowWrites(instance).find((w) => w.table === 'sys_hub_action_instance_v2' && w.method === 'POST')
-    // A Flow Designer trigger reads back "H4sI..." through the Table API; one written
-    // decompressed broke the SDK's own reader ("Corrupt data in trigger instance").
-    assert.ok(trigger.body.trigger_inputs.startsWith('H4sI'), 'trigger_inputs keeps its stored gzip form')
-    assert.ok(step.body.values.startsWith('H4sI'))
+    assert.match(loads(instance)[0].body, /<trigger_inputs>H4sI/)
+    assert.ok(instance.store.get(`sys_hub_trigger_instance_v2/${TRIGGER}`).trigger_inputs.startsWith('H4sI'))
+    assert.ok(instance.store.get(`sys_hub_action_instance_v2/${STEP}`).values.startsWith('H4sI'))
   }))
 
 test('a failed activation says why, and the NEXT push is not refused as drift (seen live)', () =>
@@ -312,4 +312,36 @@ test('a failed activation says why, and the NEXT push is not refused as drift (s
     assert.doesNotMatch(second.output, /changed on the instance since you pulled it/,
       'our own failed activation attempt is not someone else\'s drift')
     assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`), 'the edit was written')
+  }))
+
+test('an instance without the loader endpoint: refused, and nothing is written record by record', () =>
+  withInstance({ fluentLoad: 'missing' }, async (instance) => {
+    const result = await push(instance, '--sys-id', FLOW)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /REFUSED: this instance has no XML load endpoint \(api\/fluent\/load/)
+    assert.match(result.output, /Flow Designer shows the flow empty/)
+    assert.deepEqual(flowWrites(instance), [])
+    assert.equal(activations(instance).length, 0)
+    assert.ok(!instance.store.has(`sys_hub_flow/${FLOW}`))
+  }))
+
+test('--update-set is handed to the loader, which captures the flow there', () =>
+  withInstance({}, async (instance) => {
+    const SET = '5e7000000000000000000000000000a1'
+    instance.store.set(`sys_update_set/${SET}`, { sys_id: SET, name: 'Flow work', state: 'in progress' })
+    const result = await push(instance, '--sys-id', FLOW, '--update-set', SET)
+    assert.equal(result.status, 0, result.output)
+    assert.equal(loads(instance)[0].params.targetUpdateSetId, SET)
+    assert.match(result.output, new RegExp(`captured in update set "Flow work" \\(${SET}\\)`))
+  }))
+
+test('--target-scope global creates a flow built in the project scope in Global: the payload names Global', () =>
+  withInstance({}, async (instance) => {
+    const result = await push(instance, '--sys-id', FLOW, '--target-scope', 'global')
+    assert.equal(result.status, 0, result.output)
+    const [load] = loads(instance)
+    assert.equal(load.sysId, 'global')
+    assert.doesNotMatch(load.body, new RegExp(`<sys_scope[^>]*>${APP}<`), 'no record still names the app')
+    assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).sys_scope, 'global')
+    assert.equal(instance.store.get(`sys_hub_action_instance_v2/${STEP}`).sys_scope, 'global')
   }))

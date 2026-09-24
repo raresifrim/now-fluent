@@ -33,10 +33,16 @@ import { createServer } from 'node:http'
 // flowActivation: how POST /api/now/wfa_fluent/activate_flows (the call install makes
 // after writing a flow) answers — 'ok' (activates: active=true, status=published),
 // 'missing' (the 400 an instance without the ServiceNow IDE returns), or 'fail' (422).
+// fluentLoad: how POST /api/fluent/load/<scope> (the loader install uses for a
+// configuration project) answers — 'ok' applies every <record_update> in the uploaded
+// files (records merged, delete_multiple directives run, sys_scope taken from the payload)
+// and returns the update set it captured into; 'missing' is the 400 of an instance
+// without the ServiceNow IDE. The mock cannot model what the platform ADDS when it loads
+// a flow (the part a Table API write misses) — only live runs can show that.
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
   honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = [],
-  currentApp = 'global', flowActivation = 'ok'
+  currentApp = 'global', flowActivation = 'ok', fluentLoad = 'ok'
 } = {}) {
   const store = new Map(Object.entries(records))
   const USER_ID = 'user0000000000000000000000000001'
@@ -66,6 +72,22 @@ export async function startMockInstance({
     const [, , , , table, sysId] = url.pathname.split('/') // /api/now/table/<t>/<id>
     let raw = ''
     for await (const chunk of req) raw += chunk
+    if (url.pathname.startsWith('/api/fluent/load/')) {
+      const scope = decodeURIComponent(url.pathname.split('/')[4] || '')
+      log.push({ method: req.method, table: 'fluent_load', sysId: scope, body: raw, params: Object.fromEntries(url.searchParams) })
+      res.writeHead(fluentLoad === 'missing' ? 400 : 200, { 'Content-Type': 'application/json' })
+      if (fluentLoad === 'missing') {
+        return res.end(JSON.stringify({ error: { message: `Requested URI does not represent any resource: ${url.pathname}` } }))
+      }
+      const target = url.searchParams.get('targetUpdateSetId') || 'loadset0000000000000000000000001'
+      for (const file of raw.match(/<record_update\b[\s\S]*?<\/record_update>/g) || []) {
+        const updateName = loadRecordUpdate(file, scope)
+        // The loader captures the whole file as one update, named after its first record.
+        const rowId = `cap${String(++clock).padStart(29, '0')}`
+        if (updateName) store.set(`sys_update_xml/${rowId}`, { sys_id: rowId, name: updateName, update_set: target, sys_created_on: stamp() })
+      }
+      return res.end(JSON.stringify({ result: { targetUpdateSetId: target } }))
+    }
     const parsed = raw ? JSON.parse(raw) : undefined
     log.push({ method: req.method, table, sysId, body: parsed, params: Object.fromEntries(url.searchParams) })
 
@@ -199,6 +221,40 @@ export async function startMockInstance({
       if (ne && String(row[ne[1]] ?? '') === ne[2]) return false
     }
     return true
+  }
+
+  // Apply one <record_update> like the loader: records in document order, merged onto any
+  // existing row; delete_multiple directives remove what their query matches.
+  function loadRecordUpdate(xml, scope) {
+    const decode = (v) => v.replace(/^<!\[CDATA\[([\s\S]*)\]\]>$/, '$1')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&')
+    const body = xml.replace(/^<record_update\b[^>]*>/, '').replace(/<\/record_update>$/, '')
+    const re = /<([A-Za-z0-9_]+)\s+action="([A-Za-z_]+)"([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g
+    let match
+    let updateName = ''
+    while ((match = re.exec(body)) !== null) {
+      const [, t, action, attrs, inner] = match
+      if (action === 'delete_multiple') {
+        const query = decode((attrs.match(/query="([^"]*)"/) || [])[1] || '')
+        for (const [k, row] of [...store.entries()]) {
+          if (k.startsWith(`${t}/`) && matchesQuery(row, query)) store.delete(k)
+        }
+        continue
+      }
+      const fields = {}
+      const fieldRe = /<([A-Za-z0-9_]+)(?:\s[^>]*?)?(?:\/>|>([\s\S]*?)<\/\1>)/g
+      let field
+      while ((field = fieldRe.exec(inner || '')) !== null) fields[field[1]] = decode(field[2] || '')
+      const id = fields.sys_id
+      if (!id) continue
+      if (!updateName) updateName = `${t}_${id}`
+      const existing = store.get(`${t}/${id}`)
+      store.set(`${t}/${id}`, {
+        ...(existing || {}), ...fields, sys_scope: fields.sys_scope || scope, sys_updated_on: stamp(),
+        sys_mod_count: existing ? String(Number(existing.sys_mod_count || 0) + 1) : '0'
+      })
+    }
+    return updateName
   }
 
   function applyOrder(rows, query) {

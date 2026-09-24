@@ -237,11 +237,13 @@ Enhanced commands (handled by now-fluent):
       FLOWS: a Flow() (or custom action) builds into ONE artifact — the flow, its
       trigger and steps, and delete_multiple directives that remove steps no longer in
       the source. Selecting the flow, any of its steps, or --all pushes that whole
-      artifact as one unit: every read and guard first, then every record and directive
-      in document order, as the flow's scope; the live flow's active/status are kept
-      (the build always says draft/inactive). It is then activated the way install does
-      it (api/now/wfa_fluent/activate_flows) if it is new or was active; --activate
-      forces that, --no-activate skips it. A directive that does not name the flow, or
+      artifact as one unit: every read and guard first, then the whole artifact is
+      LOADED through the SDK's loader (POST api/fluent/load/<scope>, what install does
+      for a type:'configuration' project — written row by row through the Table API a
+      flow shows up EMPTY in Flow Designer), captured into an update set (--update-set
+      picks it), and read back. Like install, that leaves it an inactive draft; it is
+      then activated (api/now/wfa_fluent/activate_flows) if it is new or was active;
+      --activate forces that, --no-activate skips it. A directive that does not name the flow, or
       that matches more than 50 records, is refused. push never deletes a whole flow.
       pull takes flows through the SDK's online transform (the query path cannot
       rebuild a graph); they are not adopted across scopes.
@@ -3786,9 +3788,16 @@ async function pushRecord(target, label, context) {
 // its trigger and step instances, and delete_multiple directives — queries such as
 // flow=<id>^sys_idNOT IN<current steps> — that remove steps no longer in the source. The
 // flow record always says active=false / status=draft, because install activates flows
-// afterwards (POST api/now/wfa_fluent/activate_flows, run as the app's scope). So a graph
-// is pushed like the platform applies it: every record and directive in document order,
-// the live active/status kept, then activated the way install does it.
+// afterwards (POST api/now/wfa_fluent/activate_flows, run as the app's scope).
+//
+// Seen live: writing those records one by one through the Table API puts every one of them
+// on the instance, yet Flow Designer shows the flow EMPTY and activation fails with "No
+// Trigger instance found in the flow definition". A flow is more than its rows: the
+// platform builds the rest when it LOADS a flow's <record_update> (an update set commit, an
+// app install). So a graph is written the way install writes it for a configuration
+// project (sdk-api orchestrator installConfigurations): the whole artifact, as built,
+// through the SDK's loader endpoint POST api/fluent/load/<scope sys_id>, then activated.
+// Every read-only guard (drift, scope, directive anchoring) still runs first.
 const GRAPH_ROOT_TABLES = new Set(['sys_hub_flow', 'sys_hub_action_type_definition'])
 // A directive matching more than this is refused rather than trusted: removing a step or
 // two is an edit; wiping dozens of records is not something a source edit should do quietly.
@@ -3832,6 +3841,42 @@ function parseGraphArtifact(xml) {
 // graph's own records. Anything else is refused before a single write.
 function directiveAnchored(query, ids) {
   return [...ids].some((id) => id && String(query).includes(id))
+}
+
+// The loader install uses for a configuration project (sdk-api connector uploadXmlFiles):
+// POST api/fluent/load/<scope sys_id>, the files as multipart "files". It applies each
+// <record_update> like an update set commit — including what the platform does for a
+// flow that a Table API write skips — and answers with the update set it captured into
+// (targetUpdateSetId picks that set; without it the endpoint chooses).
+async function snLoadXml(instance, scopeId, files, { targetUpdateSetId } = {}) {
+  const url = new URL(`/api/fluent/load/${encodeURIComponent(scopeId)}`, instance.origin)
+  if (targetUpdateSetId) url.searchParams.set('targetUpdateSetId', targetUpdateSetId)
+  const form = new FormData()
+  for (const file of files) form.append('files', new Blob([file.content], { type: 'application/xml' }), file.name)
+  // fetch sets the multipart boundary itself; a stored Content-Type would break it.
+  const headers = { Accept: 'application/json' }
+  for (const [key, value] of Object.entries(instance.headers || {})) {
+    if (key.toLowerCase() !== 'content-type') headers[key] = value
+  }
+  let response
+  try {
+    response = await fetch(url, { method: 'POST', headers, body: form, signal: AbortSignal.timeout(300000) })
+  } catch (error) {
+    throw new Error(`POST ${url.pathname} failed: ${error && error.message ? error.message : error}`)
+  }
+  const text = await response.text()
+  let parsed = null
+  try { parsed = text ? JSON.parse(text) : null } catch { /* an HTML error page, not JSON */ }
+  if (!response.ok) {
+    const raw = (parsed && parsed.result && parsed.result.error) || (parsed && parsed.error && (parsed.error.message || parsed.error.detail))
+      || stripAnsi(text).replace(/\s+/g, ' ').trim().slice(0, 400) || response.statusText
+    const detail = typeof raw === 'string' ? raw : JSON.stringify(raw)
+    throw Object.assign(new Error(`POST ${url.pathname} -> HTTP ${response.status}: ${detail}`), {
+      status: response.status,
+      missing: response.status === 404 || /does not represent any resource/i.test(detail)
+    })
+  }
+  return { updateSetId: (parsed && parsed.result && parsed.result.targetUpdateSetId) || '' }
 }
 
 // The activation install runs after writing a flow (sdk-api flow-activation.js).
@@ -3904,7 +3949,6 @@ async function pushGraph(unit, label, context) {
     && (live.sys_updated_on !== baseline.sys_updated_on || live.sys_mod_count !== baseline.sys_mod_count))
 
   let runScope
-  let needsProbe = false
   const creating = !liveRoot
   if (liveRoot) {
     const baseline = usableBaseline(rootTable, rootId)
@@ -3941,7 +3985,6 @@ async function pushGraph(unit, label, context) {
       return 'failed'
     }
     runScope = own ? artifactScope : GLOBAL_SCOPE_ID
-    needsProbe = own
     if (own) {
       if (context.ownAppExists === undefined) {
         context.ownAppExists = Boolean(await snGetRecord(instance, 'sys_scope', artifactScope, 'sys_id', { throwOnError: true }))
@@ -3986,12 +4029,10 @@ async function pushGraph(unit, label, context) {
         + 'you pulled it. Re-pull the flow, or --force to overwrite it.')
       return 'failed'
     }
-    let body = recordFieldsToPayload(item.fields, { keepScope: !flags['no-scope'] })
-    if (!live && runScope === GLOBAL_SCOPE_ID && body.sys_scope && body.sys_scope !== GLOBAL_SCOPE_ID) {
-      body = { ...body, sys_scope: GLOBAL_SCOPE_ID }
-    }
-    // The build always says draft/inactive (install activates afterwards). Sending that to
-    // an existing flow would switch it off, so the instance's own state is kept.
+    // Only to tell what changed: the loader receives the whole artifact, as built.
+    let body = recordFieldsToPayload(item.fields, { keepScope: false })
+    // The build always says draft/inactive; install loads it like that and activates
+    // afterwards, and so does push — so the root's active/status are not "changes".
     if (isRoot && live) {
       delete body.active
       delete body.status
@@ -4008,123 +4049,134 @@ async function pushGraph(unit, label, context) {
     steps.push({ ...item, live, body })
   }
 
-  // The one-time scope probe WRITES (a throwaway record), so it runs only after every
-  // read-only check above has passed.
-  if (needsProbe && !dryRun) {
-    context.scopeProbes = context.scopeProbes || {}
-    if (context.scopeProbes[runScope] === undefined) {
-      try {
-        context.scopeProbes[runScope] = await probeScopeCreate(instance, project, runScope)
-      } catch (error) {
-        context.scopeProbes[runScope] = { works: false, landed: '', error: error && error.message ? error.message : String(error) }
-      }
-    }
-    const probe = context.scopeProbes[runScope]
-    if (!probe.works) {
-      console.error(`${label} REFUSED: this instance does not create records AS ${scopeLabel(project, runScope)}`
-        + `${probe.error ? ` (${probe.error})` : ''}. No record of this ${what} was created.`)
-      return 'failed'
-    }
-  }
-
   const directives = steps.filter((step) => step.kind === 'directive')
   const removals = directives.reduce((sum, step) => sum + step.matches.length, 0)
-  const writes = steps.filter((step) => step.kind === 'record')
+  const changes = steps.filter((step) => step.kind === 'record')
   const wasActive = Boolean(liveRoot && String(liveRoot.active) === 'true')
   const activate = !flags['no-activate'] && (creating || wasActive || Boolean(flags.activate))
   const scopeText = await scopeName(instance, project, runScope)
+  const loadPath = `${instance.origin}/api/fluent/load/${runScope}`
+  const activateNote = activate
+    ? `, then activate it (POST ${instance.origin}/api/now/wfa_fluent/activate_flows)`
+    : ` — not activated (${flags['no-activate'] ? '--no-activate' : 'it is inactive; --activate to activate it'})`
 
   if (dryRun) {
     for (const step of steps) {
       if (step.kind === 'directive') {
         if (step.matches.length) {
-          console.log(`      would DELETE ${step.matches.length} ${step.table} record(s) no longer in the source: `
+          console.log(`      would remove ${step.matches.length} ${step.table} record(s) no longer in the source: `
             + step.matches.join(', '))
         }
       } else {
-        console.log(`      would ${step.live ? 'PUT' : 'POST'} ${step.table} ${step.sysId} (${Object.keys(step.body).length} field(s))`)
+        console.log(`      would ${step.live ? 'update' : 'create'} ${step.table} ${step.sysId} (${Object.keys(step.body).length} field(s) differ)`)
       }
     }
-    console.log(`      ...all run as ${scopeText}${activate
-      ? `, then activate it (POST ${instance.origin}/api/now/wfa_fluent/activate_flows)`
-      : ` — not activated (${flags['no-activate'] ? '--no-activate' : 'it is inactive; --activate to activate it'})`}`)
-    if (!writes.length && !removals) return 'unchanged'
+    if (changes.length || removals) {
+      console.log(`      ...by loading the whole artifact as ${scopeText} (POST ${loadPath}, as install does)${activateNote}`)
+    }
+    if (!changes.length && !removals) return 'unchanged'
     return creating ? 'created' : 'updated'
   }
-  if (!writes.length && !removals && !(activate && flags.activate)) {
+  if (!changes.length && !removals && !(activate && flags.activate)) {
     console.log(`${label} unchanged`)
     return 'unchanged'
   }
 
-  // ---- apply, in document order --------------------------------------------
-  const written = []
-  let removed = 0
-  try {
-    for (const step of steps) {
-      if (step.kind === 'directive') {
-        for (const id of step.matches) {
-          await snDeleteRecord(instance, step.table, id, runScope)
-          removeBaseline(project, step.table, id)
-          removed++
-        }
-        continue
-      }
-      const path = step.live ? `/api/now/table/${step.table}/${step.sysId}` : `/api/now/table/${step.table}`
-      const method = step.live ? 'PUT' : 'POST'
-      try {
-        await snRequest(instance, method, path,
-          { body: step.body, params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: runScope }, throwOnError: true })
-      } catch (error) {
-        if (!error || (error.status !== 403 && error.status !== 400)) throw error
-        await snRequest(instance, method, path, { body: step.body, params: { sysparm_fields: 'sys_id' }, throwOnError: true })
-      }
-      written.push(step)
-      if (writtenRecords) writtenRecords.push({ table: step.table, sysId: step.sysId })
-    }
-  } catch (error) {
-    console.error(`${label} FAILED part-way (${written.length} of ${writes.length} record(s) written, ${removed} removed): `
-      + `${error && error.message ? error.message : error}\n`
-      + `      The ${what} on the instance may now be inconsistent. Fix the cause and push again — the push converges.`)
-    return 'failed'
+  // ---- load the artifact, the way install does ------------------------------
+  let payload = xml
+  // --target-scope global: the payload names the scope the loader puts the records in.
+  if (creating && runScope === GLOBAL_SCOPE_ID && artifactScope && artifactScope !== GLOBAL_SCOPE_ID) {
+    payload = rewriteSysScope(payload, 'global', GLOBAL_SCOPE_ID)
   }
-
-  // ---- baselines, and where the graph actually landed ------------------------
-  for (const step of written) {
+  let loaded = { updateSetId: '' }
+  if (changes.length || removals) {
     try {
-      const row = await snGetRecord(instance, step.table, step.sysId, undefined, { throwOnError: true })
-      if (row) writeBaseline(project, step.table, step.sysId, instance, row)
-    } catch { /* a missing baseline only makes the next push ask for a pull */ }
-  }
-  if (creating) {
-    const landed = await snGetRecord(instance, rootTable, rootId, 'sys_scope', { throwOnError: true })
-    const landedScope = landed ? scopeOf(landed) : ''
-    if (landedScope && landedScope !== runScope) {
-      console.error(`${label} WROTE THE ${what.toUpperCase()}, BUT IT LANDED IN ${await scopeName(instance, project, landedScope)}, `
-        + `not ${scopeText}. Its records were not removed: ${written.map((step) => step.sysId).join(', ')}.`)
+      loaded = await snLoadXml(instance, runScope, [{ name: basename(unit.file), content: payload }],
+        { targetUpdateSetId: context.targetUpdateSetId })
+    } catch (error) {
+      if (error && error.missing) {
+        console.error(`${label} REFUSED: this instance has no XML load endpoint (api/fluent/load — it comes with the `
+          + 'ServiceNow IDE), so push cannot write a flow the way install does. Nothing was written.\n'
+          + '      Writing its records one by one is not an alternative: seen live, the rows all land but Flow '
+          + 'Designer shows the flow empty and it cannot be activated. Use update-set-package.')
+      } else {
+        console.error(`${label} FAILED: loading the ${what} was refused: ${error && error.message ? error.message : error}`)
+      }
       return 'failed'
     }
   }
 
-  let state = 'saved'
+  // ---- what the instance now holds -----------------------------------------
+  const after = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
+  if (!after) {
+    console.error(`${label} FAILED: the loader answered, but the ${what} ${rootId} is not on the instance.`)
+    return 'failed'
+  }
+  if (creating) {
+    const landedScope = scopeOf(after)
+    if (landedScope && landedScope !== runScope) {
+      console.error(`${label} LOADED THE ${what.toUpperCase()}, BUT IT LANDED IN ${await scopeName(instance, project, landedScope)}, `
+        + `not ${scopeText}. It was left in place: delete it in Flow Designer.`)
+      return 'failed'
+    }
+  }
+  let present = 0
+  const missing = []
+  for (const record of records) {
+    const row = record.sysId === rootId ? after
+      : await snGetRecord(instance, record.table, record.sysId, undefined, { throwOnError: true })
+    if (row) {
+      writeBaseline(project, record.table, record.sysId, instance, row)
+      present++
+    } else {
+      missing.push(`${record.table} ${record.sysId}`)
+    }
+  }
+  let removed = 0
+  const kept = []
+  for (const step of directives) {
+    for (const id of step.matches) {
+      if (await snGetRecord(instance, step.table, id, 'sys_id', { throwOnError: true })) {
+        kept.push(`${step.table} ${id}`)
+      } else {
+        removeBaseline(project, step.table, id)
+        removed++
+      }
+    }
+  }
+  if (writtenRecords) writtenRecords.push({ table: rootTable, sysId: rootId })
+  if (missing.length || kept.length) {
+    console.error(`${label} FAILED: the loader answered, but the instance does not match the artifact:`
+      + `${missing.length ? `\n      missing: ${missing.join(', ')}` : ''}`
+      + `${kept.length ? `\n      not removed: ${kept.join(', ')}` : ''}`)
+    return 'failed'
+  }
+  let captured = ''
+  if (loaded.updateSetId) {
+    const set = await snGetRecord(instance, 'sys_update_set', loaded.updateSetId, 'name', { throwOnError: true }).catch(() => null)
+    captured = `, captured in update set ${set && set.name ? `"${set.name}" ` : ''}(${loaded.updateSetId})`
+  }
+
+  let state = 'saved as a draft'
   if (activate) {
     const result = await activateGraph(instance, runScope, rootTable, rootId)
     // An activation attempt writes the flow record even when it FAILS (seen live: mod_count
     // 0 -> 1 on a rejected publish), so the baseline is taken again either way — or the
     // next push would see our own attempt as somebody else's drift.
-    const after = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
-    if (after) writeBaseline(project, rootTable, rootId, instance, after)
+    const activated = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
+    if (activated) writeBaseline(project, rootTable, rootId, instance, activated)
     if (!result.ok) {
-      console.error(`${label} ${written.length} record(s) written and ${removed} removed, but NOT activated: ${result.message}.\n`
-        + `      Activate it in Flow Designer${result.missing ? '' : ' once the cause is fixed'}; until then the ${what} does not `
-        + 'run with these changes.')
+      console.error(`${label} ${present} record(s) loaded and ${removed} removed${captured}, but NOT activated: `
+        + `${result.message}.\n      The ${what} is saved as an inactive draft (install leaves it the same way). `
+        + `Activate it in Flow Designer${result.missing ? '' : ' once the cause is fixed'}.`)
       return 'failed'
     }
-    state = `activated (active=${after ? after.active : '?'}, status=${after ? after.status : '?'})`
+    state = `activated (active=${activated ? activated.active : '?'}, status=${activated ? activated.status : '?'})`
   } else if (!creating) {
-    state = flags['no-activate'] ? 'saved, not activated (--no-activate)' : 'saved as it was: inactive (--activate to activate it)'
+    state = flags['no-activate'] ? 'saved as an inactive draft (--no-activate)' : 'saved as an inactive draft, as it was (--activate to activate it)'
   }
-  console.log(`${label} ${what} "${name}" ${creating ? 'created' : 'updated'} in ${scopeText}: ${written.length} record(s) `
-    + `written, ${removed} removed, ${state}`)
+  console.log(`${label} ${what} "${name}" ${creating ? 'created' : 'updated'} in ${scopeText}: ${present} record(s) `
+    + `loaded, ${removed} removed${captured}, ${state}`)
   return creating ? 'created' : 'updated'
 }
 
@@ -4237,7 +4289,10 @@ async function commandPush(flags, config, positional) {
   const results = { created: [], updated: [], deleted: [], unchanged: [], failed: [...unresolved] }
   const writtenRecords = []
   const misCaptured = []
-  const context = { project, instance, flags, auth, dryRun, force, writtenRecords }
+  // A flow is loaded through api/fluent/load, which — unlike a Table API write — takes the
+  // update set to capture into; --update-set is passed to it.
+  const context = { project, instance, flags, auth, dryRun, force, writtenRecords,
+    targetUpdateSetId: updateSetSession ? updateSetSession.target.sys_id : undefined }
 
   // A flow's records travel as one unit per flow artifact, however they were selected
   // (the flow's sys_id, one of its steps, or --all).

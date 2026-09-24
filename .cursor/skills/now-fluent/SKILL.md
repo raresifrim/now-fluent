@@ -59,7 +59,8 @@ now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # approval re
 
 The inner loop for iterating on a record, where `update-set-package` is the governed
 promotion path. Both ends are the plain Table REST API (the ungated path), so they work
-in vendor scopes. `--table` is optional for both.
+in vendor scopes — except a flow, which push loads through the SDK's `api/fluent/load` as
+install does. `--table` is optional for both.
 
 - `pull` = `import --via query --force` + a baseline snapshot in `.now-fluent/state/`.
 - `push` builds, diffs the compiled artifact against that baseline, and sends only the

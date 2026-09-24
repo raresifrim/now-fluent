@@ -95,7 +95,7 @@ now-fluent transform --help
 
 `update-set-package` is the *governed* path: build an update set, import it, preview it, commit it. That is right for promoting a change you do not own, and heavy for fixing a typo in a script include.
 
-`pull`/`push` is the inner loop. Both ends are the plain Table REST API — the same ungated path `import --via query` uses — so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's own update-set export.
+`pull`/`push` is the inner loop. Both ends are the plain Table REST API — the same ungated path `import --via query` uses — so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's own update-set export. (A flow is the exception: push loads it through the SDK's `api/fluent/load`, as install does — see *Flows* below.)
 
 ```bash
 # read the record into the project AND snapshot what the instance holds right now
@@ -196,24 +196,24 @@ So the flag's real job is the check that follows: after the push, it looks at wh
 
 If you need changes in a specific update set, build one with `update-set-package` rather than hoping capture follows.
 
-### Flows: pushed as one unit
+### Flows: pushed as one unit, loaded like install
 
 A `Flow()` builds into **one** artifact: the flow, its trigger and step instances, and `delete_multiple` directives that remove steps no longer in the source. The flow record always says `active=false` / `status=draft`, because `install` activates flows afterwards through `api/now/wfa_fluent/activate_flows`. So `push` treats the artifact as a unit — whether you name the flow, one of its steps, or use `--all`:
 
 ```bash
-now-fluent push --project . --auth dev --sys-id <flow sys_id> --dry-run   # every write, and the activation
+now-fluent push --project . --auth dev --sys-id <flow sys_id> --dry-run   # every change, the load, and the activation
 now-fluent push --project . --auth dev --sys-id <flow sys_id>
 ```
 
-- every read and guard first (drift on the flow and its steps, scope rules), then every record and directive in document order, as the flow's scope;
-- a live flow's `active` / `status` are never sent; the flow is then activated like `install` does it if it is new or was active (`--activate` forces, `--no-activate` skips) — an instance without the activation endpoint (it ships with the ServiceNow IDE) gets the records but a failed run saying the flow is NOT activated;
+- **not through the Table API.** Seen live: a flow written record by record has every row on the instance, yet Flow Designer shows it empty and it cannot be activated (`No Trigger instance found in the flow definition`) — the platform builds the rest of a flow when it *loads* one. So push sends the artifact, as built, through the SDK's own loader, `POST api/fluent/load/<scope>` — what `now-sdk install` does for a `type: 'configuration'` project — which captures it into an update set (`--update-set` picks which). The endpoint ships with the ServiceNow IDE; without it push refuses and writes nothing;
+- every read and guard first (drift on the flow and its steps, scope rules, directive anchoring), then the load, then every record read back: missing records, steps not removed, or a new flow in the wrong scope fail the run;
+- like install, the load leaves the flow an inactive draft; it is then activated if it is new or was active (`--activate` forces, `--no-activate` skips). If activation fails, the flow stays an inactive draft and push says so;
 - a `delete_multiple` directive must name this flow or one of its records and may match at most 50 records, or nothing is written; push never deletes a whole flow;
-- compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is — the Table API stores and returns them unchanged (verified live);
-- **open issue:** live, the graph is written correctly, but `activate_flows` rejects a pushed flow with `No Trigger instance found in the flow definition`, although `install` makes the identical call; the cause is being investigated (runbook phase 7 diagnostic, `KEEP_FLOW=1`). Until then a pushed flow is written but not activated, and push says so;
+- compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is;
 - an activation attempt changes the flow record even when it fails, so the flow's baseline is re-taken after every attempt;
 - `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes.
 
-Runbook phases 7–8 exercise all of this against a real instance.
+The loader path is not verified live yet. Runbook phases 7–8 exercise all of this against a real instance.
 
 ### Two limitations worth knowing
 
