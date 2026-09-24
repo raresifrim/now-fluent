@@ -15,6 +15,8 @@
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-8
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --project-scope sn_sow
 #   KEEP_FLOW=1 ...    leave phase 7-8's flow on the instance, to open it in Flow Designer
+#   FLOW_PAUSE=1 ...   after every flow push in phases 7-8, print the Flow Designer link and
+#                      what it should show, and wait for Enter — so each state is checked by eye
 #       binds the demo project to a scope that ALREADY EXISTS on the instance — a
 #       ServiceNow or Store app such as sn_sow / sn_hamp, the way a vendor-scope project
 #       is set up (now.config.json scope + scopeId) — so phase 4c really creates records
@@ -648,6 +650,16 @@ for (const [t, f] of [['sys_hub_trigger_instance_v2','flow'],['sys_hub_trigger_i
     + (a !== b || sa.replace('-', '0') !== sb.replace('-', '0') ? '   <--' : ''))
 }"
 }
+# FLOW_PAUSE=1: stop so the flow can be checked in Flow Designer, not just in its records.
+flow_pause() { # $1 = flow sys_id, $2 = what Flow Designer should show now
+  [ "${FLOW_PAUSE:-}" = "1" ] || return 0
+  local origin
+  origin=$(node --input-type=module -e "import { resolveInstance } from '$REPO/bin/now-fluent.mjs'; console.log(resolveInstance('$AUTH').origin)" 2>/dev/null)
+  note "FLOW_PAUSE — open ${origin}/\$flow-designer.do#/flow-designer/$1 (reload if already open)"
+  note "EXPECTED in Flow Designer: $2"
+  printf '    press Enter to continue... '
+  { read -r _ < /dev/tty; } 2>/dev/null || echo "(no terminal to read from — continuing)"
+}
 flow_artifact() { grep -l "<name>$FNAME</name>" dist/app/update/sys_hub_flow_*.xml 2>/dev/null | head -1; }
 
 hr "PHASE 7 — a NEW flow authored in Fluent, pushed (loaded like install) to the instance, activated, and run"
@@ -674,6 +686,7 @@ else
   note "on the instance — EXPECTED: active=true status=published, 1 trigger [record_create], 1 step saying 'v1', snapshot(s) with their own trigger/step"
   note "and in Flow Designer: the flow shows its trigger and its log step (the Table API write showed it EMPTY)"
   flow_report "$FLOW"
+  flow_pause "$FLOW" "Active; trigger: incident Created where Short description starts with $FMARK; ONE action, Log info — click it: message '$FMARK v1 saw <number>'"
 
   note "DIAGNOSTIC (read-only): our flow next to an active Flow Designer flow with the same kind of trigger"
   note "fields one has and the other lacks, and records attached to each ('<--' marks a difference)"
@@ -715,6 +728,7 @@ if [ -n "$FLOW" ]; then
   echo "push exit=$?"
   note "EXPECTED: still active/published, 2 steps, the first saying 'v2'"
   flow_report "$FLOW"
+  flow_pause "$FLOW" "TWO actions: Log info (message '$FMARK v2 saw <number>') and a second Log (level warn, message '$FMARK second step')"
 
   note "REMOVE the second step; push — EXPECTED: '1 removed' (through delete_multiple), re-activated"
   write_flow v2
@@ -723,6 +737,7 @@ if [ -n "$FLOW" ]; then
   echo "push exit=$?"
   note "EXPECTED: 1 step left, saying 'v2'"
   flow_report "$FLOW"
+  flow_pause "$FLOW" "ONE action again (the second removed): Log info, message '$FMARK v2 saw <number>'"
 
   note "DRIFT: change the flow on the instance, then push an edit — EXPECTED: REFUSED 'changed on the instance', nothing written"
   node --input-type=module -e "
@@ -755,6 +770,7 @@ console.log('changed the flow description on the instance')"
       $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
       echo "push exit=$?"
       flow_report "$FLOW"
+      flow_pause "$FLOW" "ONE action, Log info, message '$FMARK v4 saw <number>' — edited in the PULLED source"
     else
       echo "the pulled source does not carry the log message as text (the SDK may have produced low-level Record() files) — not edited:"
       for f in $PULLED; do echo "  --- $f"; sed -n '1,40p' "$f"; done
