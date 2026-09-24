@@ -208,7 +208,8 @@ now-fluent push --project . --auth dev --sys-id <flow sys_id>
 - every read and guard first (drift on the flow and its steps, scope rules), then every record and directive in document order, as the flow's scope;
 - a live flow's `active` / `status` are never sent; the flow is then activated like `install` does it if it is new or was active (`--activate` forces, `--no-activate` skips) — an instance without the activation endpoint (it ships with the ServiceNow IDE) gets the records but a failed run saying the flow is NOT activated;
 - a `delete_multiple` directive must name this flow or one of its records and may match at most 50 records, or nothing is written; push never deletes a whole flow;
-- compressed fields (`trigger_inputs`, `values`) are stored gzip+base64 in the build; push sends them decompressed, because a Table API write takes the value — sent as-is, activation failed live with `No Trigger instance found in the flow definition`;
+- compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is — the Table API stores and returns them unchanged (verified live);
+- **open issue:** live, the graph is written correctly, but `activate_flows` rejects a pushed flow with `No Trigger instance found in the flow definition`, although `install` makes the identical call; the cause is being investigated (runbook phase 7 diagnostic, `KEEP_FLOW=1`). Until then a pushed flow is written but not activated, and push says so;
 - an activation attempt changes the flow record even when it fails, so the flow's baseline is re-taken after every attempt;
 - `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes.
 

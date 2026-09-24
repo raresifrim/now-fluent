@@ -4,7 +4,6 @@ import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, write
 import { join, resolve, basename, dirname, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { gunzipSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
@@ -3796,20 +3795,10 @@ const GRAPH_ROOT_TABLES = new Set(['sys_hub_flow', 'sys_hub_action_type_definiti
 const GRAPH_DELETE_LIMIT = 50
 
 // Compressed flow fields (a trigger's trigger_inputs, a step's values) are written by the
-// build in their STORED form: gzip, base64-encoded ("H4sI..."). That is what an XML load or
-// update-set commit expects. A Table API write takes the field's VALUE instead — seen live:
-// sent as-is, activation failed with "No Trigger instance found in the flow definition" —
-// so for push they are decompressed. The SDK's own reader accepts either form.
-function inflateCompressedFields(fields) {
-  const out = { ...fields }
-  for (const [name, value] of Object.entries(out)) {
-    if (typeof value !== 'string' || !value.startsWith('H4sI')) continue
-    try {
-      out[name] = gunzipSync(Buffer.from(value, 'base64')).toString('utf8')
-    } catch { /* not gzip after all: keep it as written */ }
-  }
-  return out
-}
+// build gzip+base64 ("H4sI..."), and are sent exactly like that. Seen live: the Table API
+// stores and returns them as-is — a Flow Designer trigger reads back as "H4sI..." — and a
+// trigger written decompressed broke the SDK's own reader ("Corrupt data in trigger
+// instance: incorrect header check").
 
 function graphRootTable(xml) {
   const table = firstMatch(String(xml), /<record_update\b[^>]*\btable\s*=\s*"([^"]+)"/)
@@ -3997,7 +3986,7 @@ async function pushGraph(unit, label, context) {
         + 'you pulled it. Re-pull the flow, or --force to overwrite it.')
       return 'failed'
     }
-    let body = recordFieldsToPayload(inflateCompressedFields(item.fields), { keepScope: !flags['no-scope'] })
+    let body = recordFieldsToPayload(item.fields, { keepScope: !flags['no-scope'] })
     if (!live && runScope === GLOBAL_SCOPE_ID && body.sys_scope && body.sys_scope !== GLOBAL_SCOPE_ID) {
       body = { ...body, sys_scope: GLOBAL_SCOPE_ID }
     }

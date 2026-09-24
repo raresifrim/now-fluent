@@ -288,16 +288,16 @@ test('pull takes a flow through the online transform (the query path cannot rebu
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).active, 'true')
   }))
 
-test('compressed flow fields are sent decompressed — the Table API takes the value, not the stored gzip', () =>
+test('compressed flow fields are sent exactly as built — the Table API stores them as-is (seen live)', () =>
   withInstance({}, async (instance) => {
     const result = await push(instance, '--sys-id', FLOW)
     assert.equal(result.status, 0, result.output)
     const trigger = flowWrites(instance).find((w) => w.table === 'sys_hub_trigger_instance_v2' && w.method === 'POST')
     const step = flowWrites(instance).find((w) => w.table === 'sys_hub_action_instance_v2' && w.method === 'POST')
-    assert.ok(!trigger.body.trigger_inputs.startsWith('H4sI'), 'trigger_inputs is not the gzip form')
-    assert.ok(Array.isArray(JSON.parse(trigger.body.trigger_inputs)), 'it is the JSON the build compressed')
-    assert.ok(!step.body.values.startsWith('H4sI'))
-    assert.match(step.body.values, /NowFluent flow demo saw/)
+    // A Flow Designer trigger reads back "H4sI..." through the Table API; one written
+    // decompressed broke the SDK's own reader ("Corrupt data in trigger instance").
+    assert.ok(trigger.body.trigger_inputs.startsWith('H4sI'), 'trigger_inputs keeps its stored gzip form')
+    assert.ok(step.body.values.startsWith('H4sI'))
   }))
 
 test('a failed activation says why, and the NEXT push is not refused as drift (seen live)', () =>

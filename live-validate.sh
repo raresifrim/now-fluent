@@ -14,6 +14,7 @@
 #   ./live-validate.sh --auth dev --scope sn_hamp      # + scoped spike
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-8
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --project-scope sn_sow
+#   KEEP_FLOW=1 ...    leave phase 7-8's flow on the instance, to open it in Flow Designer
 #       binds the demo project to a scope that ALREADY EXISTS on the instance — a
 #       ServiceNow or Store app such as sn_sow / sn_hamp, the way a vendor-scope project
 #       is set up (now.config.json scope + scopeId) — so phase 4c really creates records
@@ -578,6 +579,50 @@ for (const [t, q] of [['sys_hub_action_instance_v2', 'flow=$1'], ['sys_hub_trigg
 await snDeleteRecord(inst, 'sys_hub_flow', '$1', scope)
 console.log('deleted flow $1 and ' + n + ' record(s) of its graph')" || echo "could not delete flow $1 — remove it in Flow Designer"
 }
+# Our pushed flow next to one built in Flow Designer with the same kind of trigger: which fields
+# one has and the other lacks, and how many records hang off each in the flow tables. Read-only.
+flow_compare() {
+  node --input-type=module -e "
+import { resolveInstance, snRequest, snGetRecord, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+const OURS = '$1'
+const list = async (t, q, fields, limit = '1') => {
+  try { return await snRequest(inst, 'GET', '/api/now/table/' + t, { throwOnError: true,
+    params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: fields || '', sysparm_limit: limit } }) }
+  catch (e) { return null }
+}
+const refTrigger = (await list('sys_hub_trigger_instance_v2', 'trigger_type=record_create^flow!=' + OURS + '^flow.type=flow^ORDERBYDESCsys_updated_on', 'sys_id,flow')) || []
+if (!refTrigger.length) { console.log('  no Flow Designer flow with a record-created trigger to compare against'); process.exit(0) }
+const REF = refTrigger[0].flow
+const SKIP = new Set(['sys_id','sys_created_by','sys_created_on','sys_updated_by','sys_updated_on','sys_mod_count','name','description','label_cache','sys_tags','internal_name','copied_from','copied_from_name'])
+const diff = (label, a, b) => {
+  const keys = [...new Set([...Object.keys(a || {}), ...Object.keys(b || {})])].filter((k) => !SKIP.has(k)).sort()
+  const lines = []
+  for (const k of keys) {
+    const x = String((a || {})[k] ?? ''), y = String((b || {})[k] ?? '')
+    if (x === y) continue
+    const show = (v) => v === '' ? '(empty)' : v.length > 40 ? v.slice(0, 37) + '...' : v
+    lines.push('    ' + k.padEnd(28) + ' ours=' + show(x).padEnd(42) + ' flow designer=' + show(y))
+  }
+  console.log('  ' + label + ': ' + (lines.length ? lines.length + ' field(s) differ' : 'no differences'))
+  for (const l of lines) console.log(l)
+}
+const ref = await snGetRecord(inst, 'sys_hub_flow', REF, undefined, { throwOnError: true })
+console.log('  reference: Flow Designer flow \"' + (ref && ref.name) + '\" (' + REF + ', status=' + (ref && ref.status) + ')')
+diff('sys_hub_flow', await snGetRecord(inst, 'sys_hub_flow', OURS, undefined, { throwOnError: true }), ref)
+const ourTrig = ((await list('sys_hub_trigger_instance_v2', 'flow=' + OURS)) || [])[0]
+diff('sys_hub_trigger_instance_v2', ourTrig && await snGetRecord(inst, 'sys_hub_trigger_instance_v2', ourTrig.sys_id, undefined, { throwOnError: true }),
+  await snGetRecord(inst, 'sys_hub_trigger_instance_v2', refTrigger[0].sys_id, undefined, { throwOnError: true }))
+console.log('  records attached to each flow (ours / flow designer):')
+for (const [t, f] of [['sys_hub_trigger_instance_v2','flow'],['sys_hub_trigger_instance','flow'],['sys_hub_action_instance_v2','flow'],
+  ['sys_hub_action_instance','flow'],['sys_hub_flow_logic_instance_v2','flow'],['sys_hub_flow_snapshot','parent_flow'],
+  ['sys_hub_flow_variable','model'],['sys_hub_flow_input','model'],['sys_hub_flow_output','model'],['sys_hub_flow_stage','flow'],
+  ['sys_hub_alias_mapping','flow'],['sys_hub_flow_trigger_config','flow']]) {
+  const count = async (id) => { const rows = await list(t, f + '=' + id, 'sys_id', '101'); return rows === null ? 'n/a' : rows.length > 100 ? '100+ (field ignored?)' : String(rows.length) }
+  const [a, b] = [await count(OURS), await count(REF)]
+  console.log('    ' + (t + '.' + f).padEnd(40) + a.padStart(5) + ' / ' + b + (a !== b ? '   <--' : ''))
+}"
+}
 flow_artifact() { grep -l "<name>$FNAME</name>" dist/app/update/sys_hub_flow_*.xml 2>/dev/null | head -1; }
 
 hr "PHASE 7 — a NEW flow authored in Fluent, pushed to the instance, activated, and run"
@@ -603,17 +648,9 @@ else
   note "on the instance — EXPECTED: active=true status=published, a snapshot, 1 trigger [record_create], 1 step saying 'v1'"
   flow_report "$FLOW"
 
-  note "DIAGNOSTIC: how the instance returns a trigger's compressed inputs — ours vs one built in Flow Designer"
-  note "EXPECTED: both start with '[' (plain JSON). If a Flow Designer one does and ours starts with 'H4sI',"
-  note "push sent the stored gzip form, and activation cannot read the trigger."
-  node --input-type=module -e "
-import { resolveInstance, snRequest, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
-const inst = resolveInstance('$AUTH')
-const get = (q) => snRequest(inst, 'GET', '/api/now/table/sys_hub_trigger_instance_v2', { throwOnError: true,
-  params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: 'sys_id,flow,trigger_inputs', sysparm_limit: '1' } })
-const show = (label, rows) => console.log('  ' + label + ': ' + (rows[0] ? JSON.stringify(String(rows[0].trigger_inputs || '').slice(0, 60)) : '(none found)'))
-show('ours            ', await get('flow=$FLOW'))
-show('Flow Designer   ', await get('flow!=$FLOW^trigger_inputsISNOTEMPTY^flow.sys_created_byNOT LIKEnow-fluent'))"
+  note "DIAGNOSTIC (read-only): our flow next to a Flow Designer flow with the same kind of trigger"
+  note "fields one has and the other lacks, and records attached to each ('<--' marks a difference)"
+  flow_compare "$FLOW"
 
   note "does it RUN? creating an incident whose short description matches the trigger, then waiting for a flow context"
   INC=$(node --input-type=module -e "
@@ -695,8 +732,13 @@ console.log('changed the flow description on the instance')"
     fi
   fi
 
-  note "cleanup: the flow and its whole graph on the instance, and its source, baselines here"
-  delete_flow "$FLOW"
+  if [ "${KEEP_FLOW:-}" = "1" ]; then
+    note "KEEP_FLOW=1: the flow is LEFT on the instance ($FLOW, \"$FNAME\"). Open it in Flow Designer and try Activate;"
+    note "delete it there afterwards. Its local source and baselines are removed here either way."
+  else
+    note "cleanup: the flow and its whole graph on the instance, and its source, baselines here"
+    delete_flow "$FLOW"
+  fi
   for f in $(grep -rl "$FLOW" src/fluent --include='*.ts' 2>/dev/null | grep -v '/keys.ts$'); do rm -f "$f"; done
   rm -f "$FSRC" "$FSRC.authored" .now-fluent/state/sys_hub_*.json
   now-sdk build >/dev/null 2>&1; echo "project rebuilt after cleanup"
