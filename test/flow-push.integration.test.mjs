@@ -287,3 +287,29 @@ test('pull takes a flow through the online transform (the query path cannot rebu
     assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`))
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).active, 'true')
   }))
+
+test('compressed flow fields are sent decompressed — the Table API takes the value, not the stored gzip', () =>
+  withInstance({}, async (instance) => {
+    const result = await push(instance, '--sys-id', FLOW)
+    assert.equal(result.status, 0, result.output)
+    const trigger = flowWrites(instance).find((w) => w.table === 'sys_hub_trigger_instance_v2' && w.method === 'POST')
+    const step = flowWrites(instance).find((w) => w.table === 'sys_hub_action_instance_v2' && w.method === 'POST')
+    assert.ok(!trigger.body.trigger_inputs.startsWith('H4sI'), 'trigger_inputs is not the gzip form')
+    assert.ok(Array.isArray(JSON.parse(trigger.body.trigger_inputs)), 'it is the JSON the build compressed')
+    assert.ok(!step.body.values.startsWith('H4sI'))
+    assert.match(step.body.values, /NowFluent flow demo saw/)
+  }))
+
+test('a failed activation says why, and the NEXT push is not refused as drift (seen live)', () =>
+  withInstance({ flowActivation: 'fail' }, async (instance) => {
+    const first = await push(instance, '--sys-id', FLOW)
+    assert.notEqual(first.status, 0)
+    assert.match(first.output, /NOT activated: PUBLISH_FAILED: Error publishing flow sys id .*No Trigger instance found/)
+    assert.doesNotMatch(first.output, /\{"result"/, 'the reason, not the raw JSON')
+
+    build('two-steps')
+    const second = await push(instance, '--sys-id', FLOW)
+    assert.doesNotMatch(second.output, /changed on the instance since you pulled it/,
+      'our own failed activation attempt is not someone else\'s drift')
+    assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`), 'the edit was written')
+  }))

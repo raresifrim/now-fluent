@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, write
 import { join, resolve, basename, dirname, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { gunzipSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
@@ -3794,6 +3795,22 @@ const GRAPH_ROOT_TABLES = new Set(['sys_hub_flow', 'sys_hub_action_type_definiti
 // two is an edit; wiping dozens of records is not something a source edit should do quietly.
 const GRAPH_DELETE_LIMIT = 50
 
+// Compressed flow fields (a trigger's trigger_inputs, a step's values) are written by the
+// build in their STORED form: gzip, base64-encoded ("H4sI..."). That is what an XML load or
+// update-set commit expects. A Table API write takes the field's VALUE instead — seen live:
+// sent as-is, activation failed with "No Trigger instance found in the flow definition" —
+// so for push they are decompressed. The SDK's own reader accepts either form.
+function inflateCompressedFields(fields) {
+  const out = { ...fields }
+  for (const [name, value] of Object.entries(out)) {
+    if (typeof value !== 'string' || !value.startsWith('H4sI')) continue
+    try {
+      out[name] = gunzipSync(Buffer.from(value, 'base64')).toString('utf8')
+    } catch { /* not gzip after all: keep it as written */ }
+  }
+  return out
+}
+
 function graphRootTable(xml) {
   const table = firstMatch(String(xml), /<record_update\b[^>]*\btable\s*=\s*"([^"]+)"/)
   return table && GRAPH_ROOT_TABLES.has(table) ? table : ''
@@ -3838,6 +3855,15 @@ async function activateGraph(instance, scopeId, rootTable, rootId) {
       { body, params: { sysparm_transaction_scope: scopeId }, throwOnError: true })
   } catch (error) {
     const message = error && error.message ? error.message : String(error)
+    // 422 = every flow failed to activate; the body still says why, per flow.
+    const json = message.match(/HTTP 422: (\{[\s\S]*\})/)
+    if (json) {
+      try {
+        const results = (JSON.parse(json[1]).result || {}).results || []
+        const reasons = results.map((r) => `${r.error_code ? `${r.error_code}: ` : ''}${r.message || r.status}`)
+        if (reasons.length) return { ok: false, message: reasons.join('; ') }
+      } catch { /* fall through to the raw message */ }
+    }
     if (/does not represent any resource/i.test(message)) {
       return { ok: false, missing: true, message: 'this instance has no flow activation endpoint '
         + '(api/now/wfa_fluent/activate_flows — it comes with the ServiceNow IDE)' }
@@ -3971,7 +3997,7 @@ async function pushGraph(unit, label, context) {
         + 'you pulled it. Re-pull the flow, or --force to overwrite it.')
       return 'failed'
     }
-    let body = recordFieldsToPayload(item.fields, { keepScope: !flags['no-scope'] })
+    let body = recordFieldsToPayload(inflateCompressedFields(item.fields), { keepScope: !flags['no-scope'] })
     if (!live && runScope === GLOBAL_SCOPE_ID && body.sys_scope && body.sys_scope !== GLOBAL_SCOPE_ID) {
       body = { ...body, sys_scope: GLOBAL_SCOPE_ID }
     }
@@ -4093,16 +4119,17 @@ async function pushGraph(unit, label, context) {
   let state = 'saved'
   if (activate) {
     const result = await activateGraph(instance, runScope, rootTable, rootId)
+    // An activation attempt writes the flow record even when it FAILS (seen live: mod_count
+    // 0 -> 1 on a rejected publish), so the baseline is taken again either way — or the
+    // next push would see our own attempt as somebody else's drift.
+    const after = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
+    if (after) writeBaseline(project, rootTable, rootId, instance, after)
     if (!result.ok) {
       console.error(`${label} ${written.length} record(s) written and ${removed} removed, but NOT activated: ${result.message}.\n`
         + `      Activate it in Flow Designer${result.missing ? '' : ' once the cause is fixed'}; until then the ${what} does not `
         + 'run with these changes.')
       return 'failed'
     }
-    // Activation writes the flow record itself (state, snapshot, mod count), so its baseline
-    // is taken again — or the next push would see our own activation as someone else's drift.
-    const after = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
-    if (after) writeBaseline(project, rootTable, rootId, instance, after)
     state = `activated (active=${after ? after.active : '?'}, status=${after ? after.status : '?'})`
   } else if (!creating) {
     state = flags['no-activate'] ? 'saved, not activated (--no-activate)' : 'saved as it was: inactive (--activate to activate it)'

@@ -80,7 +80,14 @@ export async function startMockInstance({
       const entries = [...(parsed.flows || []).map((f) => ['sys_hub_flow', f]), ...(parsed.actions || []).map((a) => ['sys_hub_action_type_definition', a])]
       const results = entries.map(([t, entry]) => {
         const row = store.get(`${t}/${entry.sys_id}`)
-        if (flowActivation === 'fail' || !row) return { sys_id: entry.sys_id, status: 'error', message: 'Compilation failed' }
+        if (!row) return { sys_id: entry.sys_id, status: 'error', message: 'No such flow' }
+        // Seen live: an activation attempt writes the flow record even when publishing fails.
+        row.sys_mod_count = String(Number(row.sys_mod_count || 0) + 1)
+        row.sys_updated_on = stamp()
+        if (flowActivation === 'fail') {
+          return { sys_id: entry.sys_id, status: 'error', error_code: 'PUBLISH_FAILED',
+            message: `Error publishing flow sys id ${entry.sys_id}: No Trigger instance found in the flow definition` }
+        }
         row.active = 'true'
         row.status = 'published'
         return { sys_id: entry.sys_id, flow_name: row.name, status: 'success' }

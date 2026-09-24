@@ -603,6 +603,18 @@ else
   note "on the instance — EXPECTED: active=true status=published, a snapshot, 1 trigger [record_create], 1 step saying 'v1'"
   flow_report "$FLOW"
 
+  note "DIAGNOSTIC: how the instance returns a trigger's compressed inputs — ours vs one built in Flow Designer"
+  note "EXPECTED: both start with '[' (plain JSON). If a Flow Designer one does and ours starts with 'H4sI',"
+  note "push sent the stored gzip form, and activation cannot read the trigger."
+  node --input-type=module -e "
+import { resolveInstance, snRequest, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+const get = (q) => snRequest(inst, 'GET', '/api/now/table/sys_hub_trigger_instance_v2', { throwOnError: true,
+  params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: 'sys_id,flow,trigger_inputs', sysparm_limit: '1' } })
+const show = (label, rows) => console.log('  ' + label + ': ' + (rows[0] ? JSON.stringify(String(rows[0].trigger_inputs || '').slice(0, 60)) : '(none found)'))
+show('ours            ', await get('flow=$FLOW'))
+show('Flow Designer   ', await get('flow!=$FLOW^trigger_inputsISNOTEMPTY^flow.sys_created_byNOT LIKEnow-fluent'))"
+
   note "does it RUN? creating an incident whose short description matches the trigger, then waiting for a flow context"
   INC=$(node --input-type=module -e "
 import { randomBytes } from 'node:crypto'
@@ -670,15 +682,16 @@ console.log('changed the flow description on the instance')"
   PULLED=$(grep -rl "$FLOW" src/fluent --include='*.ts' 2>/dev/null | grep -v '/keys.ts$' | head -5)
   echo "generated source for the flow: ${PULLED:-none}"
   if [ "$PULL_EXIT" = 0 ] && [ -n "$PULLED" ]; then
-    note "edit the PULLED source ('v2' -> 'v4' in the log message) and push — EXPECTED: 'updated', step says 'v4'"
-    for f in $PULLED; do sed -i.bak "s/$FMARK v2 saw/$FMARK v4 saw/" "$f" && rm -f "$f.bak"; done
+    note "edit the PULLED source (whatever version is live -> 'v4' in the log message) and push — EXPECTED: 'updated', step says 'v4'"
+    for f in $PULLED; do sed -i.bak "s/$FMARK v[0-9][0-9]* saw/$FMARK v4 saw/" "$f" && rm -f "$f.bak"; done
     if grep -q "$FMARK v4 saw" $PULLED; then
       now-sdk build >/dev/null 2>&1
       $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
       echo "push exit=$?"
       flow_report "$FLOW"
     else
-      echo "the pulled source does not carry the log message as text (the SDK may have produced low-level Record() files) — not edited"
+      echo "the pulled source does not carry the log message as text (the SDK may have produced low-level Record() files) — not edited:"
+      for f in $PULLED; do echo "  --- $f"; sed -n '1,40p' "$f"; done
     fi
   fi
 
