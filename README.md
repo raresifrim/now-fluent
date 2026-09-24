@@ -196,6 +196,10 @@ So the flag's real job is the check that follows: after the push, it looks at wh
 
 If you need changes in a specific update set, build one with `update-set-package` rather than hoping capture follows.
 
+### Flows are not pushable yet
+
+`push` refuses every `sys_hub_*` record. A `Flow()` builds into **one** artifact holding the flow, its trigger and step instances, and `delete_multiple` directives that remove steps no longer in the source — and the flow record always says `active=false` / `status=draft`, because `install` activates flows afterwards through a separate endpoint (`api/now/wfa_fluent/activate_flows`). Written record by record, a push would write part of the graph, leave removed steps behind, and **switch a live flow off**. Use `install` or `update-set-package` for flows.
+
 ### Two limitations worth knowing
 
 **push cannot clear a field by deleting it from the Fluent source.** A Table API write merges, and the built artifact only contains the fields your Fluent code models — so "absent from the artifact" means "not modelled", not "delete this value". Removing a property leaves the old value on the record. Set it to an explicit empty value instead.

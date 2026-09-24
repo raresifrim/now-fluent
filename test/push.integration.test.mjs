@@ -340,3 +340,29 @@ test('a baseline filed under a different table is still found', async () => {
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /updated \(1 field\(s\)\)/, 'should diff against the found baseline, not refuse')
 })
+
+// Seen in a real SDK 4.12.2 build: a Flow() compiles into ONE artifact holding the flow,
+// its trigger and step instances and delete_multiple directives, with active=false /
+// status=draft (install activates afterwards). Pushing it record by record is unsafe.
+const writeArtifactFile = (name, xml) => writeFileSync(join(project, 'dist', 'app', 'update', name), xml)
+
+test('flow graph records are refused, and nothing is written', async () => {
+  const flowId = 'f10f10f10f10f10f10f10f10f10f10f1'
+  const stepId = 'a55a55a55a55a55a55a55a55a55a55a5'
+  writeArtifactFile(`sys_hub_flow_${flowId}.xml`, [
+    '<record_update table="sys_hub_flow">',
+    `  <sys_hub_flow action="INSERT_OR_UPDATE"><sys_id>${flowId}</sys_id><active>false</active><status>draft</status><name>F</name></sys_hub_flow>`,
+    `  <sys_hub_action_instance_v2 action="delete_multiple" query="flow=${flowId}^sys_idNOT IN${stepId}"/>`,
+    `  <sys_hub_action_instance_v2 action="INSERT_OR_UPDATE"><sys_id>${stepId}</sys_id><flow>${flowId}</flow></sys_hub_action_instance_v2>`,
+    '</record_update>'
+  ].join('\n'))
+  instance.store.set(`sys_hub_flow/${flowId}`, { sys_id: flowId, active: 'true', status: 'published', name: 'F',
+    sys_updated_on: '2026-01-01 00:00:00', sys_mod_count: '3' })
+  for (const args of [['--sys-id', flowId], ['--sys-id', stepId], ['--all', '--include', 'sys_hub_flow']]) {
+    const result = await push(...args)
+    assert.notEqual(result.status, 0, `push ${args.join(' ')} must fail`)
+    assert.match(result.stdout + result.stderr, /part of a Workflow Automation flow\/action graph/)
+  }
+  assert.ok(!instance.log.some((entry) => entry.method !== 'GET'), 'nothing written')
+  assert.equal(instance.store.get(`sys_hub_flow/${flowId}`).active, 'true', 'the live flow is still active')
+})

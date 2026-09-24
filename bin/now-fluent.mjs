@@ -3384,6 +3384,20 @@ async function pushRecord(target, label, context) {
     ? (parseRecordUpdateRecords(sanitized).find((r) => r.sysId === sysId) || target.record)
     : target.record
 
+  // ---- flows are not single records --------------------------------------
+  // A Flow() builds into ONE artifact holding the flow, its trigger and step instances,
+  // plus delete_multiple directives that remove steps no longer in the source — and it
+  // always says active=false / status=draft, because install activates flows afterwards
+  // (POST api/now/wfa_fluent/activate_flows). A record-by-record Table API write would
+  // push only part of the graph, leave removed steps behind, and switch a live flow OFF.
+  if (table.startsWith('sys_hub_')) {
+    console.error(`${label} REFUSED: ${table} is part of a Workflow Automation flow/action graph, which push does\n`
+      + '      not write yet: it would write only part of the graph, leave removed steps behind, and send the\n'
+      + "      build's active=false/status=draft (deactivating a live flow) without re-activating it.\n"
+      + '      Use now-fluent install (writes the graph and activates it) or update-set-package.')
+    return 'failed'
+  }
+
   // Only THIS record's own action decides whether it is a delete. isDeletePayload()
   // looks at whichever record element comes first in the file, so using it here would
   // delete an INSERT_OR_UPDATE record that merely shares an artifact with a DELETE.

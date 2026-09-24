@@ -19,6 +19,11 @@ All other commands forward to now-sdk unchanged.
 The inner edit loop. Both ends are the plain Table REST API, so neither is gated by the
 scope checks that refuse `move` / online `transform` / `download`.
 
+**Flows: push REFUSES `sys_hub_*` records.** A Flow() builds into one artifact (flow + trigger
++ steps + `delete_multiple` directives) with `active=false`/`status=draft`; install activates it
+afterwards. Pushing it record by record would deactivate a live flow. Use install or
+update-set-package.
+
 **Selecting records.** pull: `--sys-id a,b,c` (mixed tables fine) OR
 `--query "<encoded>" --table <t> [--limit n]` — never both; a query pull re-takes records
 already in the project, and a `query` in `.now-fluent.json` is ignored. push: `--sys-id`
