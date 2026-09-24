@@ -418,6 +418,8 @@ Import it in ServiceNow via **System Update Sets → Retrieved Update Sets → I
 
 Known now-sdk build defects are fixed in the payloads before packaging: `sys_hub_flow_snapshot.outputs` serialized as `[object Object]` (subflows with a `masterSnapshot`) is written empty, as on the instance. Top-level flow steps (`sys_hub_action_instance_v2`, `sys_hub_flow_logic_instance_v2`, `sys_hub_sub_flow_instance_v2`) are emitted without `parent_ui_id`; an explicit empty `<parent_ui_id/>` is added so a step moved out of a removed If/loop is re-parented on commit. Any other `[object Object]` in a payload is reported as a warning.
 
+**Flows arrive as inactive drafts.** A flow in the update set is the same complete build `push` sends (flow, trigger, steps, and the directives that remove steps no longer in the source), and committing it loads it like `install` would, so Flow Designer shows it whole. But the SDK always builds a flow as `active=false` / `status=draft`: `install` and `push` activate it afterwards (`api/now/wfa_fluent/activate_flows`), and an update set commit does not. Activating publishes the flow, which is what compiles it and creates the snapshot it runs from; the build carries no snapshot, so marking it active in the XML would not work. After committing, open the flow in Flow Designer and click **Activate**. The same goes for `export-xml`.
+
 Run from a project that has `now.config.json` (any `init`-created project) and scope/scope-id/app-name are filled in automatically — you usually only pass `--update-set-name` and your selection.
 
 ### Selecting which records to include

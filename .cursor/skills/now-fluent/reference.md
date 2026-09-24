@@ -164,6 +164,10 @@ Auto-fixes empty-string enum props in generated `Action()` files (known now-sdk 
 
 Records gathered from `dist/app/update`, `metadata/update`, `dist/update`.
 
+Flows arrive as INACTIVE DRAFTS: the build says `active=false`/`status=draft`, and only install/push
+activate (`api/now/wfa_fluent/activate_flows`). After committing, activate the flow in Flow Designer.
+Never set `active=true` in the XML — activation compiles the flow and creates the snapshot it runs from.
+
 ## .now-fluent.json defaults
 
 ```json

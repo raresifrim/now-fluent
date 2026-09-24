@@ -114,6 +114,8 @@ Output: `exports/<name>/update-set-<name>.xml`. User imports manually: **System 
 
 `--include` / `--exclude`: substring match on `<table>_<sysid>` filenames; repeatable and comma-separated. Exclude `sys_module` unless wanted.
 
+**Flows arrive as inactive drafts.** The flow is complete (same build push sends; the commit loads it like install), but the SDK builds flows `active=false`/`status=draft` and only install/push activate them (`api/now/wfa_fluent/activate_flows`). Tell the user: after committing, open the flow in Flow Designer and click **Activate**. Do not set `active=true` in the XML — activation compiles the flow and creates its snapshot, which the build does not carry. Same for `export-xml`.
+
 ### Vendor scope (e.g. HAM)
 
 1. Bind project: set `now.config.json` `scope` and `scopeId`

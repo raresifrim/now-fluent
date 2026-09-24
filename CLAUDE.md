@@ -227,6 +227,8 @@ Key flags:
 
 Tell the user to import via: System Update Sets → Retrieved Update Sets → Import Update Set from XML → Preview → Commit.
 
+**Flows arrive as INACTIVE DRAFTS — tell the user.** A flow in the update set is complete (the same build push sends, loaded on commit like install loads it), but the SDK builds every flow `active=false`/`status=draft`, and only `install` and `push` activate it afterwards (`POST api/now/wfa_fluent/activate_flows`); an update set commit does not (seen by the user: a flow shipped this way arrived in draft). After committing, open the flow in Flow Designer and click **Activate**. Do not "fix" it by writing `active=true`/`status=published` into the XML: activation is what compiles the flow and creates the snapshot it runs from, and the build carries none. The same applies to `export-xml`.
+
 ## ServiceNow-owned scopes and HAM
 
 For Hardware Asset Management or other ServiceNow-owned apps:
