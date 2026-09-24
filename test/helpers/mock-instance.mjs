@@ -146,6 +146,12 @@ export async function startMockInstance({
     if (!query) return true
     for (const clause of query.split('^')) {
       if (!clause || /^ORDERBY/i.test(clause)) continue
+      // Before IN: a STARTSWITH value may itself contain "IN".
+      const starts = clause.match(/^(\w+?)STARTSWITH(.*)$/)
+      if (starts) {
+        if (!String(row[starts[1]] ?? '').startsWith(starts[2])) return false
+        continue
+      }
       const inMatch = clause.match(/^(\w+)IN(.*)$/)
       if (inMatch) {
         const [, field, list] = inMatch

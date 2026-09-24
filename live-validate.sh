@@ -4,12 +4,13 @@
 # ---------------------------------------------------------------------------
 # Phases 0-2 are fully automatic and read-only-ish (the Phase 0 spike creates
 # throwaway sys_script_include records and deletes them again).
-# Phase 3-4 write records, so they are gated behind CONFIRM_PUSH=1.
+# Phases 3-5 write records, so they are gated behind CONFIRM_PUSH=1.
+# Phase 5 pulls by --query: three throwaway Global script includes, two matched.
 #
 #   chmod +x live-validate.sh
 #   ./live-validate.sh --auth dev                      # phases 0-2
 #   ./live-validate.sh --auth dev --scope sn_hamp      # + scoped spike
-#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-4
+#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-5
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --project-scope sn_sow
 #       binds the demo project to a scope that ALREADY EXISTS on the instance — a
 #       ServiceNow or Store app such as sn_sow / sn_hamp, the way a vendor-scope project
@@ -336,5 +337,85 @@ if [ -n "$NEWID" ]; then
   delete_record "$NEWID"
   rm -f "$SRC"
 fi
+
+# ---------------------------------------------------------------------------
+hr "PHASE 5 — pull by QUERY: every record an encoded query matches"
+# Three throwaway Global script includes sharing a unique name prefix. The query selects the
+# two ACTIVE ones, so the inactive third proves the filter is applied, not just the prefix.
+QPREFIX="NowFluentQ$(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")"
+create_global_si() {
+  node --input-type=module -e "
+import { randomBytes } from 'node:crypto'
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+const id = randomBytes(16).toString('hex')
+await snRequest(resolveInstance('$AUTH'), 'POST', '/api/now/table/sys_script_include', {
+  throwOnError: true,
+  body: { sys_id: id, name: '$1', script: 'var $1 = Class.create();', active: '$2',
+          description: 'now-fluent live-validate query pull — safe to delete' },
+  params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' }
+})
+console.log(id)"
+}
+baseline_mod_count() {
+  node -e "
+const f = '.now-fluent/state/sys_script_include_$1.json'
+try { console.log(JSON.parse(require('fs').readFileSync(f, 'utf8')).sys_mod_count) } catch { console.log('none') }"
+}
+Q1=$(create_global_si "${QPREFIX}A" true)
+Q2=$(create_global_si "${QPREFIX}B" true)
+Q3=$(create_global_si "${QPREFIX}C" false)
+echo "created: $Q1 (${QPREFIX}A, active)  $Q2 (${QPREFIX}B, active)  $Q3 (${QPREFIX}C, INACTIVE)"
+QUERY="nameSTARTSWITH${QPREFIX}^active=true"
+
+if [ -n "$Q1" ] && [ -n "$Q2" ] && [ -n "$Q3" ]; then
+  note "pull --query --dry-run — EXPECTED: '[dry-run] would select records ... $QUERY', nothing imported"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --query "$QUERY" --dry-run
+  echo "exit=$?"
+
+  note "pull --query AND --sys-id — EXPECTED: refused ('EITHER --sys-id ... OR --query'), exit non-zero"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --query "$QUERY" --sys-id "$Q1"
+  echo "exit=$? (non-zero expected)"
+
+  note "pull --query — EXPECTED: '2 record(s) matched', both ADOPTED from Global into $PSCOPE, 2 baselines"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --query "$QUERY"
+  echo "pull exit=$?"
+
+  note "which records got a baseline — EXPECTED: A yes, B yes, C (inactive) NO"
+  for pair in "A:$Q1" "B:$Q2" "C:$Q3"; do
+    id="${pair#*:}"
+    if [ -f ".now-fluent/state/sys_script_include_$id.json" ]; then echo "  ${pair%%:*} $id: baseline"; else echo "  ${pair%%:*} $id: no baseline"; fi
+  done
+
+  note "change A on the instance, then pull the same query again —"
+  note "EXPECTED: 'already exist as Fluent source' warning for A and B, and A's baseline mod_count goes UP"
+  BEFORE=$(baseline_mod_count "$Q1")
+  node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+await snRequest(resolveInstance('$AUTH'), 'PUT', '/api/now/table/sys_script_include/$Q1', {
+  throwOnError: true, body: { description: 'changed on the instance' },
+  params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' } })
+console.log('changed ${QPREFIX}A on the instance')"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --query "$QUERY"
+  echo "pull exit=$?"
+  echo "A baseline sys_mod_count: before $BEFORE, after $(baseline_mod_count "$Q1")"
+
+  note "pull --query --limit 1 — EXPECTED: '1 record(s) matched'"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --query "$QUERY" --limit 1
+  echo "pull exit=$?"
+fi
+
+note "cleanup: the 3 records on the instance, and their Fluent source, baselines and adoptions here"
+for id in $Q1 $Q2 $Q3; do
+  [ -n "$id" ] || continue
+  delete_record "$id"
+  for f in $(grep -rl "$id" src/fluent --include='*.ts' 2>/dev/null | grep -v '/keys.ts$'); do rm -f "$f"; done
+  rm -f ".now-fluent/state/sys_script_include_$id.json"
+done
+node -e "
+const fs = require('fs'); const f = '.now-fluent/adopted.json'
+if (fs.existsSync(f)) { const a = JSON.parse(fs.readFileSync(f, 'utf8'))
+  for (const id of '$Q1 $Q2 $Q3'.split(' ')) delete a[id]
+  fs.writeFileSync(f, JSON.stringify(a, null, 2) + '\n') }"
+now-sdk build >/dev/null 2>&1 && echo "project still builds" || echo "WARNING: the project no longer builds after cleanup — run now-sdk build to see why"
 
 hr "DONE — transcript: $LOG"
