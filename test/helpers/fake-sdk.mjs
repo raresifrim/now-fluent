@@ -123,6 +123,16 @@ if (argv[0] === 'transform' && argv.includes('--id')) {
   let keys = existsSync(keysFile) ? readFileSync(keysFile, 'utf8') : 'export const keys = {\n}\n'
   if (!keys.includes(`'${id}': {`)) keys = keys.replace(/\n\}\n?$/, `\n  '${id}': { table: '${table}' },\n}\n`)
   writeFileSync(keysFile, keys)
+  // Seen live: the real SDK cannot parse a flow's snapshot, and copies its raw XML into the
+  // metadata directory ("No records parsed from sys_hub_flow_snapshot_<id>.xml, moving to
+  // metadata directory") — from where every build copies it into dist/app.
+  if (table === 'sys_hub_flow') {
+    const snapshot = `5a${id.slice(2)}`
+    const file = join(valueOf('--directory') || process.cwd(), 'metadata', 'update', `sys_hub_flow_snapshot_${snapshot}.xml`)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, `<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_hub_flow_snapshot"><sys_hub_flow_snapshot action="INSERT_OR_UPDATE"><parent_flow>${id}</parent_flow><sys_id>${snapshot}</sys_id></sys_hub_flow_snapshot></record_update>`)
+    console.log(`No records parsed from sys_hub_flow_snapshot_${snapshot}.xml, moving to metadata directory`)
+  }
   console.log(`Transform completed successfully (online, ${table} ${id})`)
   process.exit(0)
 }

@@ -1350,6 +1350,13 @@ function commandImport(flags, config, positional, internal = {}) {
         if (result.status === 0) {
           console.log(`  ${t} ${id} ok`)
           importedBy.transform.push(id)
+          if (t === 'sys_hub_flow') {
+            const removed = pruneFlowSnapshotMetadata(project, id)
+            if (removed.length) {
+              console.log(`    removed the snapshot XML the SDK left for the build (${removed.join(', ')}): a snapshot `
+                + "is the instance's own record — activation makes a new one — so it must not be shipped back")
+            }
+          }
         } else {
           console.error(`  ${t} ${id} FAILED (exit ${result.status})`)
           // On the query path a failed graph has nowhere left to go.
@@ -2550,6 +2557,31 @@ function stripXmlDeclaration(xml) {
   return String(xml).replace(/^\s*<\?xml[^>]*\?>\s*/i, '').trim()
 }
 
+// Seen live: the SDK's online transform cannot parse a flow's snapshot and copies the raw
+// sys_hub_flow_snapshot XML into the metadata directory ("No records parsed from ...,
+// moving to metadata directory"). Every build copies that directory into dist/app, so
+// install, update-set-package and push --all would ship a stale copy of a record the
+// platform owns. The copy is removed — with any copy an earlier build already made.
+function pruneFlowSnapshotMetadata(project, flowId) {
+  const config = readProjectConfig(project)
+  const removed = []
+  const walk = (dir) => {
+    if (!existsSync(dir)) return
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        walk(path)
+      } else if (/^sys_hub_flow_snapshot_[0-9a-f]{32}\.xml$/i.test(entry.name) && readFileSync(path, 'utf8').includes(flowId)) {
+        rmSync(path, { force: true })
+        removed.push(relative(project, path))
+      }
+    }
+  }
+  walk(join(project, config.metadataDir || 'metadata'))
+  walk(join(project, config.appOutputDir || join('dist', 'app')))
+  return removed
+}
+
 function readProjectConfig(project) {
   const configFile = join(project, 'now.config.json')
   if (!existsSync(configFile)) return {}
@@ -2979,6 +3011,31 @@ async function commandPull(flags, config, positional) {
     } catch (error) {
       console.warn(`  ! ${recordTable} ${sysId}: ${error && error.message ? error.message : error}`)
       skipped.push(sysId)
+    }
+  }
+  // A flow's trigger and steps arrive with the flow's online transform but have no keys.ts
+  // entry of their own, so the loop above never reaches them — and without a baseline push
+  // cannot tell a Flow Designer edit to a step from its own. Every part gets one too.
+  const FLOW_PART_TABLES = ['sys_hub_trigger_instance_v2', 'sys_hub_action_instance_v2',
+    'sys_hub_flow_logic_instance_v2', 'sys_hub_sub_flow_instance_v2']
+  for (const sysId of baselined) {
+    if (tableFor.get(sysId) !== 'sys_hub_flow') continue
+    for (const partTable of FLOW_PART_TABLES) {
+      let rows
+      try {
+        rows = await snRequest(instance, 'GET', `/api/now/table/${partTable}`, {
+          params: { ...RAW_READ_PARAMS, sysparm_query: `flow=${sysId}`, sysparm_limit: '500' }, throwOnError: true
+        })
+      } catch (error) {
+        console.warn(`  ! ${partTable} of flow ${sysId}: ${error && error.message ? error.message : error}`)
+        continue
+      }
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (!row.sys_id) continue
+        writeBaseline(project, partTable, row.sys_id, instance, row)
+        console.log(`  ${partTable} ${row.sys_id} baseline recorded (part of flow ${sysId})`)
+        written++
+      }
     }
   }
   console.log(`\npull: ${written} baseline(s) in ${join(project, '.now-fluent', 'state')}`)

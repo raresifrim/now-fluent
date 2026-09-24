@@ -738,7 +738,8 @@ console.log('changed the flow description on the instance')"
   echo "push exit=$? (non-zero expected)"
 
   note "PULL it back: the authored source is set aside; pull must go through the online transform"
-  note "EXPECTED: 'graphs the query path cannot rebuild — importing them through the online transform', a baseline"
+  note "EXPECTED: 'graphs the query path cannot rebuild — importing them through the online transform', a baseline,"
+  note "'removed the snapshot XML the SDK left for the build', and baselines for the trigger and step ('part of flow')"
   mv "$FSRC" "$FSRC.authored"
   $NF pull --project . --auth "$AUTH" --table sys_hub_flow --sys-id "$FLOW"
   PULL_EXIT=$?

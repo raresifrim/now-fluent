@@ -282,6 +282,10 @@ test('pull takes a flow through the online transform (the query path cannot rebu
     assert.match(pulled.output, /graphs the query path cannot rebuild — importing them through the online transform/)
     assert.match(pulled.output, /transform --auth test --table sys_hub_flow --id 21d91be4/)
     assert.ok(existsSync(join(project, '.now-fluent', 'state', `sys_hub_flow_${FLOW}.json`)), 'the flow has a baseline')
+    for (const [table, id] of [['sys_hub_trigger_instance_v2', TRIGGER], ['sys_hub_action_instance_v2', STEP]]) {
+      assert.ok(existsSync(join(project, '.now-fluent', 'state', `${table}_${id}.json`)), `${table} (a part of the flow) has a baseline`)
+    }
+    assert.match(pulled.output, /baseline recorded \(part of flow 21d91be4/)
 
     build('two-steps')
     instance.log.length = 0
@@ -449,4 +453,22 @@ test('a real edit to a modelled field of the flow is still drift, and named', ()
     assert.notEqual(result.status, 0)
     assert.match(result.output, /the flow changed on the instance since you pulled it \(description\)/)
     assert.equal(loads(instance).length, 0)
+  }))
+
+test('pull removes the snapshot XML the SDK transform leaves in metadata/ (and a built copy), and only that flow\'s', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    const other = 'abcdefabcdefabcdefabcdefabcdef12'
+    const otherFile = join(project, 'metadata', 'update', `sys_hub_flow_snapshot_${other}.xml`)
+    const builtCopy = join(project, 'dist', 'app', 'update', `sys_hub_flow_snapshot_5a${FLOW.slice(2)}.xml`)
+    mkdirSync(join(project, 'metadata', 'update'), { recursive: true })
+    writeFileSync(otherFile, `<record_update><sys_hub_flow_snapshot><parent_flow>${'f'.repeat(32)}</parent_flow></sys_hub_flow_snapshot></record_update>`)
+    writeFileSync(builtCopy, `<record_update><sys_hub_flow_snapshot><parent_flow>${FLOW}</parent_flow></sys_hub_flow_snapshot></record_update>`)
+
+    const pulled = await pull(instance, '--table', 'sys_hub_flow', '--sys-id', FLOW)
+    assert.equal(pulled.status, 0, pulled.output)
+    assert.match(pulled.output, /removed the snapshot XML the SDK left for the build/)
+    assert.ok(!existsSync(join(project, 'metadata', 'update', `sys_hub_flow_snapshot_5a${FLOW.slice(2)}.xml`)), 'the transform\'s copy is gone')
+    assert.ok(!existsSync(builtCopy), 'and the copy an earlier build made')
+    assert.ok(existsSync(otherFile), 'another flow\'s snapshot is not touched')
   }))
