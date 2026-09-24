@@ -778,8 +778,8 @@ console.log('changed the flow description on the instance')"
   fi
 
   if [ "${KEEP_FLOW:-}" = "1" ]; then
-    note "KEEP_FLOW=1: the flow is LEFT on the instance ($FLOW, \"$FNAME\"). Open it in Flow Designer and try Activate;"
-    note "delete it there afterwards. Its local source and baselines are removed here either way."
+    note "KEEP_FLOW=1: the flow is LEFT on the instance ($FLOW, \"$FNAME\"). It is active; open it in Flow Designer to look at it,"
+    note "and delete it there afterwards. Its local source and baselines are removed here either way."
   else
     note "cleanup: the flow and its whole graph on the instance, and its source, baselines here"
     delete_flow "$FLOW"
