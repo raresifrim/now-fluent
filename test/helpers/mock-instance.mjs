@@ -30,10 +30,13 @@ import { createServer } from 'node:http'
 // Seen live: with the picker on sn_sow, a plain REST create landed in sn_sow. A write
 // with no honoured ?sysparm_transaction_scope runs there; default 'global'. Stored as the
 // apps.current_app preference so a caller can read it.
+// flowActivation: how POST /api/now/wfa_fluent/activate_flows (the call install makes
+// after writing a flow) answers — 'ok' (activates: active=true, status=published),
+// 'missing' (the 400 an instance without the ServiceNow IDE returns), or 'fail' (422).
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
   honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = [],
-  currentApp = 'global'
+  currentApp = 'global', flowActivation = 'ok'
 } = {}) {
   const store = new Map(Object.entries(records))
   const USER_ID = 'user0000000000000000000000000001'
@@ -69,6 +72,22 @@ export async function startMockInstance({
     const send = (status, payload) => {
       res.writeHead(status, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(payload))
+    }
+    if (url.pathname === '/api/now/wfa_fluent/activate_flows') {
+      if (flowActivation === 'missing') {
+        return send(400, { error: { message: 'Requested URI does not represent any resource: /api/now/wfa_fluent/activate_flows' } })
+      }
+      const entries = [...(parsed.flows || []).map((f) => ['sys_hub_flow', f]), ...(parsed.actions || []).map((a) => ['sys_hub_action_type_definition', a])]
+      const results = entries.map(([t, entry]) => {
+        const row = store.get(`${t}/${entry.sys_id}`)
+        if (flowActivation === 'fail' || !row) return { sys_id: entry.sys_id, status: 'error', message: 'Compilation failed' }
+        row.active = 'true'
+        row.status = 'published'
+        return { sys_id: entry.sys_id, flow_name: row.name, status: 'success' }
+      })
+      const failed = results.filter((r) => r.status !== 'success').length
+      return send(failed === results.length && results.length ? 422 : 200,
+        { result: { summary: { total: results.length, succeeded: results.length - failed, failed }, results } })
     }
     const key = `${table}/${sysId}`
     const project = (row) => {
@@ -146,6 +165,11 @@ export async function startMockInstance({
     if (!query) return true
     for (const clause of query.split('^')) {
       if (!clause || /^ORDERBY/i.test(clause)) continue
+      const notIn = clause.match(/^(\w+?)NOT IN(.*)$/)
+      if (notIn) {
+        if (notIn[2].split(',').includes(String(row[notIn[1]] ?? ''))) return false
+        continue
+      }
       // Before IN: a STARTSWITH value may itself contain "IN".
       const starts = clause.match(/^(\w+?)STARTSWITH(.*)$/)
       if (starts) {

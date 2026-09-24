@@ -343,10 +343,12 @@ test('a baseline filed under a different table is still found', async () => {
 
 // Seen in a real SDK 4.12.2 build: a Flow() compiles into ONE artifact holding the flow,
 // its trigger and step instances and delete_multiple directives, with active=false /
-// status=draft (install activates afterwards). Pushing it record by record is unsafe.
+// status=draft. However it is selected — the flow, one of its steps, or --all — it is
+// pushed as one unit, so a live flow that was never pulled is refused whole.
+// (test/flow-push.integration.test.mjs covers pushing flows properly.)
 const writeArtifactFile = (name, xml) => writeFileSync(join(project, 'dist', 'app', 'update', name), xml)
 
-test('flow graph records are refused, and nothing is written', async () => {
+test('a live flow that was never pulled is refused as a unit, however it is selected', async () => {
   const flowId = 'f10f10f10f10f10f10f10f10f10f10f1'
   const stepId = 'a55a55a55a55a55a55a55a55a55a55a5'
   writeArtifactFile(`sys_hub_flow_${flowId}.xml`, [
@@ -361,7 +363,8 @@ test('flow graph records are refused, and nothing is written', async () => {
   for (const args of [['--sys-id', flowId], ['--sys-id', stepId], ['--all', '--include', 'sys_hub_flow']]) {
     const result = await push(...args)
     assert.notEqual(result.status, 0, `push ${args.join(' ')} must fail`)
-    assert.match(result.stdout + result.stderr, /part of a Workflow Automation flow\/action graph/)
+    assert.match(result.stdout + result.stderr, /pushed as one unit/)
+    assert.match(result.stdout + result.stderr, /no pull baseline for it/)
   }
   assert.ok(!instance.log.some((entry) => entry.method !== 'GET'), 'nothing written')
   assert.equal(instance.store.get(`sys_hub_flow/${flowId}`).active, 'true', 'the live flow is still active')

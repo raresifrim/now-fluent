@@ -196,9 +196,21 @@ So the flag's real job is the check that follows: after the push, it looks at wh
 
 If you need changes in a specific update set, build one with `update-set-package` rather than hoping capture follows.
 
-### Flows are not pushable yet
+### Flows: pushed as one unit
 
-`push` refuses every `sys_hub_*` record. A `Flow()` builds into **one** artifact holding the flow, its trigger and step instances, and `delete_multiple` directives that remove steps no longer in the source — and the flow record always says `active=false` / `status=draft`, because `install` activates flows afterwards through a separate endpoint (`api/now/wfa_fluent/activate_flows`). Written record by record, a push would write part of the graph, leave removed steps behind, and **switch a live flow off**. Use `install` or `update-set-package` for flows.
+A `Flow()` builds into **one** artifact: the flow, its trigger and step instances, and `delete_multiple` directives that remove steps no longer in the source. The flow record always says `active=false` / `status=draft`, because `install` activates flows afterwards through `api/now/wfa_fluent/activate_flows`. So `push` treats the artifact as a unit — whether you name the flow, one of its steps, or use `--all`:
+
+```bash
+now-fluent push --project . --auth dev --sys-id <flow sys_id> --dry-run   # every write, and the activation
+now-fluent push --project . --auth dev --sys-id <flow sys_id>
+```
+
+- every read and guard first (drift on the flow and its steps, scope rules), then every record and directive in document order, as the flow's scope;
+- a live flow's `active` / `status` are never sent; the flow is then activated like `install` does it if it is new or was active (`--activate` forces, `--no-activate` skips) — an instance without the activation endpoint (it ships with the ServiceNow IDE) gets the records but a failed run saying the flow is NOT activated;
+- a `delete_multiple` directive must name this flow or one of its records and may match at most 50 records, or nothing is written; push never deletes a whole flow;
+- `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes.
+
+Runbook phases 7–8 exercise all of this against a real instance.
 
 ### Two limitations worth knowing
 

@@ -111,5 +111,21 @@ if (argv[0] === 'transform' && argv.includes('--from')) {
   process.exit(0)
 }
 
+// The ONLINE transform (`transform --table <t> --id <id>`): the real SDK reads the record —
+// for a flow, its whole graph — from the instance. The fake registers the id in keys.ts.
+if (argv[0] === 'transform' && argv.includes('--id')) {
+  const { readFileSync, writeFileSync, mkdirSync, existsSync } = await import('node:fs')
+  const { join, dirname } = await import('node:path')
+  const id = valueOf('--id')
+  const table = valueOf('--table')
+  const keysFile = join(valueOf('--directory') || process.cwd(), 'src', 'fluent', 'generated', 'keys.ts')
+  mkdirSync(dirname(keysFile), { recursive: true })
+  let keys = existsSync(keysFile) ? readFileSync(keysFile, 'utf8') : 'export const keys = {\n}\n'
+  if (!keys.includes(`'${id}': {`)) keys = keys.replace(/\n\}\n?$/, `\n  '${id}': { table: '${table}' },\n}\n`)
+  writeFileSync(keysFile, keys)
+  console.log(`Transform completed successfully (online, ${table} ${id})`)
+  process.exit(0)
+}
+
 console.error(`fake-sdk: unhandled command: ${argv.join(' ')}`)
 process.exit(1)

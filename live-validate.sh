@@ -4,14 +4,15 @@
 # ---------------------------------------------------------------------------
 # Phases 0-2 are fully automatic and read-only-ish (the Phase 0 spike creates
 # throwaway sys_script_include records and deletes them again).
-# Phases 3-6 write records, so they are gated behind CONFIRM_PUSH=1.
+# Phases 3-8 write records, so they are gated behind CONFIRM_PUSH=1.
 # Phase 5 pulls by --query: three throwaway Global script includes, two matched.
 # Phase 6 deletes one by removing its Fluent source: push --allow-delete.
+# Phases 7-8 create a flow in Fluent, push and run it, edit it, pull it back, delete it.
 #
 #   chmod +x live-validate.sh
 #   ./live-validate.sh --auth dev                      # phases 0-2
 #   ./live-validate.sh --auth dev --scope sn_hamp      # + scoped spike
-#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-6
+#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-8
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --project-scope sn_sow
 #       binds the demo project to a scope that ALREADY EXISTS on the instance — a
 #       ServiceNow or Store app such as sn_sow / sn_hamp, the way a vendor-scope project
@@ -504,5 +505,191 @@ if (fs.existsSync(f)) { const a = JSON.parse(fs.readFileSync(f, 'utf8')); delete
   fs.writeFileSync(f, JSON.stringify(a, null, 2) + '\n') }"
 # keys.ts still registers it, so later builds keep emitting its DELETE artifact; a later
 # push --allow-delete of it just reports 'already absent'.
+
+# ---------------------------------------------------------------------------
+# Flows: a Flow() builds into ONE artifact (flow + trigger + steps + delete_multiple
+# directives); push writes it as one unit, keeps a live flow's active/status, and then
+# activates it through api/now/wfa_fluent/activate_flows, as install does.
+FRAND=$(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")
+FNAME="NowFluent Flow $FRAND"
+FMARK="NowFluentFlow$FRAND"
+FSRC="src/fluent/nf-flow-$FRAND.now.ts"
+write_flow() { # $1 = log message tag (v1, v2...), $2 = "second" to add a second step
+  local second=""
+  if [ "${2:-}" = "second" ]; then
+    second="
+        wfa.action(action.core.log, { \$id: Now.ID['nf_flow_${FRAND}_log2'] }, { log_level: 'warn', log_message: '$FMARK second step' })"
+  fi
+  cat > "$FSRC" <<FLOWEOF
+import { action, Flow, wfa, trigger } from '@servicenow/sdk/automation'
+
+Flow(
+    { \$id: Now.ID['nf_flow_$FRAND'], name: '$FNAME', description: 'now-fluent live-validate — safe to delete', runAs: 'system' },
+    wfa.trigger(
+        trigger.record.created,
+        { \$id: Now.ID['nf_flow_${FRAND}_trigger'] },
+        { table: 'incident', condition: 'short_descriptionSTARTSWITH$FMARK', run_flow_in: 'background' }
+    ),
+    (params) => {
+        wfa.action(action.core.log, { \$id: Now.ID['nf_flow_${FRAND}_log'] },
+            { log_level: 'info', log_message: \`$FMARK $1 saw \${wfa.dataPill(params.trigger.current.number, 'string')}\` })$second
+    }
+)
+FLOWEOF
+}
+# The flow on the instance: its state, and every part of its graph (step inputs decoded).
+flow_report() {
+  node --input-type=module -e "
+import { gunzipSync } from 'node:zlib'
+import { resolveInstance, snRequest, snGetRecord, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+const f = await snGetRecord(inst, 'sys_hub_flow', '$1', 'name,active,status,sys_scope,latest_snapshot,master_snapshot', { throwOnError: true })
+if (!f) { console.log('  no sys_hub_flow $1 on the instance'); process.exit(0) }
+console.log('  flow: ' + f.name + '  active=' + f.active + '  status=' + f.status + '  sys_scope=' + f.sys_scope
+  + '  snapshot=' + (f.latest_snapshot || f.master_snapshot ? 'yes' : 'none'))
+const list = (t, q, fields) => snRequest(inst, 'GET', '/api/now/table/' + t, { throwOnError: true,
+  params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: fields, sysparm_limit: '100' } })
+const triggers = await list('sys_hub_trigger_instance_v2', 'flow=$1', 'sys_id,trigger_type')
+console.log('  triggers: ' + triggers.length + triggers.map((t) => ' [' + t.trigger_type + ']').join(''))
+const steps = await list('sys_hub_action_instance_v2', 'flow=$1^ORDERBYorder', 'sys_id,order,values')
+console.log('  steps: ' + steps.length)
+for (const s of steps) {
+  let text = s.values || ''
+  try { text = gunzipSync(Buffer.from(text, 'base64')).toString('utf8') } catch {}
+  const m = text.match(/$FMARK[^\"\\\\]*/)
+  console.log('    #' + s.order + ' ' + s.sys_id + '  log_message: ' + (m ? m[0] : '(not found in values)'))
+}"
+}
+delete_flow() {
+  node --input-type=module -e "
+import { resolveInstance, snRequest, snGetRecord, snDeleteRecord, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+const f = await snGetRecord(inst, 'sys_hub_flow', '$1', 'sys_id,sys_scope', { throwOnError: true })
+if (!f) { console.log('flow $1 is already gone'); process.exit(0) }
+const scope = f.sys_scope
+let n = 0
+for (const [t, q] of [['sys_hub_action_instance_v2', 'flow=$1'], ['sys_hub_trigger_instance_v2', 'flow=$1'],
+  ['sys_hub_flow_logic_instance_v2', 'flow=$1'], ['sys_hub_sub_flow_instance_v2', 'flow=$1'], ['sys_hub_flow_snapshot', 'parent_flow=$1']]) {
+  let rows = []
+  try { rows = await snRequest(inst, 'GET', '/api/now/table/' + t, { throwOnError: true,
+    params: { ...RAW_READ_PARAMS, sysparm_query: q, sysparm_fields: 'sys_id', sysparm_limit: '200' } }) } catch { continue }
+  for (const r of rows) { try { await snDeleteRecord(inst, t, r.sys_id, scope); n++ } catch (e) { console.log('  could not delete ' + t + ' ' + r.sys_id) } }
+}
+await snDeleteRecord(inst, 'sys_hub_flow', '$1', scope)
+console.log('deleted flow $1 and ' + n + ' record(s) of its graph')" || echo "could not delete flow $1 — remove it in Flow Designer"
+}
+flow_artifact() { grep -l "<name>$FNAME</name>" dist/app/update/sys_hub_flow_*.xml 2>/dev/null | head -1; }
+
+hr "PHASE 7 — a NEW flow authored in Fluent, pushed to the instance, activated, and run"
+write_flow v1
+now-sdk build >/dev/null 2>&1
+FART=$(flow_artifact)
+FLOW=""
+if [ -z "$FART" ]; then
+  echo "the build produced no artifact for '$FNAME' — build output:"; now-sdk build 2>&1 | tail -20
+else
+  FLOW=$(basename "$FART" .xml | sed 's/^sys_hub_flow_//')
+  echo "flow artifact: $FART"
+  grep -o '<[a-z_0-9]* action="[A-Za-z_]*"' "$FART" | sed 's/^/  /'
+
+  note "push --dry-run — EXPECTED: 'pushed as one unit', would POST sys_hub_flow + trigger + step, 'then activate it'"
+  $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build --dry-run
+  echo "exit=$?"
+
+  note "push — EXPECTED: 'created in $PSCOPE: 3 record(s) written, 0 removed, activated (active=true, status=published)'"
+  $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
+  echo "push exit=$?"
+
+  note "on the instance — EXPECTED: active=true status=published, a snapshot, 1 trigger [record_create], 1 step saying 'v1'"
+  flow_report "$FLOW"
+
+  note "does it RUN? creating an incident whose short description matches the trigger, then waiting for a flow context"
+  INC=$(node --input-type=module -e "
+import { randomBytes } from 'node:crypto'
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+const id = randomBytes(16).toString('hex')
+await snRequest(resolveInstance('$AUTH'), 'POST', '/api/now/table/incident', { throwOnError: true,
+  body: { sys_id: id, short_description: '$FMARK trigger test — safe to delete' },
+  params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' } })
+console.log(id)")
+  echo "incident: $INC"
+  node --input-type=module -e "
+import { resolveInstance, snRequest, RAW_READ_PARAMS } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+for (let i = 0; i < 12; i++) {
+  let rows = []
+  try { rows = await snRequest(inst, 'GET', '/api/now/table/sys_flow_context', { throwOnError: true,
+    params: { ...RAW_READ_PARAMS, sysparm_query: 'flow=$FLOW', sysparm_fields: 'sys_id,state,name', sysparm_limit: '5' } }) } catch (e) { console.log('  cannot read sys_flow_context: ' + e.message); break }
+  if (rows.length) { console.log('  RAN: ' + rows.map((r) => r.name + ' state=' + r.state).join(', ')); process.exit(0) }
+  await new Promise((r) => setTimeout(r, 5000))
+}
+console.log('  no flow context within 60s — check Flow Designer > Executions (a background flow can queue)')"
+  [ -n "$INC" ] && node --input-type=module -e "
+import { resolveInstance, snDeleteRecord } from '$REPO/bin/now-fluent.mjs'
+await snDeleteRecord(resolveInstance('$AUTH'), 'incident', '$INC', 'global'); console.log('deleted incident $INC')"
+fi
+
+hr "PHASE 8 — editing that EXISTING flow: change a step, add one, remove it, drift, pull it back"
+if [ -n "$FLOW" ]; then
+  note "edit: log message v1 -> v2, and ADD a second step; push — EXPECTED: 'updated', 1 new step POSTed, re-activated"
+  write_flow v2 second
+  now-sdk build >/dev/null 2>&1
+  $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build --dry-run
+  $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
+  echo "push exit=$?"
+  note "EXPECTED: still active/published, 2 steps, the first saying 'v2'"
+  flow_report "$FLOW"
+
+  note "REMOVE the second step; push — EXPECTED: '1 removed' (through delete_multiple), re-activated"
+  write_flow v2
+  now-sdk build >/dev/null 2>&1
+  $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
+  echo "push exit=$?"
+  note "EXPECTED: 1 step left, saying 'v2'"
+  flow_report "$FLOW"
+
+  note "DRIFT: change the flow on the instance, then push an edit — EXPECTED: REFUSED 'changed on the instance', nothing written"
+  node --input-type=module -e "
+import { resolveInstance, snRequest, snGetRecord } from '$REPO/bin/now-fluent.mjs'
+const inst = resolveInstance('$AUTH')
+const f = await snGetRecord(inst, 'sys_hub_flow', '$FLOW', 'sys_scope', { throwOnError: true })
+await snRequest(inst, 'PUT', '/api/now/table/sys_hub_flow/$FLOW', { throwOnError: true,
+  body: { description: 'changed on the instance' }, params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: f.sys_scope } })
+console.log('changed the flow description on the instance')"
+  write_flow v3
+  now-sdk build >/dev/null 2>&1
+  $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
+  echo "push exit=$? (non-zero expected)"
+
+  note "PULL it back: the authored source is set aside; pull must go through the online transform"
+  note "EXPECTED: 'graphs the query path cannot rebuild — importing them through the online transform', a baseline"
+  mv "$FSRC" "$FSRC.authored"
+  $NF pull --project . --auth "$AUTH" --table sys_hub_flow --sys-id "$FLOW"
+  PULL_EXIT=$?
+  echo "pull exit=$PULL_EXIT"
+  PULLED=$(grep -rl "$FLOW" src/fluent --include='*.ts' 2>/dev/null | grep -v '/keys.ts$' | head -5)
+  echo "generated source for the flow: ${PULLED:-none}"
+  if [ "$PULL_EXIT" = 0 ] && [ -n "$PULLED" ]; then
+    note "edit the PULLED source ('v2' -> 'v4' in the log message) and push — EXPECTED: 'updated', step says 'v4'"
+    for f in $PULLED; do sed -i.bak "s/$FMARK v2 saw/$FMARK v4 saw/" "$f" && rm -f "$f.bak"; done
+    if grep -q "$FMARK v4 saw" $PULLED; then
+      now-sdk build >/dev/null 2>&1
+      $NF push --project . --auth "$AUTH" --sys-id "$FLOW" --no-build
+      echo "push exit=$?"
+      flow_report "$FLOW"
+    else
+      echo "the pulled source does not carry the log message as text (the SDK may have produced low-level Record() files) — not edited"
+    fi
+  fi
+
+  note "cleanup: the flow and its whole graph on the instance, and its source, baselines here"
+  delete_flow "$FLOW"
+  for f in $(grep -rl "$FLOW" src/fluent --include='*.ts' 2>/dev/null | grep -v '/keys.ts$'); do rm -f "$f"; done
+  rm -f "$FSRC" "$FSRC.authored" .now-fluent/state/sys_hub_*.json
+  now-sdk build >/dev/null 2>&1; echo "project rebuilt after cleanup"
+else
+  echo "skipped: phase 7 created no flow"
+  rm -f "$FSRC"
+fi
 
 hr "DONE — transcript: $LOG"

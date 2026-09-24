@@ -19,10 +19,12 @@ All other commands forward to now-sdk unchanged.
 The inner edit loop. Both ends are the plain Table REST API, so neither is gated by the
 scope checks that refuse `move` / online `transform` / `download`.
 
-**Flows: push REFUSES `sys_hub_*` records.** A Flow() builds into one artifact (flow + trigger
-+ steps + `delete_multiple` directives) with `active=false`/`status=draft`; install activates it
-afterwards. Pushing it record by record would deactivate a live flow. Use install or
-update-set-package.
+**Flows: pushed as ONE unit.** A Flow() builds into one artifact (flow + trigger + steps +
+`delete_multiple` directives) with `active=false`/`status=draft`. push writes the whole artifact
+(guards first, then document order, as the flow's scope), never sends a live flow's
+active/status, then activates it like install (`api/now/wfa_fluent/activate_flows`) if new or
+active (`--activate` / `--no-activate`). Directives must name the flow, ≤ 50 matches. pull
+routes flows to the online transform. Never deletes a whole flow.
 
 **Selecting records.** pull: `--sys-id a,b,c` (mixed tables fine) OR
 `--query "<encoded>" --table <t> [--limit n]` — never both; a query pull re-takes records

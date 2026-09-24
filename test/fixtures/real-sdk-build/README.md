@@ -11,3 +11,10 @@ empty `<caller_access/>`, and a `<sys_update_name>` that must never be written b
 
 Regenerate by running `now-sdk build` in a Fluent project and copying
 `dist/app/update/*.xml`.
+
+`flow/` holds a `Flow()` (a record-created trigger and one log step, `source.now.ts`) built
+twice: `one-step.xml`, and `two-steps.xml` with a second log step added. A flow builds into
+ONE artifact holding the flow, its trigger and step instances, and `delete_multiple`
+directives (`flow=<id>^sys_idNOT IN<current steps>`) that remove steps no longer in the
+source; the flow record always says `active=false` / `status=draft`. Rebuilding the same
+source is byte-identical, so the ids are stable across the two files.
