@@ -4,6 +4,11 @@
 //   auth --list                        -> the alias/host block push parses for the URL
 //   auth --print <a> --format headers  -> the header lines push authenticates with
 //   build                              -> a no-op (the test writes the artifacts itself)
+// FAKE_SDK_EMULATE_DELETES=1 models how the real SDK tracks deletions, for the live
+// runbook's delete phase: transform also writes a source file per record, and build emits
+// an action="DELETE" artifact in dist/app/author_elective_update for every record keys.ts
+// registers whose source no longer mentions it. Opt-in, so tests that write their own
+// artifacts are unaffected.
 const argv = process.argv.slice(2)
 const host = process.env.FAKE_SDK_HOST || 'http://127.0.0.1:1'
 
@@ -23,6 +28,30 @@ if (argv[0] === 'auth' && argv.includes('--print')) {
   process.exit(0)
 }
 if (argv[0] === 'build') {
+  if (process.env.FAKE_SDK_EMULATE_DELETES === '1') {
+    const { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const keysFile = join('src', 'fluent', 'generated', 'keys.ts')
+    const sources = []
+    const walk = (dir) => {
+      if (!existsSync(dir)) return
+      for (const name of readdirSync(dir)) {
+        const file = join(dir, name)
+        if (statSync(file).isDirectory()) walk(file)
+        else if (file.endsWith('.ts') && name !== 'keys.ts') sources.push(readFileSync(file, 'utf8'))
+      }
+    }
+    walk(join('src', 'fluent'))
+    const out = join('dist', 'app', 'author_elective_update')
+    rmSync(out, { recursive: true, force: true })
+    const keys = existsSync(keysFile) ? readFileSync(keysFile, 'utf8') : ''
+    for (const [, id, table] of keys.matchAll(/'([0-9a-f]{32})': \{ table: '([^']+)' \}/g)) {
+      if (sources.some((text) => text.includes(id))) continue
+      mkdirSync(out, { recursive: true })
+      writeFileSync(join(out, `${table}_${id}.xml`),
+        `<record_update table="${table}"><${table} action="DELETE"><sys_id>${id}</sys_id></${table}></record_update>`)
+    }
+  }
   console.log('[now-sdk] build ok (fake)')
   process.exit(0)
 }
@@ -68,7 +97,13 @@ if (argv[0] === 'transform' && argv.includes('--from')) {
     const xml = readFileSync(file, 'utf8')
     const id = (xml.match(/<sys_id>([0-9a-f]{32})<\/sys_id>/) || [])[1]
     const table = (xml.match(/<record_update table="([^"]+)"/) || [])[1]
-    if (!id || keys.includes(`'${id}': {`)) continue
+    if (!id) continue
+    if (process.env.FAKE_SDK_EMULATE_DELETES === '1') {
+      const src = join(directory, 'src', 'fluent', 'generated', `${table}_${id}.now.ts`)
+      mkdirSync(dirname(src), { recursive: true })
+      writeFileSync(src, `// fake Fluent source\nRecord({ $id: Now.ID['${id}'], table: '${table}' })\n`)
+    }
+    if (keys.includes(`'${id}': {`)) continue
     keys = keys.replace(/\n\}\n?$/, `\n  '${id}': { table: '${table}' },\n}\n`)
   }
   writeFileSync(keysFile, keys)

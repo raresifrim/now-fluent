@@ -4,13 +4,14 @@
 # ---------------------------------------------------------------------------
 # Phases 0-2 are fully automatic and read-only-ish (the Phase 0 spike creates
 # throwaway sys_script_include records and deletes them again).
-# Phases 3-5 write records, so they are gated behind CONFIRM_PUSH=1.
+# Phases 3-6 write records, so they are gated behind CONFIRM_PUSH=1.
 # Phase 5 pulls by --query: three throwaway Global script includes, two matched.
+# Phase 6 deletes one by removing its Fluent source: push --allow-delete.
 #
 #   chmod +x live-validate.sh
 #   ./live-validate.sh --auth dev                      # phases 0-2
 #   ./live-validate.sh --auth dev --scope sn_hamp      # + scoped spike
-#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-5
+#   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip   # + phases 3-6
 #   CONFIRM_PUSH=1 ./live-validate.sh --auth dev --round-trip --project-scope sn_sow
 #       binds the demo project to a scope that ALREADY EXISTS on the instance — a
 #       ServiceNow or Store app such as sn_sow / sn_hamp, the way a vendor-scope project
@@ -417,5 +418,91 @@ if (fs.existsSync(f)) { const a = JSON.parse(fs.readFileSync(f, 'utf8'))
   for (const id of '$Q1 $Q2 $Q3'.split(' ')) delete a[id]
   fs.writeFileSync(f, JSON.stringify(a, null, 2) + '\n') }"
 now-sdk build >/dev/null 2>&1 && echo "project still builds" || echo "WARNING: the project no longer builds after cleanup — run now-sdk build to see why"
+
+# ---------------------------------------------------------------------------
+hr "PHASE 6 — delete a record by removing its Fluent source: push --allow-delete"
+# A throwaway Global script include, pulled (so it is adopted and has a baseline). Removing its
+# source makes the SDK build emit a DELETE artifact (dist/app/author_elective_update), which push
+# applies only with --allow-delete and only through the same guards as an update.
+DNAME="NowFluentDel$(node -e "console.log(require('crypto').randomBytes(3).toString('hex'))")"
+DEL=$(create_global_si "$DNAME" false)
+echo "created: $DEL ($DNAME, Global, inactive)"
+remove_source() {
+  local found=0
+  for f in $(grep -rl "$1" src/fluent --include='*.ts' 2>/dev/null | grep -v '/keys.ts$'); do rm -f "$f"; echo "removed $f"; found=1; done
+  [ "$found" = 1 ] || echo "no Fluent source found for $1"
+}
+delete_artifact() {
+  local f
+  f=$(grep -l "$1" dist/app/author_elective_update/*.xml 2>/dev/null | head -1)
+  if [ -n "$f" ] && grep -q 'action="DELETE"' "$f"; then echo "DELETE artifact: $f"; else echo "NO DELETE artifact for $1 in dist/app/author_elective_update"; fi
+}
+change_on_instance() {
+  node --input-type=module -e "
+import { resolveInstance, snRequest } from '$REPO/bin/now-fluent.mjs'
+await snRequest(resolveInstance('$AUTH'), 'PUT', '/api/now/table/sys_script_include/$1', {
+  throwOnError: true, body: { description: 'changed on the instance after the pull' },
+  params: { sysparm_fields: 'sys_id', sysparm_transaction_scope: 'global' } })
+console.log('changed $1 on the instance')"
+}
+
+if [ -n "$DEL" ]; then
+  note "pull it — EXPECTED: adopted from Global into $PSCOPE, baseline recorded"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --sys-id "$DEL"
+  echo "pull exit=$?"
+
+  note "DRIFT GUARD: change it on the instance, remove its source, build, push --allow-delete"
+  note "EXPECTED: a DELETE artifact, then 'REFUSED: changed on the instance since you pulled it', record NOT deleted"
+  change_on_instance "$DEL"
+  remove_source "$DEL"
+  now-sdk build >/dev/null 2>&1; echo "build exit=$?"
+  delete_artifact "$DEL"
+  $NF push --project . --auth "$AUTH" --sys-id "$DEL" --allow-delete --no-build
+  echo "push exit=$? (non-zero expected)"
+  now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$DEL" -f sys_id,name,sys_scope
+
+  note "pull again (takes the changed version, restores the source), remove the source again, build"
+  $NF pull --project . --auth "$AUTH" --table sys_script_include --sys-id "$DEL"
+  echo "pull exit=$?"
+  remove_source "$DEL"
+  now-sdk build >/dev/null 2>&1; echo "build exit=$?"
+  delete_artifact "$DEL"
+
+  note "push WITHOUT --allow-delete — EXPECTED: 'SKIPPED (a delete; pass --allow-delete to apply it)', nothing deleted"
+  $NF push --project . --auth "$AUTH" --sys-id "$DEL" --no-build
+  echo "push exit=$?"
+
+  note "push --allow-delete --dry-run — EXPECTED: 'would DELETE .../sys_script_include/$DEL', nothing deleted"
+  $NF push --project . --auth "$AUTH" --sys-id "$DEL" --allow-delete --no-build --dry-run
+  echo "push exit=$?"
+
+  note "push --allow-delete — EXPECTED: '$DEL deleted', exit 0"
+  $NF push --project . --auth "$AUTH" --sys-id "$DEL" --allow-delete --no-build
+  echo "push exit=$?"
+
+  note "on the instance — EXPECTED: no record (0 retrieved)"
+  now-sdk query sys_script_include --auth "$AUTH" -q "sys_id=$DEL" -f sys_id,name,sys_scope
+  note "locally — EXPECTED: no baseline, no adopted.json entry"
+  [ -f ".now-fluent/state/sys_script_include_$DEL.json" ] && echo "  baseline: STILL THERE" || echo "  baseline: gone"
+  node -e "
+const fs = require('fs'); const f = '.now-fluent/adopted.json'
+const a = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {}
+console.log('  adopted.json entry: ' + ('$DEL' in a ? 'STILL THERE' : 'gone'))"
+
+  note "push --allow-delete AGAIN — EXPECTED: 'already absent', nothing sent"
+  $NF push --project . --auth "$AUTH" --sys-id "$DEL" --allow-delete --no-build
+  echo "push exit=$?"
+fi
+
+note "cleanup: make sure the record is gone, whatever happened above"
+[ -n "$DEL" ] && delete_record "$DEL"
+[ -n "$DEL" ] && remove_source "$DEL" >/dev/null
+[ -n "$DEL" ] && rm -f ".now-fluent/state/sys_script_include_$DEL.json"
+[ -n "$DEL" ] && node -e "
+const fs = require('fs'); const f = '.now-fluent/adopted.json'
+if (fs.existsSync(f)) { const a = JSON.parse(fs.readFileSync(f, 'utf8')); delete a['$DEL']
+  fs.writeFileSync(f, JSON.stringify(a, null, 2) + '\n') }"
+# keys.ts still registers it, so later builds keep emitting its DELETE artifact; a later
+# push --allow-delete of it just reports 'already absent'.
 
 hr "DONE — transcript: $LOG"
