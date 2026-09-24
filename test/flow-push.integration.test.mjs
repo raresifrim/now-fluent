@@ -139,7 +139,7 @@ test('editing a live flow: a step added then removed — the removal goes throug
 test('a flow changed on the instance since the pull is refused before anything is written', () =>
   withInstance({}, async (instance) => {
     assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
-    instance.store.get(`sys_hub_flow/${FLOW}`).sys_mod_count = '42'
+    Object.assign(instance.store.get(`sys_hub_flow/${FLOW}`), { name: 'Renamed in Flow Designer', sys_mod_count: '42' })
     build('two-steps')
     instance.log.length = 0
     const result = await push(instance, '--sys-id', FLOW)
@@ -417,4 +417,36 @@ test('--allow-delete loads a DELETE record only with an unchanged baseline, and 
     assert.match(loads(instance)[0].body, /<sys_hub_flow_input action="DELETE">/)
     assert.ok(!instance.store.has(`sys_hub_flow_input/${INPUT}`))
     assert.ok(!existsSync(join(stateDir, `sys_hub_flow_input_${INPUT}.json`)), 'its baseline is gone too')
+  }))
+
+test('the platform changing a field the source does not model (compiled_snapshot, seen live) is not drift', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    // After activation the platform recompiles and stamps the step on its own.
+    const step = instance.store.get(`sys_hub_action_instance_v2/${STEP}`)
+    step.compiled_snapshot = 'f94d0c1583238710b4529c50ceaad3cc'
+    step.sys_mod_count = String(Number(step.sys_mod_count) + 1)
+    step.sys_updated_on = '2026-01-01 00:59:59'
+    const flow = instance.store.get(`sys_hub_flow/${FLOW}`)
+    flow.latest_snapshot = '446d405583238710b4529c50ceaad3c2'
+    flow.sys_mod_count = String(Number(flow.sys_mod_count) + 1)
+    build('two-steps')
+    const result = await push(instance, '--sys-id', FLOW)
+    assert.equal(result.status, 0, result.output)
+    assert.doesNotMatch(result.output, /changed on the instance/)
+    assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`))
+  }))
+
+test('a real edit to a modelled field of the flow is still drift, and named', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    const flow = instance.store.get(`sys_hub_flow/${FLOW}`)
+    flow.description = 'changed on the instance'
+    flow.sys_mod_count = String(Number(flow.sys_mod_count) + 1)
+    build('two-steps')
+    instance.log.length = 0
+    const result = await push(instance, '--sys-id', FLOW)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /the flow changed on the instance since you pulled it \(description\)/)
+    assert.equal(loads(instance).length, 0)
   }))

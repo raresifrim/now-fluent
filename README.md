@@ -211,7 +211,7 @@ now-fluent push --project . --auth dev --sys-id <flow sys_id>
 - a `delete_multiple` directive must name this flow or one of its records and may match at most 50 records, or nothing is written; push never deletes a whole flow;
 - records the artifact marks `DELETE` (a flow pulled back can build with some: records the regenerated source lacks) are left in place and named, unless `--allow-delete` — then only with an unchanged baseline;
 - compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is;
-- activation changes the flow record (even when it fails) and its trigger, so every record's baseline is re-taken after every attempt;
+- activation changes the flow record (even when it fails) and its trigger, so every record's baseline is re-taken after every attempt; and because the platform keeps stamping its own fields afterwards (a step's `compiled_snapshot`), a flow counts as drifted only when a field the artifact writes has changed — the refusal names it;
 - `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes.
 
 Verified live (`sn_sow`): a flow authored in Fluent is loaded, activated, shows its trigger and step in Flow Designer, and runs. Runbook phases 7–8 exercise all of this against a real instance.

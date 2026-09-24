@@ -3888,20 +3888,6 @@ function stripDeleteRecords(xml, drop) {
   })
 }
 
-// Which fields of a record differ from its baseline — to say WHAT drifted, not just that
-// something did. Bookkeeping fields are left out.
-async function changedSinceBaseline(instance, table, sysId, baseline) {
-  try {
-    const live = await snGetRecord(instance, table, sysId, undefined, { throwOnError: true })
-    if (!live || !baseline || !baseline.fields) return []
-    const skip = new Set(['sys_updated_on', 'sys_updated_by', 'sys_mod_count'])
-    return [...new Set([...Object.keys(live), ...Object.keys(baseline.fields)])]
-      .filter((field) => !skip.has(field) && String(live[field] ?? '') !== String(baseline.fields[field] ?? '')).sort()
-  } catch {
-    return []
-  }
-}
-
 // The activation install runs after writing a flow (sdk-api flow-activation.js).
 async function activateGraph(instance, scopeId, rootTable, rootId) {
   const entry = { sys_id: rootId, active: '', state: '' }
@@ -3971,6 +3957,20 @@ async function pushGraph(unit, label, context) {
   }
   const isDrifted = (live, baseline) => Boolean(live && baseline
     && (live.sys_updated_on !== baseline.sys_updated_on || live.sys_mod_count !== baseline.sys_mod_count))
+  // A flow's records are also written by the PLATFORM: seen live, publishing rewrote the
+  // trigger, and a step's compiled_snapshot changed after activation on its own. A counter
+  // bump alone is therefore not drift. What a push must not do is overwrite someone's
+  // change, and the load writes only the fields the artifact carries — so a flow record has
+  // drifted when one of THOSE fields differs from the baseline. (Its active/status are the
+  // activation's, not the source's.)
+  const graphDrift = async (item, live, baseline, isRoot) => {
+    if (!isDrifted(live, baseline)) return []
+    const full = await snGetRecord(instance, item.table, item.sysId, undefined, { throwOnError: true })
+    if (!full) return []
+    const modelled = Object.keys(recordFieldsToPayload(item.fields, { keepScope: false }))
+      .filter((field) => !(isRoot && (field === 'active' || field === 'status')))
+    return modelled.filter((field) => String(full[field] ?? '') !== String(baseline.fields[field] ?? '')).sort()
+  }
 
   let runScope
   const creating = !liveRoot
@@ -3982,8 +3982,9 @@ async function pushGraph(unit, label, context) {
         + `      Pull it first (now-fluent pull --project ... --auth ${auth} --sys-id ${rootId}), or --force.`)
       return 'failed'
     }
-    if (driftChecked && isDrifted(liveRoot, baseline)) {
-      console.error(`${label} REFUSED: the ${what} changed on the instance since you pulled it.\n`
+    const rootDrift = driftChecked ? await graphDrift(root, liveRoot, baseline, true) : []
+    if (rootDrift.length) {
+      console.error(`${label} REFUSED: the ${what} changed on the instance since you pulled it (${rootDrift.join(', ')}).\n`
         + `      pulled:   ${baseline.sys_updated_on} (mod_count ${baseline.sys_mod_count})\n`
         + `      instance: ${liveRoot.sys_updated_on} (mod_count ${liveRoot.sys_mod_count})\n`
         + '      Re-pull to take the instance version, or --force to overwrite it.')
@@ -4048,11 +4049,11 @@ async function pushGraph(unit, label, context) {
     const live = isRoot ? liveRoot : await snGetRecord(instance, item.table, item.sysId,
       'sys_id,sys_updated_on,sys_mod_count,sys_scope', { throwOnError: true })
     const baseline = usableBaseline(item.table, item.sysId)
-    const drifted = isDrifted(live, baseline)
-    if (!isRoot && driftChecked && drifted) {
-      const fields = await changedSinceBaseline(instance, item.table, item.sysId, baseline)
+    const driftFields = isRoot ? [] : await graphDrift(item, live, baseline, false)
+    const drifted = driftFields.length > 0
+    if (driftChecked && drifted) {
       console.error(`${label} REFUSED: ${item.table} ${item.sysId} (part of this ${what}) changed on the instance since `
-        + `you pulled it${fields.length ? ` (${fields.join(', ')})` : ''}. Re-pull the flow, or --force to overwrite it.`)
+        + `you pulled it (${driftFields.join(', ')}). Re-pull the flow, or --force to overwrite it.`)
       return 'failed'
     }
     // Only to tell what changed: the loader receives the whole artifact, as built.

@@ -29,7 +29,8 @@ record back, then activates it like install (`api/now/wfa_fluent/activate_flows`
 active (`--activate` / `--no-activate`). Directives must name the flow, ≤ 50 matches. pull
 routes flows to the online transform. Never deletes a whole flow. DELETE records inside the artifact
 are left in place unless `--allow-delete` (unchanged baseline required). Activation rewrites the
-trigger, so every part is re-baselined after it. Live-verified: create → load → activate → runs.
+trigger, so every part is re-baselined after it; flow drift = a field the artifact writes changed
+(platform-maintained fields such as `compiled_snapshot` are ignored). Live-verified: create → load → activate → runs.
 
 **Selecting records.** pull: `--sys-id a,b,c` (mixed tables fine) OR
 `--query "<encoded>" --table <t> [--limit n]` — never both; a query pull re-takes records
