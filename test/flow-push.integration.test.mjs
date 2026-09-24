@@ -345,3 +345,76 @@ test('--target-scope global creates a flow built in the project scope in Global:
     assert.equal(instance.store.get(`sys_hub_flow/${FLOW}`).sys_scope, 'global')
     assert.equal(instance.store.get(`sys_hub_action_instance_v2/${STEP}`).sys_scope, 'global')
   }))
+
+test('activation rewrites the trigger (seen live); every part is re-baselined, so the next edit is not refused as drift', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    assert.equal(instance.store.get(`sys_hub_trigger_instance_v2/${TRIGGER}`).sys_mod_count, '1', 'the mock models it')
+    build('two-steps')
+    const edited = await push(instance, '--sys-id', FLOW)
+    assert.equal(edited.status, 0, edited.output)
+    assert.doesNotMatch(edited.output, /changed on the instance/)
+    assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`))
+  }))
+
+test('a step changed on the instance is refused, naming the fields that changed', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    const step = instance.store.get(`sys_hub_action_instance_v2/${STEP}`)
+    step.comment = 'edited in Flow Designer'
+    step.sys_mod_count = String(Number(step.sys_mod_count) + 1)
+    build('two-steps')
+    instance.log.length = 0
+    const result = await push(instance, '--sys-id', FLOW)
+    assert.notEqual(result.status, 0)
+    assert.match(result.output, /sys_hub_action_instance_v2 a37ab71e\S* \(part of this flow\) changed on the instance since you pulled it \(comment\)/)
+    assert.equal(loads(instance).length, 0)
+  }))
+
+// A flow pulled back through the online transform builds with DELETE records inside its
+// artifact (seen live): records on the instance that the regenerated source no longer has.
+const INPUT = 'f1a0000000000000000000000000beef'
+function withDeleteRecord() {
+  const file = join(project, 'dist', 'app', 'update', `sys_hub_flow_${FLOW}.xml`)
+  writeFileSync(file, readFileSync(file, 'utf8').replace('</record_update>',
+    `  <sys_hub_flow_input action="DELETE"><sys_id>${INPUT}</sys_id><model>${FLOW}</model></sys_hub_flow_input>\n</record_update>`))
+}
+
+test('DELETE records inside a flow artifact are left in place by default — named, and not sent to the loader', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    instance.store.set(`sys_hub_flow_input/${INPUT}`, { sys_id: INPUT, model: FLOW, sys_mod_count: '0', sys_updated_on: 'x' })
+    build('two-steps')
+    withDeleteRecord()
+    instance.log.length = 0
+    const result = await push(instance, '--sys-id', FLOW)
+    assert.equal(result.status, 0, result.output)
+    assert.match(result.output, new RegExp(`left in place: 1 record\\(s\\) the source no longer has \\(sys_hub_flow_input ${INPUT}\\) — --allow-delete removes them`))
+    assert.doesNotMatch(loads(instance)[0].body, /action="DELETE"/)
+    assert.ok(instance.store.has(`sys_hub_flow_input/${INPUT}`))
+    assert.ok(instance.store.has(`sys_hub_action_instance_v2/${STEP2}`), 'the rest of the edit was loaded')
+  }))
+
+test('--allow-delete loads a DELETE record only with an unchanged baseline, and checks it is gone', () =>
+  withInstance({}, async (instance) => {
+    assert.equal((await push(instance, '--sys-id', FLOW)).status, 0)
+    instance.store.set(`sys_hub_flow_input/${INPUT}`, { sys_id: INPUT, model: FLOW, sys_mod_count: '0', sys_updated_on: 'x' })
+    build('two-steps')
+    withDeleteRecord()
+    instance.log.length = 0
+    const unpulled = await push(instance, '--sys-id', FLOW, '--allow-delete')
+    assert.notEqual(unpulled.status, 0)
+    assert.match(unpulled.output, /deletes sys_hub_flow_input f1a0\S+, which this project has no pull baseline for/)
+    assert.deepEqual(instance.writes(), [])
+
+    const stateDir = join(project, '.now-fluent', 'state')
+    writeFileSync(join(stateDir, `sys_hub_flow_input_${INPUT}.json`), JSON.stringify({ table: 'sys_hub_flow_input', sysId: INPUT,
+      instance: instance.origin, sys_updated_on: 'x', sys_mod_count: '0', fields: instance.store.get(`sys_hub_flow_input/${INPUT}`) }))
+    const dry = await push(instance, '--sys-id', FLOW, '--allow-delete', '--dry-run')
+    assert.match(dry.output, new RegExp(`would delete sys_hub_flow_input ${INPUT}`))
+    const result = await push(instance, '--sys-id', FLOW, '--allow-delete')
+    assert.equal(result.status, 0, result.output)
+    assert.match(loads(instance)[0].body, /<sys_hub_flow_input action="DELETE">/)
+    assert.ok(!instance.store.has(`sys_hub_flow_input/${INPUT}`))
+    assert.ok(!existsSync(join(stateDir, `sys_hub_flow_input_${INPUT}.json`)), 'its baseline is gone too')
+  }))

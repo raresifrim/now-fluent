@@ -243,7 +243,8 @@ Enhanced commands (handled by now-fluent):
       flow shows up EMPTY in Flow Designer), captured into an update set (--update-set
       picks it), and read back. Like install, that leaves it an inactive draft; it is
       then activated (api/now/wfa_fluent/activate_flows) if it is new or was active;
-      --activate forces that, --no-activate skips it. A directive that does not name the flow, or
+      --activate forces that, --no-activate skips it. Records the artifact marks DELETE
+      (a pulled flow can have some) are left in place unless --allow-delete. A directive that does not name the flow, or
       that matches more than 50 records, is refused. push never deletes a whole flow.
       pull takes flows through the SDK's online transform (the query path cannot
       rebuild a graph); they are not adopted across scopes.
@@ -3879,6 +3880,28 @@ async function snLoadXml(instance, scopeId, files, { targetUpdateSetId } = {}) {
   return { updateSetId: (parsed && parsed.result && parsed.result.targetUpdateSetId) || '' }
 }
 
+// Remove the action="DELETE" record elements whose sys_id `drop` selects.
+function stripDeleteRecords(xml, drop) {
+  return String(xml).replace(/[ \t]*<([A-Za-z0-9_]+)\s+action="DELETE"[^>]*?(?:\/>|>([\s\S]*?)<\/\1>)[ \t]*\r?\n?/g, (match, table, inner) => {
+    const sysId = firstMatch(inner || '', /<sys_id>([0-9a-f]{32})<\/sys_id>/)
+    return drop(sysId || '') ? '' : match
+  })
+}
+
+// Which fields of a record differ from its baseline — to say WHAT drifted, not just that
+// something did. Bookkeeping fields are left out.
+async function changedSinceBaseline(instance, table, sysId, baseline) {
+  try {
+    const live = await snGetRecord(instance, table, sysId, undefined, { throwOnError: true })
+    if (!live || !baseline || !baseline.fields) return []
+    const skip = new Set(['sys_updated_on', 'sys_updated_by', 'sys_mod_count'])
+    return [...new Set([...Object.keys(live), ...Object.keys(baseline.fields)])]
+      .filter((field) => !skip.has(field) && String(live[field] ?? '') !== String(baseline.fields[field] ?? '')).sort()
+  } catch {
+    return []
+  }
+}
+
 // The activation install runs after writing a flow (sdk-api flow-activation.js).
 async function activateGraph(instance, scopeId, rootTable, rootId) {
   const entry = { sys_id: rootId, active: '', state: '' }
@@ -3919,14 +3942,14 @@ async function pushGraph(unit, label, context) {
   const rootTable = graphRootTable(unit.xml)
   const { xml } = sanitizeSdkPayload(unit.xml)
   const items = parseGraphArtifact(xml)
-  const records = items.filter((item) => item.kind === 'record')
+  // Records the build marks DELETE inside the artifact are on the instance but no longer in
+  // the source (seen live: a flow pulled back through the online transform builds with
+  // some). They are planned separately below; everything else is the graph to load.
+  const deletes = items.filter((item) => item.kind === 'record' && item.action === 'DELETE')
+  const records = items.filter((item) => item.kind === 'record' && item.action !== 'DELETE')
   const root = records.find((record) => record.table === rootTable)
   if (!root || !root.sysId) {
     console.error(`${label} REFUSED: ${relative(project, unit.file)} has no ${rootTable} record to push.`)
-    return 'failed'
-  }
-  if (records.some((record) => record.action === 'DELETE')) {
-    console.error(`${label} REFUSED: the artifact deletes records itself; push applies only its delete_multiple directives.`)
     return 'failed'
   }
   const rootId = root.sysId
@@ -3934,8 +3957,9 @@ async function pushGraph(unit, label, context) {
   const name = root.fields.name || rootId
   const unitIds = new Set(records.map((record) => record.sysId).filter(Boolean))
   const driftChecked = !flags['no-drift-check'] && !force
+  const directiveCount = items.filter((item) => item.kind === 'directive').length
   console.log(`${label} ${what} "${name}": ${records.length} record(s), `
-    + `${items.length - records.length} delete_multiple directive(s), pushed as one unit`)
+    + `${directiveCount} delete_multiple directive(s)${deletes.length ? `, ${deletes.length} DELETE(s)` : ''}, pushed as one unit`)
 
   // ---- plan: every read and every guard before the first write --------------
   const liveRoot = await snGetRecord(instance, rootTable, rootId,
@@ -4019,14 +4043,16 @@ async function pushGraph(unit, label, context) {
       steps.push({ ...item, matches })
       continue
     }
+    if (item.action === 'DELETE') continue
     const isRoot = item.sysId === rootId && item.table === rootTable
     const live = isRoot ? liveRoot : await snGetRecord(instance, item.table, item.sysId,
       'sys_id,sys_updated_on,sys_mod_count,sys_scope', { throwOnError: true })
     const baseline = usableBaseline(item.table, item.sysId)
     const drifted = isDrifted(live, baseline)
     if (!isRoot && driftChecked && drifted) {
+      const fields = await changedSinceBaseline(instance, item.table, item.sysId, baseline)
       console.error(`${label} REFUSED: ${item.table} ${item.sysId} (part of this ${what}) changed on the instance since `
-        + 'you pulled it. Re-pull the flow, or --force to overwrite it.')
+        + `you pulled it${fields.length ? ` (${fields.join(', ')})` : ''}. Re-pull the flow, or --force to overwrite it.`)
       return 'failed'
     }
     // Only to tell what changed: the loader receives the whole artifact, as built.
@@ -4049,8 +4075,34 @@ async function pushGraph(unit, label, context) {
     steps.push({ ...item, live, body })
   }
 
+  // install would delete the artifact's DELETE records. push leaves them in place unless
+  // --allow-delete, and then only those it has an unchanged baseline for — the same rule as
+  // any other delete: an unpulled or drifted record is never destroyed.
+  const removable = []
+  const leftInPlace = []
+  for (const item of deletes) {
+    const live = await snGetRecord(instance, item.table, item.sysId, 'sys_id,sys_updated_on,sys_mod_count', { throwOnError: true })
+    if (!live) continue
+    if (!flags['allow-delete']) {
+      leftInPlace.push(item)
+      continue
+    }
+    const baseline = usableBaseline(item.table, item.sysId)
+    if (driftChecked && (!baseline || isDrifted(live, baseline))) {
+      console.error(`${label} REFUSED before writing: the artifact deletes ${item.table} ${item.sysId}, which `
+        + `${baseline ? 'changed on the instance since you pulled it' : 'this project has no pull baseline for'}. `
+        + 'Re-pull the flow, or --force.')
+      return 'failed'
+    }
+    removable.push(item)
+  }
+  const leftNote = leftInPlace.length
+    ? `left in place: ${leftInPlace.length} record(s) the source no longer has (`
+      + `${leftInPlace.map((item) => `${item.table} ${item.sysId}`).join(', ')}) — --allow-delete removes them, as install would`
+    : ''
+
   const directives = steps.filter((step) => step.kind === 'directive')
-  const removals = directives.reduce((sum, step) => sum + step.matches.length, 0)
+  const removals = directives.reduce((sum, step) => sum + step.matches.length, 0) + removable.length
   const changes = steps.filter((step) => step.kind === 'record')
   const wasActive = Boolean(liveRoot && String(liveRoot.active) === 'true')
   const activate = !flags['no-activate'] && (creating || wasActive || Boolean(flags.activate))
@@ -4071,19 +4123,24 @@ async function pushGraph(unit, label, context) {
         console.log(`      would ${step.live ? 'update' : 'create'} ${step.table} ${step.sysId} (${Object.keys(step.body).length} field(s) differ)`)
       }
     }
+    for (const item of removable) console.log(`      would delete ${item.table} ${item.sysId} (no longer in the source; --allow-delete)`)
+    if (leftNote) console.log(`      ${leftNote}`)
     if (changes.length || removals) {
       console.log(`      ...by loading the whole artifact as ${scopeText} (POST ${loadPath}, as install does)${activateNote}`)
     }
     if (!changes.length && !removals) return 'unchanged'
     return creating ? 'created' : 'updated'
   }
+  if (leftNote) console.log(`${label} ${leftNote}`)
   if (!changes.length && !removals && !(activate && flags.activate)) {
     console.log(`${label} unchanged`)
     return 'unchanged'
   }
 
   // ---- load the artifact, the way install does ------------------------------
-  let payload = xml
+  // DELETE records push is not applying are taken out of what the loader receives.
+  const keep = new Set(removable.map((item) => item.sysId))
+  let payload = stripDeleteRecords(xml, (sysId) => !keep.has(sysId))
   // --target-scope global: the payload names the scope the loader puts the records in.
   if (creating && runScope === GLOBAL_SCOPE_ID && artifactScope && artifactScope !== GLOBAL_SCOPE_ID) {
     payload = rewriteSysScope(payload, 'global', GLOBAL_SCOPE_ID)
@@ -4134,7 +4191,8 @@ async function pushGraph(unit, label, context) {
   }
   let removed = 0
   const kept = []
-  for (const step of directives) {
+  const expectedGone = [...directives, ...removable.map((item) => ({ table: item.table, matches: [item.sysId] }))]
+  for (const step of expectedGone) {
     for (const id of step.matches) {
       if (await snGetRecord(instance, step.table, id, 'sys_id', { throwOnError: true })) {
         kept.push(`${step.table} ${id}`)
@@ -4163,8 +4221,15 @@ async function pushGraph(unit, label, context) {
     // An activation attempt writes the flow record even when it FAILS (seen live: mod_count
     // 0 -> 1 on a rejected publish), so the baseline is taken again either way — or the
     // next push would see our own attempt as somebody else's drift.
+    // Activation also rewrites the flow's parts (seen live: the trigger instance changed, and
+    // every later push was refused as drift), so every record's baseline is re-taken.
     const activated = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
     if (activated) writeBaseline(project, rootTable, rootId, instance, activated)
+    for (const record of records) {
+      if (record.sysId === rootId) continue
+      const row = await snGetRecord(instance, record.table, record.sysId, undefined, { throwOnError: true }).catch(() => null)
+      if (row) writeBaseline(project, record.table, record.sysId, instance, row)
+    }
     if (!result.ok) {
       console.error(`${label} ${present} record(s) loaded and ${removed} removed${captured}, but NOT activated: `
         + `${result.message}.\n      The ${what} is saved as an inactive draft (install leaves it the same way). `

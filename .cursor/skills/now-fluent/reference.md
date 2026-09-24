@@ -27,7 +27,9 @@ live), so push runs every guard, then sends the whole artifact through the SDK's
 into an update set, `--update-set` picks it; no endpoint → refused, nothing written), reads every
 record back, then activates it like install (`api/now/wfa_fluent/activate_flows`) if new or
 active (`--activate` / `--no-activate`). Directives must name the flow, ≤ 50 matches. pull
-routes flows to the online transform. Never deletes a whole flow. Loader path: not yet live-verified.
+routes flows to the online transform. Never deletes a whole flow. DELETE records inside the artifact
+are left in place unless `--allow-delete` (unchanged baseline required). Activation rewrites the
+trigger, so every part is re-baselined after it. Live-verified: create → load → activate → runs.
 
 **Selecting records.** pull: `--sys-id a,b,c` (mixed tables fine) OR
 `--query "<encoded>" --table <t> [--limit n]` — never both; a query pull re-takes records

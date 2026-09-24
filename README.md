@@ -209,11 +209,12 @@ now-fluent push --project . --auth dev --sys-id <flow sys_id>
 - every read and guard first (drift on the flow and its steps, scope rules, directive anchoring), then the load, then every record read back: missing records, steps not removed, or a new flow in the wrong scope fail the run;
 - like install, the load leaves the flow an inactive draft; it is then activated if it is new or was active (`--activate` forces, `--no-activate` skips). If activation fails, the flow stays an inactive draft and push says so;
 - a `delete_multiple` directive must name this flow or one of its records and may match at most 50 records, or nothing is written; push never deletes a whole flow;
+- records the artifact marks `DELETE` (a flow pulled back can build with some: records the regenerated source lacks) are left in place and named, unless `--allow-delete` — then only with an unchanged baseline;
 - compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is;
-- an activation attempt changes the flow record even when it fails, so the flow's baseline is re-taken after every attempt;
+- activation changes the flow record (even when it fails) and its trigger, so every record's baseline is re-taken after every attempt;
 - `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes.
 
-The loader path is not verified live yet. Runbook phases 7–8 exercise all of this against a real instance.
+Verified live (`sn_sow`): a flow authored in Fluent is loaded, activated, shows its trigger and step in Flow Designer, and runs. Runbook phases 7–8 exercise all of this against a real instance.
 
 ### Two limitations worth knowing
 

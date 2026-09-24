@@ -103,9 +103,16 @@ export async function startMockInstance({
       const results = entries.map(([t, entry]) => {
         const row = store.get(`${t}/${entry.sys_id}`)
         if (!row) return { sys_id: entry.sys_id, status: 'error', message: 'No such flow' }
-        // Seen live: an activation attempt writes the flow record even when publishing fails.
+        // Seen live: an activation attempt writes the flow record even when publishing fails,
+        // and publishing rewrites the flow's trigger instance too.
         row.sys_mod_count = String(Number(row.sys_mod_count || 0) + 1)
         row.sys_updated_on = stamp()
+        for (const [k, other] of store.entries()) {
+          if (k.startsWith('sys_hub_trigger_instance_v2/') && other.flow === entry.sys_id) {
+            other.sys_mod_count = String(Number(other.sys_mod_count || 0) + 1)
+            other.sys_updated_on = stamp()
+          }
+        }
         if (flowActivation === 'fail') {
           return { sys_id: entry.sys_id, status: 'error', error_code: 'PUBLISH_FAILED',
             message: `Error publishing flow sys id ${entry.sys_id}: No Trigger instance found in the flow definition` }
@@ -247,6 +254,10 @@ export async function startMockInstance({
       while ((field = fieldRe.exec(inner || '')) !== null) fields[field[1]] = decode(field[2] || '')
       const id = fields.sys_id
       if (!id) continue
+      if (action === 'DELETE') {
+        store.delete(`${t}/${id}`)
+        continue
+      }
       if (!updateName) updateName = `${t}_${id}`
       const existing = store.get(`${t}/${id}`)
       store.set(`${t}/${id}`, {

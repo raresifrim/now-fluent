@@ -747,6 +747,7 @@ console.log('changed the flow description on the instance')"
   echo "generated source for the flow: ${PULLED:-none}"
   if [ "$PULL_EXIT" = 0 ] && [ -n "$PULLED" ]; then
     note "edit the PULLED source (whatever version is live -> 'v4' in the log message) and push — EXPECTED: 'updated', step says 'v4'"
+    note "(the pulled build may carry DELETE records for things the regenerated source lacks: EXPECTED 'left in place: ...', not deleted)"
     for f in $PULLED; do sed -i.bak "s/$FMARK v[0-9][0-9]* saw/$FMARK v4 saw/" "$f" && rm -f "$f.bak"; done
     if grep -q "$FMARK v4 saw" $PULLED; then
       now-sdk build >/dev/null 2>&1
