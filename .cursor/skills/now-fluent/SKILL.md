@@ -50,7 +50,8 @@ now-fluent install --auth <alias>   # only after explicit approval
 ### Edit one live record (pull → edit → push)
 
 ```bash
-now-fluent pull --project ./work --auth <alias> --sys-id <32hex>
+now-fluent pull --project ./work --auth <alias> --sys-id <32hex>[,<32hex>...]
+#   or: --table <table> --query "<encoded query>" [--limit <n>]   (not both)
 # ...edit the Fluent source...
 now-fluent push --project ./work --auth <alias> --sys-id <32hex> --dry-run
 now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # approval required
@@ -58,7 +59,8 @@ now-fluent push --project ./work --auth <alias> --sys-id <32hex>   # approval re
 
 The inner loop for iterating on a record, where `update-set-package` is the governed
 promotion path. Both ends are the plain Table REST API (the ungated path), so they work
-in vendor scopes. `--table` is optional for both.
+in vendor scopes — except a flow, which push loads through the SDK's `api/fluent/load` as
+install does. `--table` is optional for both.
 
 - `pull` = `import --via query --force` + a baseline snapshot in `.now-fluent/state/`.
 - `push` builds, diffs the compiled artifact against that baseline, and sends only the
@@ -111,6 +113,8 @@ now-fluent update-set-package \
 Output: `exports/<name>/update-set-<name>.xml`. User imports manually: **System Update Sets → Retrieved Update Sets → Import Update Set from XML → Preview → Commit**.
 
 `--include` / `--exclude`: substring match on `<table>_<sysid>` filenames; repeatable and comma-separated. Exclude `sys_module` unless wanted.
+
+**Flows arrive as inactive drafts.** The flow is complete (same build push sends; the commit loads it like install), but the SDK builds flows `active=false`/`status=draft` and only install/push activate them (`api/now/wfa_fluent/activate_flows`). Tell the user: after committing, open the flow in Flow Designer and click **Activate**. Do not set `active=true` in the XML — activation compiles the flow and creates its snapshot, which the build does not carry. Same for `export-xml`.
 
 ### Vendor scope (e.g. HAM)
 

@@ -30,10 +30,22 @@ import { createServer } from 'node:http'
 // Seen live: with the picker on sn_sow, a plain REST create landed in sn_sow. A write
 // with no honoured ?sysparm_transaction_scope runs there; default 'global'. Stored as the
 // apps.current_app preference so a caller can read it.
+// flowActivation: how POST /api/now/wfa_fluent/activate_flows (the call install makes
+// after writing a flow) answers — 'ok' (activates: active=true, status=published),
+// 'missing' (the 400 an instance without the ServiceNow IDE returns), or 'fail' (422).
+// preferenceReplacedOnWrite:true models what a live run showed: during a push the
+// platform REPLACED the account's sys_update_set preference record (a new sys_id, pointing
+// at Default), so a restore aimed at the old record answered 404.
+// fluentLoad: how POST /api/fluent/load/<scope> (the loader install uses for a
+// configuration project) answers — 'ok' applies every <record_update> in the uploaded
+// files (records merged, delete_multiple directives run, sys_scope taken from the payload)
+// and returns the update set it captured into; 'missing' is the 400 of an instance
+// without the ServiceNow IDE. The mock cannot model what the platform ADDS when it loads
+// a flow (the part a Table API write misses) — only live runs can show that.
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
   honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = [],
-  currentApp = 'global'
+  currentApp = 'global', flowActivation = 'ok', fluentLoad = 'ok', preferenceReplacedOnWrite = false
 } = {}) {
   const store = new Map(Object.entries(records))
   const USER_ID = 'user0000000000000000000000000001'
@@ -63,12 +75,58 @@ export async function startMockInstance({
     const [, , , , table, sysId] = url.pathname.split('/') // /api/now/table/<t>/<id>
     let raw = ''
     for await (const chunk of req) raw += chunk
+    if (url.pathname.startsWith('/api/fluent/load/')) {
+      const scope = decodeURIComponent(url.pathname.split('/')[4] || '')
+      log.push({ method: req.method, table: 'fluent_load', sysId: scope, body: raw, params: Object.fromEntries(url.searchParams) })
+      res.writeHead(fluentLoad === 'missing' ? 400 : 200, { 'Content-Type': 'application/json' })
+      if (fluentLoad === 'missing') {
+        return res.end(JSON.stringify({ error: { message: `Requested URI does not represent any resource: ${url.pathname}` } }))
+      }
+      const target = url.searchParams.get('targetUpdateSetId') || 'loadset0000000000000000000000001'
+      for (const file of raw.match(/<record_update\b[\s\S]*?<\/record_update>/g) || []) {
+        const updateName = loadRecordUpdate(file, scope)
+        // The loader captures the whole file as one update, named after its first record.
+        const rowId = `cap${String(++clock).padStart(29, '0')}`
+        if (updateName) store.set(`sys_update_xml/${rowId}`, { sys_id: rowId, name: updateName, update_set: target, sys_created_on: stamp() })
+      }
+      return res.end(JSON.stringify({ result: { targetUpdateSetId: target } }))
+    }
     const parsed = raw ? JSON.parse(raw) : undefined
     log.push({ method: req.method, table, sysId, body: parsed, params: Object.fromEntries(url.searchParams) })
 
     const send = (status, payload) => {
       res.writeHead(status, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(payload))
+    }
+    if (url.pathname === '/api/now/wfa_fluent/activate_flows') {
+      if (flowActivation === 'missing') {
+        return send(400, { error: { message: 'Requested URI does not represent any resource: /api/now/wfa_fluent/activate_flows' } })
+      }
+      const entries = [...(parsed.flows || []).map((f) => ['sys_hub_flow', f]), ...(parsed.actions || []).map((a) => ['sys_hub_action_type_definition', a])]
+      const results = entries.map(([t, entry]) => {
+        const row = store.get(`${t}/${entry.sys_id}`)
+        if (!row) return { sys_id: entry.sys_id, status: 'error', message: 'No such flow' }
+        // Seen live: an activation attempt writes the flow record even when publishing fails,
+        // and publishing rewrites the flow's trigger instance too.
+        row.sys_mod_count = String(Number(row.sys_mod_count || 0) + 1)
+        row.sys_updated_on = stamp()
+        for (const [k, other] of store.entries()) {
+          if (k.startsWith('sys_hub_trigger_instance_v2/') && other.flow === entry.sys_id) {
+            other.sys_mod_count = String(Number(other.sys_mod_count || 0) + 1)
+            other.sys_updated_on = stamp()
+          }
+        }
+        if (flowActivation === 'fail') {
+          return { sys_id: entry.sys_id, status: 'error', error_code: 'PUBLISH_FAILED',
+            message: `Error publishing flow sys id ${entry.sys_id}: No Trigger instance found in the flow definition` }
+        }
+        row.active = 'true'
+        row.status = 'published'
+        return { sys_id: entry.sys_id, flow_name: row.name, status: 'success' }
+      })
+      const failed = results.filter((r) => r.status !== 'success').length
+      return send(failed === results.length && results.length ? 422 : 200,
+        { result: { summary: { total: results.length, succeeded: results.length - failed, failed }, results } })
     }
     const key = `${table}/${sysId}`
     const project = (row) => {
@@ -146,6 +204,17 @@ export async function startMockInstance({
     if (!query) return true
     for (const clause of query.split('^')) {
       if (!clause || /^ORDERBY/i.test(clause)) continue
+      const notIn = clause.match(/^(\w+?)NOT IN(.*)$/)
+      if (notIn) {
+        if (notIn[2].split(',').includes(String(row[notIn[1]] ?? ''))) return false
+        continue
+      }
+      // Before IN: a STARTSWITH value may itself contain "IN".
+      const starts = clause.match(/^(\w+?)STARTSWITH(.*)$/)
+      if (starts) {
+        if (!String(row[starts[1]] ?? '').startsWith(starts[2])) return false
+        continue
+      }
       const inMatch = clause.match(/^(\w+)IN(.*)$/)
       if (inMatch) {
         const [, field, list] = inMatch
@@ -164,6 +233,44 @@ export async function startMockInstance({
     return true
   }
 
+  // Apply one <record_update> like the loader: records in document order, merged onto any
+  // existing row; delete_multiple directives remove what their query matches.
+  function loadRecordUpdate(xml, scope) {
+    const decode = (v) => v.replace(/^<!\[CDATA\[([\s\S]*)\]\]>$/, '$1')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&')
+    const body = xml.replace(/^<record_update\b[^>]*>/, '').replace(/<\/record_update>$/, '')
+    const re = /<([A-Za-z0-9_]+)\s+action="([A-Za-z_]+)"([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g
+    let match
+    let updateName = ''
+    while ((match = re.exec(body)) !== null) {
+      const [, t, action, attrs, inner] = match
+      if (action === 'delete_multiple') {
+        const query = decode((attrs.match(/query="([^"]*)"/) || [])[1] || '')
+        for (const [k, row] of [...store.entries()]) {
+          if (k.startsWith(`${t}/`) && matchesQuery(row, query)) store.delete(k)
+        }
+        continue
+      }
+      const fields = {}
+      const fieldRe = /<([A-Za-z0-9_]+)(?:\s[^>]*?)?(?:\/>|>([\s\S]*?)<\/\1>)/g
+      let field
+      while ((field = fieldRe.exec(inner || '')) !== null) fields[field[1]] = decode(field[2] || '')
+      const id = fields.sys_id
+      if (!id) continue
+      if (action === 'DELETE') {
+        store.delete(`${t}/${id}`)
+        continue
+      }
+      if (!updateName) updateName = `${t}_${id}`
+      const existing = store.get(`${t}/${id}`)
+      store.set(`${t}/${id}`, {
+        ...(existing || {}), ...fields, sys_scope: fields.sys_scope || scope, sys_updated_on: stamp(),
+        sys_mod_count: existing ? String(Number(existing.sys_mod_count || 0) + 1) : '0'
+      })
+    }
+    return updateName
+  }
+
   function applyOrder(rows, query) {
     const desc = query.match(/ORDERBYDESC(\w+)/i)
     const asc = query.match(/(?:^|\^)ORDERBY(?!DESC)(\w+)/i)
@@ -173,7 +280,18 @@ export async function startMockInstance({
     if (desc) rows.reverse()
   }
 
+  function replacePreference(table) {
+    if (!preferenceReplacedOnWrite || table === 'sys_user_preference') return
+    for (const [k, v] of [...store.entries()]) {
+      if (!k.startsWith('sys_user_preference/') || v.name !== 'sys_update_set') continue
+      store.delete(k)
+      const id = `prefnew${String(++clock).padStart(25, '0')}`
+      store.set(`sys_user_preference/${id}`, { ...v, sys_id: id, value: 'platform-chosen-set' })
+    }
+  }
+
   function noteCapture(table, id) {
+    replacePreference(table)
     if (!CAPTURED.has(table)) return
     const pref = [...store.entries()].find(([k, v]) => k.startsWith('sys_user_preference/') && v.name === 'sys_update_set')
     const destination = captureFollowsPreference && pref && pref[1].value

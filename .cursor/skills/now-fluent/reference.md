@@ -19,6 +19,25 @@ All other commands forward to now-sdk unchanged.
 The inner edit loop. Both ends are the plain Table REST API, so neither is gated by the
 scope checks that refuse `move` / online `transform` / `download`.
 
+**Flows: pushed as ONE unit, loaded like install.** A Flow() builds into one artifact (flow +
+trigger + steps + `delete_multiple` directives) with `active=false`/`status=draft`. Written row by
+row through the Table API, Flow Designer showed the flow EMPTY and it could not be activated (seen
+live), so push runs every guard, then sends the whole artifact through the SDK's loader
+(`POST api/fluent/load/<scope>`, what install does for a `type: 'configuration'` project; captured
+into an update set, `--update-set` picks it; no endpoint → refused, nothing written), reads every
+record back, then activates it like install (`api/now/wfa_fluent/activate_flows`) if new or
+active (`--activate` / `--no-activate`). Directives must name the flow, ≤ 50 matches. pull
+routes flows to the online transform (baselining the trigger/steps too, and removing the snapshot XML
+it leaves in `metadata/`). Never deletes a whole flow. DELETE records inside the artifact
+are left in place unless `--allow-delete` (unchanged baseline required). Activation rewrites the
+trigger, so every part is re-baselined after it; flow drift = a field the artifact writes changed
+(platform-maintained fields such as `compiled_snapshot` are ignored). Live-verified: create → load → activate → runs.
+
+**Selecting records.** pull: `--sys-id a,b,c` (mixed tables fine) OR
+`--query "<encoded>" --table <t> [--limit n]` — never both; a query pull re-takes records
+already in the project, and a `query` in `.now-fluent.json` is ignored. push: `--sys-id`
+lists or `--all` (+ `--include`/`--exclude`); each record is written or refused on its own.
+
 **Credentials.** Taken from the SDK's own store: `now-sdk auth --list` gives the host,
 `now-sdk auth --print <alias> --format headers` gives live auth headers (that flag
 exists for exactly this — "for use in manual API calls"). No second profile, no
@@ -144,6 +163,10 @@ Auto-fixes empty-string enum props in generated `Action()` files (known now-sdk 
 | `--zip` | Also produce zip |
 
 Records gathered from `dist/app/update`, `metadata/update`, `dist/update`.
+
+Flows arrive as INACTIVE DRAFTS: the build says `active=false`/`status=draft`, and only install/push
+activate (`api/now/wfa_fluent/activate_flows`). After committing, activate the flow in Flow Designer.
+Never set `active=true` in the XML — activation compiles the flow and creates the snapshot it runs from.
 
 ## .now-fluent.json defaults
 

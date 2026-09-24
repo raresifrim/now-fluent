@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs'
 import { join, resolve, basename, dirname, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -21,7 +21,8 @@ const ENHANCED = new Set(['help', '--help', '-h', '--version', '-v', 'doctor', '
 const BOOLEAN_FLAGS = new Set(['build-local', 'zip', 'no-bundle', 'dry-run', 'keep', 'no-flows', 'bulk', 'keep-failed', 'force', 'no-related',
   'move-adopted', 'keep-payload-scope',
   // push/pull
-  'no-build', 'full', 'allow-delete', 'no-drift-check', 'no-scope', 'all', 'no-state', 'no-adopt-scope'])
+  'no-build', 'full', 'allow-delete', 'no-drift-check', 'no-scope', 'all', 'no-state', 'no-adopt-scope',
+  'activate', 'no-activate'])
 
 // ---------------------------------------------------------------------------
 // Help
@@ -160,9 +161,10 @@ Enhanced commands (handled by now-fluent):
       matching ones (repeatable AND comma-separated). A good large-export filter:
       --exclude sys_documentation,sys_translated,sys_ui_message,sys_atf_test,sys_atf_step
 
-  pull --project <path> --auth <alias> --sys-id <32hex>[,<32hex>...]
-       [--table <table>] [--via query|transform|move|auto] [--no-adopt-scope]
-       [--no-state] [--dry-run]
+  pull --project <path> --auth <alias>
+       (--sys-id <32hex>[,<32hex>...] [--table <table>]
+        | --query <encoded query> --table <table> [--limit <n>])
+       [--via query|transform|move|auto] [--no-adopt-scope] [--no-state] [--dry-run]
       Import records into the project AND record a baseline snapshot of each one as
       the instance holds it right now (.now-fluent/state/<table>_<sysid>.json).
       The import itself is exactly "import --via query --force", so pull works in
@@ -170,8 +172,13 @@ Enhanced commands (handled by now-fluent):
       not gated by the scope checks that refuse move/transform/download.
       The baseline is what makes push safe — it is how push knows which fields you
       actually edited, and whether somebody else changed the record meanwhile.
-      --table is optional (resolved from sys_metadata.sys_class_name); --no-state
-      imports without recording a baseline (push then has no drift detection).
+      Name the records as a sys_id list (--table optional: resolved from
+      sys_metadata.sys_class_name), or select them with --query <encoded query>
+      against --table, e.g. --table sys_script_include --query
+      "sys_scope.scope=sn_hamp^nameSTARTSWITHHAM" (--limit caps how many). Unlike
+      import, a --query pull re-takes records already in the project — pull always
+      takes the instance version. --no-state imports without recording a baseline
+      (push then has no drift detection).
       CROSS-SCOPE: a record from another scope (say Global, pulled into a project
       bound to x_my_app) is ADOPTED — its sys_scope and api_name prefix are
       rewritten into the project's scope before the offline transform, so the
@@ -188,7 +195,7 @@ Enhanced commands (handled by now-fluent):
        (--sys-id <32hex>[,<32hex>...] | --all [--include <substr>...] [--exclude <substr>...])
        [--table <table>] [--no-build] [--full] [--force] [--no-drift-check]
        [--target-scope global] [--no-scope] [--allow-delete]
-       [--update-set <sys_id|name>] [--dry-run]
+       [--update-set <sys_id|name>] [--activate | --no-activate] [--dry-run]
       Build the project, take the compiled <record_update> artifact for each selected
       record, and write it straight back to the instance through the Table REST API
       (PUT for a record that exists, POST carrying the sys_id for one that does not,
@@ -227,6 +234,20 @@ Enhanced commands (handled by now-fluent):
         - --target-scope <anything else> is refused: this transport cannot do it.
           Use update-set-package, whose payload carries sys_scope.
       Every write reads the scope back and FAILS the record if it landed elsewhere.
+      FLOWS: a Flow() (or custom action) builds into ONE artifact — the flow, its
+      trigger and steps, and delete_multiple directives that remove steps no longer in
+      the source. Selecting the flow, any of its steps, or --all pushes that whole
+      artifact as one unit: every read and guard first, then the whole artifact is
+      LOADED through the SDK's loader (POST api/fluent/load/<scope>, what install does
+      for a type:'configuration' project — written row by row through the Table API a
+      flow shows up EMPTY in Flow Designer), captured into an update set (--update-set
+      picks it), and read back. Like install, that leaves it an inactive draft; it is
+      then activated (api/now/wfa_fluent/activate_flows) if it is new or was active;
+      --activate forces that, --no-activate skips it. Records the artifact marks DELETE
+      (a pulled flow can have some) are left in place unless --allow-delete. A directive that does not name the flow, or
+      that matches more than 50 records, is refused. push never deletes a whole flow.
+      pull takes flows through the SDK's online transform (the query path cannot
+      rebuild a graph); they are not adopted across scopes.
       --no-scope omits sys_scope from the body; since the field is ignored anyway
       this changes nothing on the instance — it exists to keep the write minimal.
       --allow-delete applies DELETE artifacts (removed Fluent code) instead of
@@ -1219,6 +1240,9 @@ function commandImport(flags, config, positional, internal = {}) {
   } else {
     sysIds = sysIdsFrom(flags, config, positional)
   }
+  // pull needs to know what a --query selected: to warn before replacing local source,
+  // and to record a baseline for every matched record.
+  if (typeof internal.onSelected === 'function') internal.onSelected(sysIds)
 
   // A dry run cannot exercise the ladder (nothing actually fails), so print the plan
   // for whichever strategies --via selects instead of pretending the first one landed.
@@ -1303,22 +1327,42 @@ function commandImport(flags, config, positional, internal = {}) {
   }
 
   // ---- 4. online transform -------------------------------------------------
-  if (pending.length && (via === 'auto' || via === 'transform')) {
-    const doable = pending.filter((id) => tableFor.has(id))
+  // A flow or custom action is a GRAPH (the flow, its trigger, steps, variables...) that
+  // the query path cannot rebuild from one row — offline transform fails without the
+  // action/trigger shapes. Only the SDK's online transform, which reads the whole graph
+  // from the instance, can import it; so on the query path those records go there too.
+  const graphIds = pending.filter((id) => GRAPH_ROOT_TABLES.has(tableFor.get(id)))
+  const graphFailed = []
+  if (graphIds.length && via === 'query') {
+    console.log(`\n${graphIds.length} flow/action record(s) are graphs the query path cannot rebuild — importing `
+      + 'them through the online transform instead (not adopted: the SDK imports them in their own scope).')
+  }
+  if (pending.length && (via === 'auto' || via === 'transform' || (via === 'query' && graphIds.length))) {
+    const doable = via === 'query' ? graphIds : pending.filter((id) => tableFor.has(id))
     if (doable.length) {
       console.log(`\nTransforming ${doable.length} record(s) online via "now-sdk transform --table <table> --id <id>"...`)
       const attempting = new Set(doable)
       const stillPending = pending.filter((id) => !attempting.has(id))
       for (const id of doable) {
         const t = tableFor.get(id)
+        const snapshotsBefore = t === 'sys_hub_flow' ? listSnapshotFiles(project) : null
         const result = runSdk(['transform', '--auth', auth, '--table', t, '--id', id, '--directory', project, ...extra],
           { cwd: project, allowFailure: true })
         if (result.status === 0) {
           console.log(`  ${t} ${id} ok`)
           importedBy.transform.push(id)
+          if (t === 'sys_hub_flow') {
+            const removed = pruneFlowSnapshotFiles(project, id, snapshotsBefore)
+            if (removed.length) {
+              console.log(`    removed the snapshot XML the SDK left for the build (${removed.join(', ')}): a snapshot `
+                + "is the instance's own record — activation makes a new one — so it must not be shipped back")
+            }
+          }
         } else {
           console.error(`  ${t} ${id} FAILED (exit ${result.status})`)
-          stillPending.push(id)
+          // On the query path a failed graph has nowhere left to go.
+          if (via === 'query') graphFailed.push(id)
+          else stillPending.push(id)
         }
       }
       pending = stillPending
@@ -1328,7 +1372,7 @@ function commandImport(flags, config, positional, internal = {}) {
       console.log(`\nimport: ${importedBy.transform.length} record(s) into ${project}`)
       return
     }
-    if (pending.length) {
+    if (pending.length && via === 'auto') {
       console.log(`\n${pending.length} record(s) left — falling back to the query path `
         + '(Table API read + offline transform, which no scope check gates).')
     }
@@ -1362,6 +1406,7 @@ function commandImport(flags, config, positional, internal = {}) {
       pending = [...result.failed, ...noTable]
     }
   }
+  pending = [...pending, ...graphFailed]
 
   const total = importedBy.move.length + importedBy.transform.length + importedBy.query.length
   const by = Object.entries(importedBy).filter(([, v]) => v.length).map(([k, v]) => `${v.length} via ${k}`).join(', ')
@@ -2513,6 +2558,51 @@ function stripXmlDeclaration(xml) {
   return String(xml).replace(/^\s*<\?xml[^>]*\?>\s*/i, '').trim()
 }
 
+// Seen live: the SDK's online transform cannot parse a flow's snapshot and copies the raw
+// sys_hub_flow_snapshot XML into the metadata directory ("No records parsed from ...,
+// moving to metadata directory"). Every build copies that directory into dist/app, so
+// install, update-set-package and push --all would ship a stale copy of a record the
+// platform owns. The transform's output is not captured and the file's location and
+// content are the SDK's business, so the files are found by what the transform DID: every
+// sys_hub_flow_snapshot_<id>.xml in the project it created or rewrote (compared with a
+// listing taken before it ran), plus any that names this flow — and their built copies.
+const SNAPSHOT_FILE_RE = /^sys_hub_flow_snapshot_[0-9a-f]{32}\.xml$/i
+function listSnapshotFiles(project) {
+  const found = new Map()
+  const walk = (dir) => {
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!['node_modules', '.git', '.now-fluent'].includes(entry.name)) walk(join(dir, entry.name))
+      } else if (SNAPSHOT_FILE_RE.test(entry.name)) {
+        const path = join(dir, entry.name)
+        try { found.set(path, statSync(path).mtimeMs) } catch { /* vanished meanwhile */ }
+      }
+    }
+  }
+  walk(project)
+  return found
+}
+
+function pruneFlowSnapshotFiles(project, flowId, before) {
+  const after = listSnapshotFiles(project)
+  const names = new Set()
+  for (const [path, mtime] of after) {
+    const touched = !before.has(path) || before.get(path) !== mtime
+    let namesFlow = false
+    try { namesFlow = readFileSync(path, 'utf8').includes(flowId) } catch { /* unreadable: judge by touched */ }
+    if (touched || namesFlow) names.add(basename(path))
+  }
+  const removed = []
+  for (const path of after.keys()) {
+    if (!names.has(basename(path))) continue
+    rmSync(path, { force: true })
+    removed.push(relative(project, path))
+  }
+  return removed
+}
+
 function readProjectConfig(project) {
   const configFile = join(project, 'now.config.json')
   if (!existsSync(configFile)) return {}
@@ -2820,19 +2910,33 @@ async function commandPull(flags, config, positional) {
   const auth = flags.auth || config.auth
   if (!auth) fail('Missing required --auth for pull')
   const dryRun = Boolean(flags['dry-run'])
-  const sysIds = sysIdsFrom(flags, config, positional)
+
+  // Two ways to name the records: a sys_id list, or an encoded query against --table.
+  // Only a --query typed on THIS command counts — a query in the config file (meant for
+  // import) must never turn "pull these ids" into "pull whatever that query matches".
+  const encodedQuery = flags.query
+  const table = flags.table || config.table
+  const namedIds = flags['sys-id'] ?? flags.sysId ?? flags.ids
+  if (encodedQuery && (namedIds || positional.length)) {
+    fail('pull takes EITHER --sys-id <ids> OR --query <encoded query> --table <table>, not both.')
+  }
+  if (encodedQuery && !table) fail('--query needs --table <table> (the table to run the encoded query against).')
+  let sysIds = encodedQuery ? [] : sysIdsFrom(flags, config, positional)
 
   // pull takes the INSTANCE version, so it replaces the local Fluent source for these
   // records. That is the contract, but it is silent data loss if the developer had
-  // uncommitted edits — so say which records are about to be overwritten.
+  // uncommitted edits — so say which records are about to be overwritten. With --query
+  // the records are only known once selected, just before anything is transformed.
   const alreadyLocal = loadProjectRecordIds(project)
-  const replacing = sysIds.filter((id) => alreadyLocal.has(id))
-  if (replacing.length) {
+  const warnReplacing = (ids) => {
+    const replacing = ids.filter((id) => alreadyLocal.has(id))
+    if (!replacing.length) return
     console.warn(`Warning: ${replacing.length} of these record(s) already exist as Fluent source in this `
       + 'project. pull takes the INSTANCE version, so any local edits to them will be replaced:')
     for (const id of replacing) console.warn(`  ${id}`)
     console.warn('  Commit or stash your work first if you need it back.\n')
   }
+  if (!encodedQuery) warnReplacing(sysIds)
 
   // pull defaults to the query strategy: it is the one that survives ServiceNow-owned
   // scopes, and the only one whose rebuilt XML we control — which scope adoption needs.
@@ -2851,7 +2955,12 @@ async function commandPull(flags, config, positional) {
   }
 
   const collect = []
-  commandImport({ ...flags, via, force: true }, config, positional, { projectScope, rewriteScope, collect })
+  // force: pull always takes the instance version, so a --query re-imports records that
+  // are already in keys.ts instead of skipping them the way a resumable import does.
+  commandImport({ ...flags, via, force: true, query: encodedQuery }, { ...config, query: undefined }, positional, {
+    projectScope, rewriteScope, collect,
+    onSelected: encodedQuery ? (ids) => { sysIds = ids; warnReplacing(ids) } : undefined
+  })
   if (dryRun) return
 
   const adopted = collect.filter((record) => record.adopted)
@@ -2881,7 +2990,6 @@ async function commandPull(flags, config, positional) {
   // whose old baselines are now stale. The non-query paths do not report what they
   // wrote, so for those fall back to whatever keys.ts newly registered.
   const tableFor = new Map()
-  const table = flags.table || config.table
   if (table) for (const id of sysIds) tableFor.set(id, table)
   for (const record of collect) if (!tableFor.has(record.sysId)) tableFor.set(record.sysId, record.table)
   const nowLocal = loadProjectRecordIds(project)
@@ -2924,6 +3032,31 @@ async function commandPull(flags, config, positional) {
     } catch (error) {
       console.warn(`  ! ${recordTable} ${sysId}: ${error && error.message ? error.message : error}`)
       skipped.push(sysId)
+    }
+  }
+  // A flow's trigger and steps arrive with the flow's online transform but have no keys.ts
+  // entry of their own, so the loop above never reaches them — and without a baseline push
+  // cannot tell a Flow Designer edit to a step from its own. Every part gets one too.
+  const FLOW_PART_TABLES = ['sys_hub_trigger_instance_v2', 'sys_hub_action_instance_v2',
+    'sys_hub_flow_logic_instance_v2', 'sys_hub_sub_flow_instance_v2']
+  for (const sysId of baselined) {
+    if (tableFor.get(sysId) !== 'sys_hub_flow') continue
+    for (const partTable of FLOW_PART_TABLES) {
+      let rows
+      try {
+        rows = await snRequest(instance, 'GET', `/api/now/table/${partTable}`, {
+          params: { ...RAW_READ_PARAMS, sysparm_query: `flow=${sysId}`, sysparm_limit: '500' }, throwOnError: true
+        })
+      } catch (error) {
+        console.warn(`  ! ${partTable} of flow ${sysId}: ${error && error.message ? error.message : error}`)
+        continue
+      }
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (!row.sys_id) continue
+        writeBaseline(project, partTable, row.sys_id, instance, row)
+        console.log(`  ${partTable} ${row.sys_id} baseline recorded (part of flow ${sysId})`)
+        written++
+      }
     }
   }
   console.log(`\npull: ${written} baseline(s) in ${join(project, '.now-fluent', 'state')}`)
@@ -3217,8 +3350,25 @@ async function setCurrentUpdateSet(instance, ref) {
     target,
     async restore() {
       if (current) {
-        await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${current.sys_id}`,
-          { body: { value: current.value || '' }, throwOnError: true })
+        // Seen live: the platform can REPLACE the preference record during the push (the
+        // restore PUT to the old record answered 404, and the account was left on another
+        // set). So if the record is gone, whichever one holds the preference now gets the
+        // value — or a new one is created.
+        try {
+          await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${current.sys_id}`,
+            { body: { value: current.value || '' }, throwOnError: true })
+        } catch (error) {
+          if (!error || error.status !== 404) throw error
+          const id = await findPreferenceId(instance, userId)
+          if (id) {
+            await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${id}`,
+              { body: { value: current.value || '' }, throwOnError: true })
+          } else {
+            await snRequest(instance, 'POST', '/api/now/table/sys_user_preference', {
+              body: { name: 'sys_update_set', user: userId, value: current.value || '', type: 'string' }, throwOnError: true
+            })
+          }
+        }
         console.log(`Restored the previous update set preference (${current.value || 'none'}).`)
       } else {
         // An empty id would address the COLLECTION, so check before sending anything.
@@ -3361,6 +3511,29 @@ async function pushRecord(target, label, context) {
   // looks at whichever record element comes first in the file, so using it here would
   // delete an INSERT_OR_UPDATE record that merely shares an artifact with a DELETE.
   const deleting = action === 'DELETE'
+
+  // ---- flow records outside a flow artifact --------------------------------
+  // A flow's records are pushed through their flow (pushGraph). What reaches here is a
+  // sys_hub_* record in an artifact of its own: the DELETE the build writes for a removed
+  // step — which the flow's delete_multiple directive already removes — or a low-level
+  // Record() of a flow table, which cannot be written safely one record at a time.
+  if (table.startsWith('sys_hub_')) {
+    if (deleting && GRAPH_ROOT_TABLES.has(table)) {
+      console.error(`${label} REFUSED: its source was removed, but push does not delete a whole flow or action — `
+        + 'that cascades through records the build does not list. Delete it in Flow Designer.')
+      return 'failed'
+    }
+    if (deleting) {
+      console.log(`${label} SKIPPED (a removed flow step: pushing its flow removes it, through the flow's `
+        + 'delete_multiple directive)')
+      return 'unchanged'
+    }
+    console.error(`${label} REFUSED: ${table} is part of a Workflow Automation graph but is not in its flow's artifact,\n`
+      + '      so push cannot write it together with the rest of the graph. Push the flow itself, or use\n'
+      + '      now-fluent install or update-set-package.')
+    return 'failed'
+  }
+
   if (deleting && !flags['allow-delete']) {
     console.log(`${label} SKIPPED (a delete; pass --allow-delete to apply it)`)
     return 'unchanged'
@@ -3704,6 +3877,470 @@ async function pushRecord(target, label, context) {
   return creating ? 'created' : 'updated'
 }
 
+// ---------------------------------------------------------------------------
+// Workflow Automation graphs: a flow (or custom action) is pushed as ONE unit
+// ---------------------------------------------------------------------------
+// Seen in a real SDK 4.12.2 build: a Flow() compiles into ONE artifact holding the flow,
+// its trigger and step instances, and delete_multiple directives — queries such as
+// flow=<id>^sys_idNOT IN<current steps> — that remove steps no longer in the source. The
+// flow record always says active=false / status=draft, because install activates flows
+// afterwards (POST api/now/wfa_fluent/activate_flows, run as the app's scope).
+//
+// Seen live: writing those records one by one through the Table API puts every one of them
+// on the instance, yet Flow Designer shows the flow EMPTY and activation fails with "No
+// Trigger instance found in the flow definition". A flow is more than its rows: the
+// platform builds the rest when it LOADS a flow's <record_update> (an update set commit, an
+// app install). So a graph is written the way install writes it for a configuration
+// project (sdk-api orchestrator installConfigurations): the whole artifact, as built,
+// through the SDK's loader endpoint POST api/fluent/load/<scope sys_id>, then activated.
+// Every read-only guard (drift, scope, directive anchoring) still runs first.
+const GRAPH_ROOT_TABLES = new Set(['sys_hub_flow', 'sys_hub_action_type_definition'])
+// A directive matching more than this is refused rather than trusted: removing a step or
+// two is an edit; wiping dozens of records is not something a source edit should do quietly.
+const GRAPH_DELETE_LIMIT = 50
+
+// Compressed flow fields (a trigger's trigger_inputs, a step's values) are written by the
+// build gzip+base64 ("H4sI..."), and are sent exactly like that. Seen live: the Table API
+// stores and returns them as-is — a Flow Designer trigger reads back as "H4sI..." — and a
+// trigger written decompressed broke the SDK's own reader ("Corrupt data in trigger
+// instance: incorrect header check").
+
+function graphRootTable(xml) {
+  const table = firstMatch(String(xml), /<record_update\b[^>]*\btable\s*=\s*"([^"]+)"/)
+  return table && GRAPH_ROOT_TABLES.has(table) ? table : ''
+}
+
+// Every record element AND every delete_multiple directive of an artifact, in document
+// order (the order the platform applies them in).
+function parseGraphArtifact(xml) {
+  const { masked, sections } = maskCdata(xml)
+  const body = firstMatch(masked, /<record_update\b[^>]*>([\s\S]*)<\/record_update>/) ?? masked
+  const items = []
+  const re = new RegExp(`<([A-Za-z0-9_]+)(${XML_ATTRS})\\s*(?:/>|>([\\s\\S]*?)</\\1>)`, 'g')
+  let match
+  while ((match = re.exec(body)) !== null) {
+    const [, table, attrs, inner] = match
+    const action = (attrs.match(/\baction\s*=\s*["']([A-Za-z_]+)["']/) || [])[1]
+    if (!action) continue
+    if (action === 'delete_multiple') {
+      const query = (attrs.match(/\bquery\s*=\s*"([^"]*)"/) || [])[1]
+      items.push({ kind: 'directive', table, query: decodeXmlEntities(query || '') })
+      continue
+    }
+    const fields = parseFieldElements(inner || '', sections)
+    items.push({ kind: 'record', table, action, fields, sysId: fields.sys_id || '' })
+  }
+  return items
+}
+
+// A directive may only touch this graph: its query must name the root or one of the
+// graph's own records. Anything else is refused before a single write.
+function directiveAnchored(query, ids) {
+  return [...ids].some((id) => id && String(query).includes(id))
+}
+
+// The loader install uses for a configuration project (sdk-api connector uploadXmlFiles):
+// POST api/fluent/load/<scope sys_id>, the files as multipart "files". It applies each
+// <record_update> like an update set commit — including what the platform does for a
+// flow that a Table API write skips — and answers with the update set it captured into
+// (targetUpdateSetId picks that set; without it the endpoint chooses).
+async function snLoadXml(instance, scopeId, files, { targetUpdateSetId } = {}) {
+  const url = new URL(`/api/fluent/load/${encodeURIComponent(scopeId)}`, instance.origin)
+  if (targetUpdateSetId) url.searchParams.set('targetUpdateSetId', targetUpdateSetId)
+  const form = new FormData()
+  for (const file of files) form.append('files', new Blob([file.content], { type: 'application/xml' }), file.name)
+  // fetch sets the multipart boundary itself; a stored Content-Type would break it.
+  const headers = { Accept: 'application/json' }
+  for (const [key, value] of Object.entries(instance.headers || {})) {
+    if (key.toLowerCase() !== 'content-type') headers[key] = value
+  }
+  let response
+  try {
+    response = await fetch(url, { method: 'POST', headers, body: form, signal: AbortSignal.timeout(300000) })
+  } catch (error) {
+    throw new Error(`POST ${url.pathname} failed: ${error && error.message ? error.message : error}`)
+  }
+  const text = await response.text()
+  let parsed = null
+  try { parsed = text ? JSON.parse(text) : null } catch { /* an HTML error page, not JSON */ }
+  if (!response.ok) {
+    const raw = (parsed && parsed.result && parsed.result.error) || (parsed && parsed.error && (parsed.error.message || parsed.error.detail))
+      || stripAnsi(text).replace(/\s+/g, ' ').trim().slice(0, 400) || response.statusText
+    const detail = typeof raw === 'string' ? raw : JSON.stringify(raw)
+    throw Object.assign(new Error(`POST ${url.pathname} -> HTTP ${response.status}: ${detail}`), {
+      status: response.status,
+      missing: response.status === 404 || /does not represent any resource/i.test(detail)
+    })
+  }
+  return { updateSetId: (parsed && parsed.result && parsed.result.targetUpdateSetId) || '' }
+}
+
+// Remove the action="DELETE" record elements whose sys_id `drop` selects.
+function stripDeleteRecords(xml, drop) {
+  return String(xml).replace(/[ \t]*<([A-Za-z0-9_]+)\s+action="DELETE"[^>]*?(?:\/>|>([\s\S]*?)<\/\1>)[ \t]*\r?\n?/g, (match, table, inner) => {
+    const sysId = firstMatch(inner || '', /<sys_id>([0-9a-f]{32})<\/sys_id>/)
+    return drop(sysId || '') ? '' : match
+  })
+}
+
+// The activation install runs after writing a flow (sdk-api flow-activation.js).
+async function activateGraph(instance, scopeId, rootTable, rootId) {
+  const entry = { sys_id: rootId, active: '', state: '' }
+  const body = rootTable === 'sys_hub_flow' ? { flows: [entry], actions: [] } : { flows: [], actions: [entry] }
+  let result
+  try {
+    result = await snRequest(instance, 'POST', '/api/now/wfa_fluent/activate_flows',
+      { body, params: { sysparm_transaction_scope: scopeId }, throwOnError: true })
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    // 422 = every flow failed to activate; the body still says why, per flow.
+    const json = message.match(/HTTP 422: (\{[\s\S]*\})/)
+    if (json) {
+      try {
+        const results = (JSON.parse(json[1]).result || {}).results || []
+        const reasons = results.map((r) => `${r.error_code ? `${r.error_code}: ` : ''}${r.message || r.status}`)
+        if (reasons.length) return { ok: false, message: reasons.join('; ') }
+      } catch { /* fall through to the raw message */ }
+    }
+    if (/does not represent any resource/i.test(message)) {
+      return { ok: false, missing: true, message: 'this instance has no flow activation endpoint '
+        + '(api/now/wfa_fluent/activate_flows — it comes with the ServiceNow IDE)' }
+    }
+    return { ok: false, message }
+  }
+  const summary = (result && result.summary) || {}
+  const failures = ((result && result.results) || []).filter((r) => r.status !== 'success')
+  if (summary.failed || failures.length) {
+    return { ok: false, message: failures.map((r) => `${r.flow_name || r.sys_id}: ${r.message || ''}`
+      + `${r.errorMessage ? ` (${r.errorMessage})` : ''}`).join('; ') || 'activation failed' }
+  }
+  if (!summary.total) return { ok: false, message: 'the activation endpoint had nothing to activate' }
+  return { ok: true }
+}
+
+async function pushGraph(unit, label, context) {
+  const { project, instance, flags, auth, dryRun, force, writtenRecords } = context
+  const rootTable = graphRootTable(unit.xml)
+  const { xml } = sanitizeSdkPayload(unit.xml)
+  const items = parseGraphArtifact(xml)
+  // Records the build marks DELETE inside the artifact are on the instance but no longer in
+  // the source (seen live: a flow pulled back through the online transform builds with
+  // some). They are planned separately below; everything else is the graph to load.
+  const deletes = items.filter((item) => item.kind === 'record' && item.action === 'DELETE')
+  const records = items.filter((item) => item.kind === 'record' && item.action !== 'DELETE')
+  const root = records.find((record) => record.table === rootTable)
+  if (!root || !root.sysId) {
+    console.error(`${label} REFUSED: ${relative(project, unit.file)} has no ${rootTable} record to push.`)
+    return 'failed'
+  }
+  const rootId = root.sysId
+  const what = rootTable === 'sys_hub_flow' ? (root.fields.type === 'subflow' ? 'subflow' : 'flow') : 'action'
+  const name = root.fields.name || rootId
+  const unitIds = new Set(records.map((record) => record.sysId).filter(Boolean))
+  const driftChecked = !flags['no-drift-check'] && !force
+  const directiveCount = items.filter((item) => item.kind === 'directive').length
+  console.log(`${label} ${what} "${name}": ${records.length} record(s), `
+    + `${directiveCount} delete_multiple directive(s)${deletes.length ? `, ${deletes.length} DELETE(s)` : ''}, pushed as one unit`)
+
+  // ---- plan: every read and every guard before the first write --------------
+  const liveRoot = await snGetRecord(instance, rootTable, rootId,
+    'sys_id,sys_updated_on,sys_mod_count,sys_scope,active,status', { throwOnError: true })
+  const artifactScope = scopeOf(root.fields)
+  const usableBaseline = (table, sysId) => {
+    const stored = readBaseline(project, table, sysId)
+    return stored && (!stored.instance || stored.instance === instance.origin) ? stored : null
+  }
+  const isDrifted = (live, baseline) => Boolean(live && baseline
+    && (live.sys_updated_on !== baseline.sys_updated_on || live.sys_mod_count !== baseline.sys_mod_count))
+  // A flow's records are also written by the PLATFORM: seen live, publishing rewrote the
+  // trigger, and a step's compiled_snapshot changed after activation on its own. A counter
+  // bump alone is therefore not drift. What a push must not do is overwrite someone's
+  // change, and the load writes only the fields the artifact carries — so a flow record has
+  // drifted when one of THOSE fields differs from the baseline. (Its active/status are the
+  // activation's, not the source's.)
+  const graphDrift = async (item, live, baseline, isRoot) => {
+    if (!isDrifted(live, baseline)) return []
+    const full = await snGetRecord(instance, item.table, item.sysId, undefined, { throwOnError: true })
+    if (!full) return []
+    const modelled = Object.keys(recordFieldsToPayload(item.fields, { keepScope: false }))
+      .filter((field) => !(isRoot && (field === 'active' || field === 'status')))
+    return modelled.filter((field) => String(full[field] ?? '') !== String(baseline.fields[field] ?? '')).sort()
+  }
+
+  let runScope
+  const creating = !liveRoot
+  if (liveRoot) {
+    const baseline = usableBaseline(rootTable, rootId)
+    if (driftChecked && !baseline) {
+      console.error(`${label} REFUSED: the ${what} exists on the instance but this project has no pull baseline for it, `
+        + "so a push cannot tell your edits from someone else's.\n"
+        + `      Pull it first (now-fluent pull --project ... --auth ${auth} --sys-id ${rootId}), or --force.`)
+      return 'failed'
+    }
+    const rootDrift = driftChecked ? await graphDrift(root, liveRoot, baseline, true) : []
+    if (rootDrift.length) {
+      console.error(`${label} REFUSED: the ${what} changed on the instance since you pulled it (${rootDrift.join(', ')}).\n`
+        + `      pulled:   ${baseline.sys_updated_on} (mod_count ${baseline.sys_mod_count})\n`
+        + `      instance: ${liveRoot.sys_updated_on} (mod_count ${liveRoot.sys_mod_count})\n`
+        + '      Re-pull to take the instance version, or --force to overwrite it.')
+      return 'failed'
+    }
+    const liveScope = scopeOf(liveRoot)
+    if (artifactScope && liveScope && artifactScope !== liveScope) {
+      console.error(`${label} REFUSED before writing: the source puts this ${what} in `
+        + `${await scopeName(instance, project, artifactScope)}, but on the instance it lives in `
+        + `${await scopeName(instance, project, liveScope)}. Flows are not adopted across scopes; pull it again.`)
+      return 'failed'
+    }
+    runScope = liveScope || artifactScope || GLOBAL_SCOPE_ID
+  } else {
+    // A new graph: the same scope rules as a single record's create.
+    const ownScope = projectScopeOf(project)
+    const wantGlobal = flags['target-scope'] === GLOBAL_SCOPE_ID
+    const own = Boolean(artifactScope && ownScope && ownScope.scopeId !== GLOBAL_SCOPE_ID
+      && artifactScope === ownScope.scopeId && !wantGlobal)
+    if (!own && artifactScope && artifactScope !== GLOBAL_SCOPE_ID && !wantGlobal) {
+      console.error(`${label} REFUSED: this ${what} does not exist yet, and its scope ${artifactScope} is neither Global `
+        + "nor this project's own.")
+      return 'failed'
+    }
+    runScope = own ? artifactScope : GLOBAL_SCOPE_ID
+    if (own) {
+      if (context.ownAppExists === undefined) {
+        context.ownAppExists = Boolean(await snGetRecord(instance, 'sys_scope', artifactScope, 'sys_id', { throwOnError: true }))
+      }
+      if (!context.ownAppExists) {
+        console.error(`${label} REFUSED: the application ${scopeLabel(project, artifactScope)} does not exist on this `
+          + 'instance, so nothing can be created in it.')
+        return 'failed'
+      }
+    }
+  }
+
+  const steps = []
+  for (const item of items) {
+    if (item.kind === 'directive') {
+      if (!directiveAnchored(item.query, unitIds)) {
+        console.error(`${label} REFUSED before writing: a delete_multiple directive on ${item.table} does not name this `
+          + `${what} or any of its records, so it is not trusted:\n      ${item.query}`)
+        return 'failed'
+      }
+      const rows = await snRequest(instance, 'GET', `/api/now/table/${item.table}`, {
+        params: { ...RAW_READ_PARAMS, sysparm_query: item.query, sysparm_fields: 'sys_id',
+          sysparm_limit: String(GRAPH_DELETE_LIMIT + 1) },
+        throwOnError: true
+      })
+      const matches = (Array.isArray(rows) ? rows : []).map((row) => row.sys_id).filter(Boolean)
+      if (matches.length > GRAPH_DELETE_LIMIT) {
+        console.error(`${label} REFUSED before writing: a delete_multiple directive on ${item.table} matches more than `
+          + `${GRAPH_DELETE_LIMIT} records:\n      ${item.query}`)
+        return 'failed'
+      }
+      steps.push({ ...item, matches })
+      continue
+    }
+    if (item.action === 'DELETE') continue
+    const isRoot = item.sysId === rootId && item.table === rootTable
+    const live = isRoot ? liveRoot : await snGetRecord(instance, item.table, item.sysId,
+      'sys_id,sys_updated_on,sys_mod_count,sys_scope', { throwOnError: true })
+    const baseline = usableBaseline(item.table, item.sysId)
+    const driftFields = isRoot ? [] : await graphDrift(item, live, baseline, false)
+    const drifted = driftFields.length > 0
+    if (driftChecked && drifted) {
+      console.error(`${label} REFUSED: ${item.table} ${item.sysId} (part of this ${what}) changed on the instance since `
+        + `you pulled it (${driftFields.join(', ')}). Re-pull the flow, or --force to overwrite it.`)
+      return 'failed'
+    }
+    // Only to tell what changed: the loader receives the whole artifact, as built.
+    let body = recordFieldsToPayload(item.fields, { keepScope: false })
+    // The build always says draft/inactive; install loads it like that and activates
+    // afterwards, and so does push — so the root's active/status are not "changes".
+    if (isRoot && live) {
+      delete body.active
+      delete body.status
+    }
+    if (live && baseline && !flags.full && !drifted) {
+      const changed = {}
+      for (const [field, value] of Object.entries(body)) {
+        if (String(baseline.fields[field] ?? '') !== String(value)) changed[field] = value
+      }
+      body = changed
+    }
+    if (live && !Object.keys(body).length) continue
+    if (!live) body = { ...body, sys_id: item.sysId }
+    steps.push({ ...item, live, body })
+  }
+
+  // install would delete the artifact's DELETE records. push leaves them in place unless
+  // --allow-delete, and then only those it has an unchanged baseline for — the same rule as
+  // any other delete: an unpulled or drifted record is never destroyed.
+  const removable = []
+  const leftInPlace = []
+  for (const item of deletes) {
+    const live = await snGetRecord(instance, item.table, item.sysId, 'sys_id,sys_updated_on,sys_mod_count', { throwOnError: true })
+    if (!live) continue
+    if (!flags['allow-delete']) {
+      leftInPlace.push(item)
+      continue
+    }
+    const baseline = usableBaseline(item.table, item.sysId)
+    if (driftChecked && (!baseline || isDrifted(live, baseline))) {
+      console.error(`${label} REFUSED before writing: the artifact deletes ${item.table} ${item.sysId}, which `
+        + `${baseline ? 'changed on the instance since you pulled it' : 'this project has no pull baseline for'}. `
+        + 'Re-pull the flow, or --force.')
+      return 'failed'
+    }
+    removable.push(item)
+  }
+  const leftNote = leftInPlace.length
+    ? `left in place: ${leftInPlace.length} record(s) the source no longer has (`
+      + `${leftInPlace.map((item) => `${item.table} ${item.sysId}`).join(', ')}) — --allow-delete removes them, as install would`
+    : ''
+
+  const directives = steps.filter((step) => step.kind === 'directive')
+  const removals = directives.reduce((sum, step) => sum + step.matches.length, 0) + removable.length
+  const changes = steps.filter((step) => step.kind === 'record')
+  const wasActive = Boolean(liveRoot && String(liveRoot.active) === 'true')
+  const activate = !flags['no-activate'] && (creating || wasActive || Boolean(flags.activate))
+  const scopeText = await scopeName(instance, project, runScope)
+  const loadPath = `${instance.origin}/api/fluent/load/${runScope}`
+  const activateNote = activate
+    ? `, then activate it (POST ${instance.origin}/api/now/wfa_fluent/activate_flows)`
+    : ` — not activated (${flags['no-activate'] ? '--no-activate' : 'it is inactive; --activate to activate it'})`
+
+  if (dryRun) {
+    for (const step of steps) {
+      if (step.kind === 'directive') {
+        if (step.matches.length) {
+          console.log(`      would remove ${step.matches.length} ${step.table} record(s) no longer in the source: `
+            + step.matches.join(', '))
+        }
+      } else {
+        console.log(`      would ${step.live ? 'update' : 'create'} ${step.table} ${step.sysId} (${Object.keys(step.body).length} field(s) differ)`)
+      }
+    }
+    for (const item of removable) console.log(`      would delete ${item.table} ${item.sysId} (no longer in the source; --allow-delete)`)
+    if (leftNote) console.log(`      ${leftNote}`)
+    if (changes.length || removals) {
+      console.log(`      ...by loading the whole artifact as ${scopeText} (POST ${loadPath}, as install does)${activateNote}`)
+    }
+    if (!changes.length && !removals) return 'unchanged'
+    return creating ? 'created' : 'updated'
+  }
+  if (leftNote) console.log(`${label} ${leftNote}`)
+  if (!changes.length && !removals && !(activate && flags.activate)) {
+    console.log(`${label} unchanged`)
+    return 'unchanged'
+  }
+
+  // ---- load the artifact, the way install does ------------------------------
+  // DELETE records push is not applying are taken out of what the loader receives.
+  const keep = new Set(removable.map((item) => item.sysId))
+  let payload = stripDeleteRecords(xml, (sysId) => !keep.has(sysId))
+  // --target-scope global: the payload names the scope the loader puts the records in.
+  if (creating && runScope === GLOBAL_SCOPE_ID && artifactScope && artifactScope !== GLOBAL_SCOPE_ID) {
+    payload = rewriteSysScope(payload, 'global', GLOBAL_SCOPE_ID)
+  }
+  let loaded = { updateSetId: '' }
+  if (changes.length || removals) {
+    try {
+      loaded = await snLoadXml(instance, runScope, [{ name: basename(unit.file), content: payload }],
+        { targetUpdateSetId: context.targetUpdateSetId })
+    } catch (error) {
+      if (error && error.missing) {
+        console.error(`${label} REFUSED: this instance has no XML load endpoint (api/fluent/load — it comes with the `
+          + 'ServiceNow IDE), so push cannot write a flow the way install does. Nothing was written.\n'
+          + '      Writing its records one by one is not an alternative: seen live, the rows all land but Flow '
+          + 'Designer shows the flow empty and it cannot be activated. Use update-set-package.')
+      } else {
+        console.error(`${label} FAILED: loading the ${what} was refused: ${error && error.message ? error.message : error}`)
+      }
+      return 'failed'
+    }
+  }
+
+  // ---- what the instance now holds -----------------------------------------
+  const after = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
+  if (!after) {
+    console.error(`${label} FAILED: the loader answered, but the ${what} ${rootId} is not on the instance.`)
+    return 'failed'
+  }
+  if (creating) {
+    const landedScope = scopeOf(after)
+    if (landedScope && landedScope !== runScope) {
+      console.error(`${label} LOADED THE ${what.toUpperCase()}, BUT IT LANDED IN ${await scopeName(instance, project, landedScope)}, `
+        + `not ${scopeText}. It was left in place: delete it in Flow Designer.`)
+      return 'failed'
+    }
+  }
+  let present = 0
+  const missing = []
+  for (const record of records) {
+    const row = record.sysId === rootId ? after
+      : await snGetRecord(instance, record.table, record.sysId, undefined, { throwOnError: true })
+    if (row) {
+      writeBaseline(project, record.table, record.sysId, instance, row)
+      present++
+    } else {
+      missing.push(`${record.table} ${record.sysId}`)
+    }
+  }
+  let removed = 0
+  const kept = []
+  const expectedGone = [...directives, ...removable.map((item) => ({ table: item.table, matches: [item.sysId] }))]
+  for (const step of expectedGone) {
+    for (const id of step.matches) {
+      if (await snGetRecord(instance, step.table, id, 'sys_id', { throwOnError: true })) {
+        kept.push(`${step.table} ${id}`)
+      } else {
+        removeBaseline(project, step.table, id)
+        removed++
+      }
+    }
+  }
+  if (writtenRecords) writtenRecords.push({ table: rootTable, sysId: rootId })
+  if (missing.length || kept.length) {
+    console.error(`${label} FAILED: the loader answered, but the instance does not match the artifact:`
+      + `${missing.length ? `\n      missing: ${missing.join(', ')}` : ''}`
+      + `${kept.length ? `\n      not removed: ${kept.join(', ')}` : ''}`)
+    return 'failed'
+  }
+  let captured = ''
+  if (loaded.updateSetId) {
+    const set = await snGetRecord(instance, 'sys_update_set', loaded.updateSetId, 'name', { throwOnError: true }).catch(() => null)
+    captured = `, captured in update set ${set && set.name ? `"${set.name}" ` : ''}(${loaded.updateSetId})`
+  }
+
+  let state = 'saved as a draft'
+  if (activate) {
+    const result = await activateGraph(instance, runScope, rootTable, rootId)
+    // An activation attempt writes the flow record even when it FAILS (seen live: mod_count
+    // 0 -> 1 on a rejected publish), so the baseline is taken again either way — or the
+    // next push would see our own attempt as somebody else's drift.
+    // Activation also rewrites the flow's parts (seen live: the trigger instance changed, and
+    // every later push was refused as drift), so every record's baseline is re-taken.
+    const activated = await snGetRecord(instance, rootTable, rootId, undefined, { throwOnError: true })
+    if (activated) writeBaseline(project, rootTable, rootId, instance, activated)
+    for (const record of records) {
+      if (record.sysId === rootId) continue
+      const row = await snGetRecord(instance, record.table, record.sysId, undefined, { throwOnError: true }).catch(() => null)
+      if (row) writeBaseline(project, record.table, record.sysId, instance, row)
+    }
+    if (!result.ok) {
+      console.error(`${label} ${present} record(s) loaded and ${removed} removed${captured}, but NOT activated: `
+        + `${result.message}.\n      The ${what} is saved as an inactive draft (install leaves it the same way). `
+        + `Activate it in Flow Designer${result.missing ? '' : ' once the cause is fixed'}.`)
+      return 'failed'
+    }
+    state = `activated (active=${activated ? activated.active : '?'}, status=${activated ? activated.status : '?'})`
+  } else if (!creating) {
+    state = flags['no-activate'] ? 'saved as an inactive draft (--no-activate)' : 'saved as an inactive draft, as it was (--activate to activate it)'
+  }
+  console.log(`${label} ${what} "${name}" ${creating ? 'created' : 'updated'} in ${scopeText}: ${present} record(s) `
+    + `loaded, ${removed} removed${captured}, ${state}`)
+  return creating ? 'created' : 'updated'
+}
+
 async function commandPush(flags, config, positional) {
   const project = projectPath(flags, config)
   if (!existsSync(project)) fail(`Project path does not exist: ${project}`)
@@ -3813,15 +4450,36 @@ async function commandPush(flags, config, positional) {
   const results = { created: [], updated: [], deleted: [], unchanged: [], failed: [...unresolved] }
   const writtenRecords = []
   const misCaptured = []
-  const context = { project, instance, flags, auth, dryRun, force, writtenRecords }
+  // A flow is loaded through api/fluent/load, which — unlike a Table API write — takes the
+  // update set to capture into; --update-set is passed to it.
+  const context = { project, instance, flags, auth, dryRun, force, writtenRecords,
+    targetUpdateSetId: updateSetSession ? updateSetSession.target.sys_id : undefined }
+
+  // A flow's records travel as one unit per flow artifact, however they were selected
+  // (the flow's sys_id, one of its steps, or --all).
+  const units = []
+  const graphFiles = new Set()
+  for (const target of targets) {
+    // A flow's own DELETE (its source removed) is not a graph to write; pushRecord refuses it.
+    if (graphRootTable(target.xml) && target.record.action !== 'DELETE') {
+      if (graphFiles.has(target.file)) continue
+      graphFiles.add(target.file)
+      units.push({ graph: true, file: target.file, xml: target.xml })
+    } else {
+      units.push({ graph: false, target })
+    }
+  }
 
   try {
-    for (const [index, target] of targets.entries()) {
-      const { table, sysId } = target.record
-      const label = `[${index + 1}/${targets.length}] ${table} ${sysId}`
+    for (const [index, unit] of units.entries()) {
+      const { table, sysId } = unit.graph
+        ? parseGraphArtifact(unit.xml).find((item) => item.kind === 'record' && GRAPH_ROOT_TABLES.has(item.table))
+          || { table: graphRootTable(unit.xml), sysId: basename(unit.file) }
+        : unit.target.record
+      const label = `[${index + 1}/${units.length}] ${table} ${sysId}`
       let outcome
       try {
-        outcome = await pushRecord(target, label, context)
+        outcome = unit.graph ? await pushGraph(unit, label, context) : await pushRecord(unit.target, label, context)
       } catch (error) {
         // One refused record must not abandon the rest of the run.
         console.error(`${label} FAILED: ${error && error.message ? error.message : error}`)

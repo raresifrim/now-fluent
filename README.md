@@ -95,17 +95,24 @@ now-fluent transform --help
 
 `update-set-package` is the *governed* path: build an update set, import it, preview it, commit it. That is right for promoting a change you do not own, and heavy for fixing a typo in a script include.
 
-`pull`/`push` is the inner loop. Both ends are the plain Table REST API — the same ungated path `import --via query` uses — so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's own update-set export.
+`pull`/`push` is the inner loop. Both ends are the plain Table REST API — the same ungated path `import --via query` uses — so neither is blocked by the scope checks that refuse `move`, the online `transform`, `download` and the SDK's own update-set export. (A flow is the exception: push loads it through the SDK's `api/fluent/load`, as install does — see *Flows* below.)
 
 ```bash
 # read the record into the project AND snapshot what the instance holds right now
 now-fluent pull --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
+
+# ...or several: a comma list (mixed tables are fine), or every record a query matches
+now-fluent pull --project ./work --auth dev --sys-id <id1>,<id2>,<id3>
+now-fluent pull --project ./work --auth dev --table sys_script_include \
+  --query "sys_scope.scope=sn_hamp^nameSTARTSWITHHAM" --limit 50
 
 # ...edit the Fluent source...
 
 # build, diff against the snapshot, and write only what changed back to the record
 now-fluent push --project ./work --auth dev --sys-id 0123456789abcdef0123456789abcdef
 ```
+
+`pull` takes either a sys_id list or `--query` + `--table`, not both. A `--query` pull re-takes records that are already in the project (unlike `import --query`, which skips them so a bulk run can resume): pull always takes the instance version, and warns first when that replaces local source. `push` takes `--sys-id` lists too, or `--all` with `--include`/`--exclude`; each record is written or refused on its own, and the run exits non-zero if any failed.
 
 ### How push decides what to do
 
@@ -188,6 +195,26 @@ push also refuses, **before writing**, any update whose source puts the record i
 So the flag's real job is the check that follows: after the push, it looks at where each write was actually captured and, on a mismatch, names the set it went to and fails the run. It restores your previous update set preference afterwards either way.
 
 If you need changes in a specific update set, build one with `update-set-package` rather than hoping capture follows.
+
+### Flows: pushed as one unit, loaded like install
+
+A `Flow()` builds into **one** artifact: the flow, its trigger and step instances, and `delete_multiple` directives that remove steps no longer in the source. The flow record always says `active=false` / `status=draft`, because `install` activates flows afterwards through `api/now/wfa_fluent/activate_flows`. So `push` treats the artifact as a unit — whether you name the flow, one of its steps, or use `--all`:
+
+```bash
+now-fluent push --project . --auth dev --sys-id <flow sys_id> --dry-run   # every change, the load, and the activation
+now-fluent push --project . --auth dev --sys-id <flow sys_id>
+```
+
+- **not through the Table API.** Seen live: a flow written record by record has every row on the instance, yet Flow Designer shows it empty and it cannot be activated (`No Trigger instance found in the flow definition`) — the platform builds the rest of a flow when it *loads* one. So push sends the artifact, as built, through the SDK's own loader, `POST api/fluent/load/<scope>` — what `now-sdk install` does for a `type: 'configuration'` project — which captures it into an update set (`--update-set` picks which). The endpoint ships with the ServiceNow IDE; without it push refuses and writes nothing;
+- every read and guard first (drift on the flow and its steps, scope rules, directive anchoring), then the load, then every record read back: missing records, steps not removed, or a new flow in the wrong scope fail the run;
+- like install, the load leaves the flow an inactive draft; it is then activated if it is new or was active (`--activate` forces, `--no-activate` skips). If activation fails, the flow stays an inactive draft and push says so;
+- a `delete_multiple` directive must name this flow or one of its records and may match at most 50 records, or nothing is written; push never deletes a whole flow;
+- records the artifact marks `DELETE` (a flow pulled back can build with some: records the regenerated source lacks) are left in place and named, unless `--allow-delete` — then only with an unchanged baseline;
+- compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is;
+- activation changes the flow record (even when it fails) and its trigger, so every record's baseline is re-taken after every attempt; and because the platform keeps stamping its own fields afterwards (a step's `compiled_snapshot`), a flow counts as drifted only when a field the artifact writes has changed — the refusal names it;
+- `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes. It baselines the flow's trigger and steps too, and removes the snapshot XML the transform leaves in `metadata/` (every build would otherwise ship it) — found by what the transform wrote, not by where it put it.
+
+Verified live (`sn_sow`), the whole round trip: a flow authored in Fluent is loaded, activated, shows its trigger and step in Flow Designer, and runs; then a step is edited, added and removed, a real instance edit is refused, the flow is pulled back, and the pulled source is edited and pushed. Runbook phases 7–8 exercise all of this against a real instance.
 
 ### Two limitations worth knowing
 
@@ -390,6 +417,8 @@ Import it in ServiceNow via **System Update Sets → Retrieved Update Sets → I
 | `--keep-payload-scope` | Keep each payload's `sys_scope` as built. By default every payload `sys_scope` is rewritten to `--scope`/`--scope-id`, so e.g. a Global (`--scope global --scope-id global`) or other-scope update set built from an `sn_*` project lands in the right application | off |
 
 Known now-sdk build defects are fixed in the payloads before packaging: `sys_hub_flow_snapshot.outputs` serialized as `[object Object]` (subflows with a `masterSnapshot`) is written empty, as on the instance. Top-level flow steps (`sys_hub_action_instance_v2`, `sys_hub_flow_logic_instance_v2`, `sys_hub_sub_flow_instance_v2`) are emitted without `parent_ui_id`; an explicit empty `<parent_ui_id/>` is added so a step moved out of a removed If/loop is re-parented on commit. Any other `[object Object]` in a payload is reported as a warning.
+
+**Flows arrive as inactive drafts.** A flow in the update set is the same complete build `push` sends (flow, trigger, steps, and the directives that remove steps no longer in the source), and committing it loads it like `install` would, so Flow Designer shows it whole. But the SDK always builds a flow as `active=false` / `status=draft`: `install` and `push` activate it afterwards (`api/now/wfa_fluent/activate_flows`), and an update set commit does not. Activating publishes the flow, which is what compiles it and creates the snapshot it runs from; the build carries no snapshot, so marking it active in the XML would not work. After committing, open the flow in Flow Designer and click **Activate**. The same goes for `export-xml`.
 
 Run from a project that has `now.config.json` (any `init`-created project) and scope/scope-id/app-name are filled in automatically — you usually only pass `--update-set-name` and your selection.
 
