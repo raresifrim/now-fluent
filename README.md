@@ -212,9 +212,9 @@ now-fluent push --project . --auth dev --sys-id <flow sys_id>
 - records the artifact marks `DELETE` (a flow pulled back can build with some: records the regenerated source lacks) are left in place and named, unless `--allow-delete` — then only with an unchanged baseline;
 - compressed fields (`trigger_inputs`, `values`) are gzip+base64 in the build and sent as-is;
 - activation changes the flow record (even when it fails) and its trigger, so every record's baseline is re-taken after every attempt; and because the platform keeps stamping its own fields afterwards (a step's `compiled_snapshot`), a flow counts as drifted only when a field the artifact writes has changed — the refusal names it;
-- `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes. It baselines the flow's trigger and steps too, and removes the snapshot XML the transform leaves in `metadata/` (every build would otherwise ship it).
+- `pull` takes flows through the SDK's online transform — the query path cannot rebuild a graph — so they are not adopted across scopes. It baselines the flow's trigger and steps too, and removes the snapshot XML the transform leaves in `metadata/` (every build would otherwise ship it) — found by what the transform wrote, not by where it put it.
 
-Verified live (`sn_sow`): a flow authored in Fluent is loaded, activated, shows its trigger and step in Flow Designer, and runs. Runbook phases 7–8 exercise all of this against a real instance.
+Verified live (`sn_sow`), the whole round trip: a flow authored in Fluent is loaded, activated, shows its trigger and step in Flow Designer, and runs; then a step is edited, added and removed, a real instance edit is refused, the flow is pulled back, and the pulled source is edited and pushed. Runbook phases 7–8 exercise all of this against a real instance.
 
 ### Two limitations worth knowing
 

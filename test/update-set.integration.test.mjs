@@ -133,3 +133,17 @@ test('refuses an update set that is not in progress', async () => {
     assert.ok(!instance.store.has(`sys_script_include/${SYS_ID}`), 'nothing should be written')
   } finally { await instance.stop() }
 })
+
+test('the restore survives the platform replacing the preference record mid-push (seen live: 404)', async () => {
+  const instance = await startMockInstance({ preferenceReplacedOnWrite: true })
+  try {
+    seedSets(instance)
+    const result = await push(instance, '--update-set', 'NowFluent Push Test Set')
+    const output = result.stdout + result.stderr
+    assert.doesNotMatch(output, /could not restore/)
+    assert.match(output, /Restored the previous update set preference \(default-set\)/)
+    const prefs = [...instance.store.values()].filter((row) => row.name === 'sys_update_set' && row.user)
+    assert.equal(prefs.length, 1, 'still one preference record')
+    assert.equal(prefs[0].value, 'default-set', 'holding the value from before the push')
+  } finally { await instance.stop() }
+})

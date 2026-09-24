@@ -468,7 +468,8 @@ test('pull removes the snapshot XML the SDK transform leaves in metadata/ (and a
     const pulled = await pull(instance, '--table', 'sys_hub_flow', '--sys-id', FLOW)
     assert.equal(pulled.status, 0, pulled.output)
     assert.match(pulled.output, /removed the snapshot XML the SDK left for the build/)
-    assert.ok(!existsSync(join(project, 'metadata', 'update', `sys_hub_flow_snapshot_5a${FLOW.slice(2)}.xml`)), 'the transform\'s copy is gone')
+    assert.ok(!existsSync(join(project, 'metadata', `sys_hub_flow_snapshot_5a${FLOW.slice(2)}.xml`)),
+      'the transform\'s copy is gone — found by what the transform wrote, not by where or what it holds')
     assert.ok(!existsSync(builtCopy), 'and the copy an earlier build made')
     assert.ok(existsSync(otherFile), 'another flow\'s snapshot is not touched')
   }))

@@ -128,9 +128,12 @@ if (argv[0] === 'transform' && argv.includes('--id')) {
   // metadata directory") — from where every build copies it into dist/app.
   if (table === 'sys_hub_flow') {
     const snapshot = `5a${id.slice(2)}`
-    const file = join(valueOf('--directory') || process.cwd(), 'metadata', 'update', `sys_hub_flow_snapshot_${snapshot}.xml`)
+    // Where it lands and what it holds are the SDK's business: this copy sits directly in
+    // metadata/ and does not even name the flow — pull must still find it (a live run
+    // showed a check that relied on both missing the real file).
+    const file = join(valueOf('--directory') || process.cwd(), 'metadata', `sys_hub_flow_snapshot_${snapshot}.xml`)
     mkdirSync(dirname(file), { recursive: true })
-    writeFileSync(file, `<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_hub_flow_snapshot"><sys_hub_flow_snapshot action="INSERT_OR_UPDATE"><parent_flow>${id}</parent_flow><sys_id>${snapshot}</sys_id></sys_hub_flow_snapshot></record_update>`)
+    writeFileSync(file, `<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_hub_flow_snapshot"><sys_hub_flow_snapshot action="INSERT_OR_UPDATE"><sys_id>${snapshot}</sys_id></sys_hub_flow_snapshot></record_update>`)
     console.log(`No records parsed from sys_hub_flow_snapshot_${snapshot}.xml, moving to metadata directory`)
   }
   console.log(`Transform completed successfully (online, ${table} ${id})`)

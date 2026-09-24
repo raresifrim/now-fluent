@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, cpSync, rmSync, readdirSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs'
 import { join, resolve, basename, dirname, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -1345,13 +1345,14 @@ function commandImport(flags, config, positional, internal = {}) {
       const stillPending = pending.filter((id) => !attempting.has(id))
       for (const id of doable) {
         const t = tableFor.get(id)
+        const snapshotsBefore = t === 'sys_hub_flow' ? listSnapshotFiles(project) : null
         const result = runSdk(['transform', '--auth', auth, '--table', t, '--id', id, '--directory', project, ...extra],
           { cwd: project, allowFailure: true })
         if (result.status === 0) {
           console.log(`  ${t} ${id} ok`)
           importedBy.transform.push(id)
           if (t === 'sys_hub_flow') {
-            const removed = pruneFlowSnapshotMetadata(project, id)
+            const removed = pruneFlowSnapshotFiles(project, id, snapshotsBefore)
             if (removed.length) {
               console.log(`    removed the snapshot XML the SDK left for the build (${removed.join(', ')}): a snapshot `
                 + "is the instance's own record — activation makes a new one — so it must not be shipped back")
@@ -2561,24 +2562,44 @@ function stripXmlDeclaration(xml) {
 // sys_hub_flow_snapshot XML into the metadata directory ("No records parsed from ...,
 // moving to metadata directory"). Every build copies that directory into dist/app, so
 // install, update-set-package and push --all would ship a stale copy of a record the
-// platform owns. The copy is removed — with any copy an earlier build already made.
-function pruneFlowSnapshotMetadata(project, flowId) {
-  const config = readProjectConfig(project)
-  const removed = []
+// platform owns. The transform's output is not captured and the file's location and
+// content are the SDK's business, so the files are found by what the transform DID: every
+// sys_hub_flow_snapshot_<id>.xml in the project it created or rewrote (compared with a
+// listing taken before it ran), plus any that names this flow — and their built copies.
+const SNAPSHOT_FILE_RE = /^sys_hub_flow_snapshot_[0-9a-f]{32}\.xml$/i
+function listSnapshotFiles(project) {
+  const found = new Map()
   const walk = (dir) => {
-    if (!existsSync(dir)) return
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const path = join(dir, entry.name)
+    let entries
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
       if (entry.isDirectory()) {
-        walk(path)
-      } else if (/^sys_hub_flow_snapshot_[0-9a-f]{32}\.xml$/i.test(entry.name) && readFileSync(path, 'utf8').includes(flowId)) {
-        rmSync(path, { force: true })
-        removed.push(relative(project, path))
+        if (!['node_modules', '.git', '.now-fluent'].includes(entry.name)) walk(join(dir, entry.name))
+      } else if (SNAPSHOT_FILE_RE.test(entry.name)) {
+        const path = join(dir, entry.name)
+        try { found.set(path, statSync(path).mtimeMs) } catch { /* vanished meanwhile */ }
       }
     }
   }
-  walk(join(project, config.metadataDir || 'metadata'))
-  walk(join(project, config.appOutputDir || join('dist', 'app')))
+  walk(project)
+  return found
+}
+
+function pruneFlowSnapshotFiles(project, flowId, before) {
+  const after = listSnapshotFiles(project)
+  const names = new Set()
+  for (const [path, mtime] of after) {
+    const touched = !before.has(path) || before.get(path) !== mtime
+    let namesFlow = false
+    try { namesFlow = readFileSync(path, 'utf8').includes(flowId) } catch { /* unreadable: judge by touched */ }
+    if (touched || namesFlow) names.add(basename(path))
+  }
+  const removed = []
+  for (const path of after.keys()) {
+    if (!names.has(basename(path))) continue
+    rmSync(path, { force: true })
+    removed.push(relative(project, path))
+  }
   return removed
 }
 
@@ -3329,8 +3350,25 @@ async function setCurrentUpdateSet(instance, ref) {
     target,
     async restore() {
       if (current) {
-        await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${current.sys_id}`,
-          { body: { value: current.value || '' }, throwOnError: true })
+        // Seen live: the platform can REPLACE the preference record during the push (the
+        // restore PUT to the old record answered 404, and the account was left on another
+        // set). So if the record is gone, whichever one holds the preference now gets the
+        // value — or a new one is created.
+        try {
+          await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${current.sys_id}`,
+            { body: { value: current.value || '' }, throwOnError: true })
+        } catch (error) {
+          if (!error || error.status !== 404) throw error
+          const id = await findPreferenceId(instance, userId)
+          if (id) {
+            await snRequest(instance, 'PUT', `/api/now/table/sys_user_preference/${id}`,
+              { body: { value: current.value || '' }, throwOnError: true })
+          } else {
+            await snRequest(instance, 'POST', '/api/now/table/sys_user_preference', {
+              body: { name: 'sys_update_set', user: userId, value: current.value || '', type: 'string' }, throwOnError: true
+            })
+          }
+        }
         console.log(`Restored the previous update set preference (${current.value || 'none'}).`)
       } else {
         // An empty id would address the COLLECTION, so check before sending anything.

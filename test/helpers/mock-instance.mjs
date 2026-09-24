@@ -33,6 +33,9 @@ import { createServer } from 'node:http'
 // flowActivation: how POST /api/now/wfa_fluent/activate_flows (the call install makes
 // after writing a flow) answers — 'ok' (activates: active=true, status=published),
 // 'missing' (the 400 an instance without the ServiceNow IDE returns), or 'fail' (422).
+// preferenceReplacedOnWrite:true models what a live run showed: during a push the
+// platform REPLACED the account's sys_update_set preference record (a new sys_id, pointing
+// at Default), so a restore aimed at the old record answered 404.
 // fluentLoad: how POST /api/fluent/load/<scope> (the loader install uses for a
 // configuration project) answers — 'ok' applies every <record_update> in the uploaded
 // files (records merged, delete_multiple directives run, sys_scope taken from the payload)
@@ -42,7 +45,7 @@ import { createServer } from 'node:http'
 export async function startMockInstance({
   records = {}, honoursScope = false, captureInto = null, captureFollowsPreference = false, putReplaces = false,
   honoursTransactionScope = false, noScopeTables = [], protectedFromGlobal = false, undeletableScopes = [],
-  currentApp = 'global', flowActivation = 'ok', fluentLoad = 'ok'
+  currentApp = 'global', flowActivation = 'ok', fluentLoad = 'ok', preferenceReplacedOnWrite = false
 } = {}) {
   const store = new Map(Object.entries(records))
   const USER_ID = 'user0000000000000000000000000001'
@@ -277,7 +280,18 @@ export async function startMockInstance({
     if (desc) rows.reverse()
   }
 
+  function replacePreference(table) {
+    if (!preferenceReplacedOnWrite || table === 'sys_user_preference') return
+    for (const [k, v] of [...store.entries()]) {
+      if (!k.startsWith('sys_user_preference/') || v.name !== 'sys_update_set') continue
+      store.delete(k)
+      const id = `prefnew${String(++clock).padStart(25, '0')}`
+      store.set(`sys_user_preference/${id}`, { ...v, sys_id: id, value: 'platform-chosen-set' })
+    }
+  }
+
   function noteCapture(table, id) {
+    replacePreference(table)
     if (!CAPTURED.has(table)) return
     const pref = [...store.entries()].find(([k, v]) => k.startsWith('sys_user_preference/') && v.name === 'sys_update_set')
     const destination = captureFollowsPreference && pref && pref[1].value
